@@ -74,3 +74,7 @@ See `sample.csv` for an example.
 | `sample.csv` | Example CSV |
 | `browser.json` | Your saved login session (created on first login — keep private) |
 | `RESEARCH.md` | Notes on the approaches considered |
+
+## License
+
+[GNU General Public License v3.0](LICENSE)
