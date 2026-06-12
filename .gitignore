@@ -1,0 +1,20 @@
+# Login session — contains YouTube session cookies, NEVER commit.
+# (Any future auth/oauth variants are caught by the patterns below too.)
+browser.json
+oauth.json
+*.session
+headers_auth.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Generated / local tooling
+ui_preview.png
+.claude/
+
+# OS noise
+Thumbs.db
+.DS_Store
