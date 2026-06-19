@@ -31,8 +31,11 @@ module level
 ├── constants: APP_DIR, AUTH_FILE, ARTIST/TITLE/STATION_HEADERS, SONG_COLUMNS,
 │                LOGIN_INSTRUCTIONS
 ├── read_songs_csv(path)        # CSV → list[(artist, title, station)]
+├── read_songs_folder(path)     # music files → list[(folder, file stem, "")]
 ├── clean_pasted_headers(raw)   # DevTools paste → {header: value}
 ├── normalize(s) / pick_match() # search-result matching heuristic
+├── safe_filename(name)         # playlist title → legal file name
+├── write_playlist_csv(...)     # get_playlist tracks → Artist/Title/Album CSV
 ├── class LoginDialog(Toplevel) # paste-headers auth dialog
 ├── class CratefillApp         # main window + all behavior
 └── main()
@@ -109,18 +112,22 @@ client). It was skipped because the setup burden is on the end user; if header
 pasting proves too painful, that's the alternative — see
 https://ytmusicapi.readthedocs.io/en/stable/setup/oauth.html
 
-**`browser.json` contains the user's session cookies. Never commit it.** (The
-project isn't a git repo yet; add it to `.gitignore` the day it becomes one.)
+**`browser.json` contains the user's session cookies. Never commit it.** (It
+is in `.gitignore`, together with patterns for other auth-file variants.)
 
 ### Threading model
 
 Tkinter is single-threaded; network calls would freeze the UI. The pattern used:
 
-- The **Add** button (`add_songs`) snapshots the selections, disables itself,
-  and starts a daemon `threading.Thread` running `_worker`.
-- `_worker` does all network I/O and communicates *only* by putting
+- The **Add** button (`add_songs`) and **Export CSV…** button
+  (`export_playlists`) snapshot the selections, disable both buttons
+  (`_start_work`), and start a daemon `threading.Thread` running `_worker` /
+  `_export_worker` respectively.
+- The workers do all network I/O and communicate *only* by putting
   `(kind, payload)` tuples on `self.worker_queue` (a `queue.Queue`). Kinds:
-  `"log"` (a line for the log pane), `"step"` (advance progress bar), `"done"`.
+  `"log"` (a line for the log pane), `"step"` (advance progress bar), and
+  `"done"` — with payload `"refresh"` when the playlists should be refetched
+  (after adding; pointless after an export).
 - `_poll_worker`, rescheduled every 100 ms via `root.after`, drains the queue
   on the main thread and touches the widgets.
 
@@ -144,12 +151,38 @@ Two phases, on purpose:
    duplicates=False)` call **per playlist** with all matched IDs batched — not
    one call per song, which would be slow and rate-limit-prone.
 
-`duplicates=False` makes YT Music skip songs already in the playlist; the
-response status is then not `STATUS_SUCCEEDED`, which the code reports as a
-soft warning rather than a failure. Adding to a playlist the user doesn't own
-fails per-playlist and is logged without affecting the others.
+`duplicates=False` does **not** make YT Music skip songs already in the
+playlist — it makes the whole batch fail atomically (nothing added) if even
+one song is a duplicate, and ytmusicapi's `duplicates=True` would add the
+duplicates. So on a failed status, `_worker` fetches the playlist's current
+videoIds, filters them out of the batch, and retries once with the rest
+(logging "N already there, skipped"); matched videoIds are also deduped
+within the batch. If the retry still fails (playlist not editable, or YT
+considers a song a duplicate under a *different* videoId), a soft warning is
+logged. Adding to a playlist the user doesn't own fails per-playlist and is
+logged without affecting the others.
 
 After completion, `refresh_playlists()` runs so track counts update.
+
+### Folder → playlist (`load_folder`)
+
+Same flow as CSV loading; `read_songs_folder` fills the artist column with the
+folder name and the title column with each music file's stem (extensions per
+`AUDIO_EXTENSIONS`, non-recursive), so the search query becomes "folder name +
+file name" with no other code changes. Works best for folders named after an
+artist/album; for station folders of "Artist - Title.ext" files most matches
+land as `?` (uncertain) because the folder name isn't the artist — still
+useful, just review the log.
+
+### Playlist → CSV export (`_export_worker`)
+
+One `yt.get_playlist(playlistId, limit=None)` per selected playlist, then
+`write_playlist_csv` writes `Artist,Title,Album` rows (UTF-8, csv module
+quoting). Playlist titles are made filesystem-safe by `safe_filename`, and
+existing files get a ` (2)` suffix instead of being overwritten. Per-playlist
+failures are logged and don't abort the run. The exported CSV round-trips
+through `read_songs_csv` (the Album header is deliberately *not* in
+`STATION_HEADERS`).
 
 ### UI layout
 
@@ -168,6 +201,14 @@ After completion, `refresh_playlists()` runs so track counts update.
   Indices map directly into `self.playlists`.
 - **Bottom:** Add button, determinate `ttk.Progressbar` (max = songs +
   playlists, one step per unit of work), and a read-only `tk.Text` log.
+
+Dropping a CSV file or a music folder onto the song tree loads it
+(`_on_drop`, routed to `load_csv_path`/`load_folder_path` — the same methods
+the buttons use). This needs the optional `tkinterdnd2` package and the
+`TkinterDnD.Tk()` root that `main()` creates when the package is present;
+without either, the app degrades to buttons-only (the import is guarded and
+`_build_ui` ignores the `TclError` raised when registering a drop target on a
+plain `tk.Tk()` root — which is what the smoke test and screenshot helper use).
 
 ## Testing
 

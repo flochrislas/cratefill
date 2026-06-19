@@ -1,1 +1,2 @@
 ytmusicapi>=1.12
+tkinterdnd2>=0.4  # optional at runtime: enables drag-and-drop loading

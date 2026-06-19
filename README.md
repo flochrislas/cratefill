@@ -1,19 +1,37 @@
 # Cratefill
 
-A small desktop app that adds songs from a CSV file to your YouTube Music playlists.
+A small desktop app that moves songs between CSV files, folders of music files,
+and your YouTube Music playlists.
 
-- **Left pane:** load a CSV with your songs (artist + song name; extra columns are ignored).
-  Click a column title to sort.
+![Cratefill screenshot](https://raw.githubusercontent.com/flochrislas/cratefill/main/docs/screenshot.png)
+
+- **Left pane:** load your songs, either from a CSV (artist + song name; extra
+  columns are ignored) or from a folder of music files (**Load folder…** — the
+  folder name + file name become the search query). You can also drag and drop
+  a CSV file or a folder straight onto the song list. Click a column title to sort.
 - **Right pane:** log in to YouTube Music and see your playlists.
 - Select songs on the left, one or more playlists on the right, click **Add** —
   each song is searched on YouTube Music and added to every selected playlist.
 - The log pane shows what matched (`✓`), what matched only loosely (`?` — review these),
   and what wasn't found (`✗`).
+- The reverse works too: select playlists and click **Export CSV…** to save each
+  one as a CSV file with artist, track name, and album columns.
+
+## Get it
+
+- **Windows, no Python:** download `Cratefill.exe` from the
+  [latest release](https://github.com/flochrislas/cratefill/releases/latest)
+  and double-click it.
+- **With Python (any OS):** `pipx install cratefill` (or `pip install cratefill`),
+  then run `cratefill`. Add drag-and-drop with `pipx install "cratefill[dnd]"`.
+- **From source:** see [Run](#run) below.
 
 ## Requirements
 
-- Python 3.10+ (uses the built-in Tkinter GUI — no extra GUI packages)
+- Python 3.10+ (uses the built-in Tkinter GUI)
 - [ytmusicapi](https://github.com/sigma67/ytmusicapi)
+- [tkinterdnd2](https://github.com/Eliav2/tkinterdnd2) (optional — enables
+  drag-and-drop; the app runs fine without it)
 
 ```
 py -m pip install -r requirements.txt

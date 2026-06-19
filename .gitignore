@@ -15,6 +15,15 @@ venv/
 ui_preview.png
 .claude/
 
+# Build artifacts (PyInstaller, sdist/wheel)
+build/
+dist/
+*.spec
+*.egg-info/
+
+# Personal song lists
+old-list.csv
+
 # OS noise
 Thumbs.db
 .DS_Store

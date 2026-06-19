@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cratefill"
+version = "0.1.0"
+description = "Desktop app to move songs between CSV files, music folders, and YouTube Music playlists."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
+authors = [{ name = "flochrislas", email = "florent.globalsign@gmail.com" }]
+keywords = ["youtube-music", "ytmusic", "playlist", "csv", "tkinter", "music"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: X11 Applications",
+    "Environment :: Win32 (MS Windows)",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Sound/Audio",
+]
+dependencies = ["ytmusicapi>=1.12"]
+
+[project.optional-dependencies]
+dnd = ["tkinterdnd2>=0.4"]
+
+[project.urls]
+Homepage = "https://github.com/flochrislas/cratefill"
+Repository = "https://github.com/flochrislas/cratefill"
+Issues = "https://github.com/flochrislas/cratefill/issues"
+
+[project.gui-scripts]
+cratefill = "cratefill:main"
+
+[tool.setuptools]
+py-modules = ["cratefill"]

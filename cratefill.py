@@ -1,10 +1,13 @@
-"""Cratefill — add songs from a CSV file to YouTube Music playlists.
+"""Cratefill — move songs between CSV files, folders and YouTube Music playlists.
 
 Left pane:  songs loaded from a CSV (artist + title columns, optional station
-column shown for reference, extras ignored). Click a column title to sort.
+column shown for reference, extras ignored) or from a folder of music files
+(folder name + file name). Click a column title to sort.
 Right pane: your YouTube Music playlists after logging in.
 Select songs + playlists, click Add: each song is searched on YouTube Music
 and added to every selected playlist. Results are reported in the log pane.
+The reverse also works: select playlists and click "Export CSV…" to save each
+one as an Artist/Title/Album CSV file.
 """
 
 import csv
@@ -18,6 +21,13 @@ from tkinter import filedialog, messagebox, ttk
 
 import ytmusicapi
 from ytmusicapi import YTMusic
+
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+except ImportError:  # optional: without it the app works, minus drag and drop
+    DND_FILES = TkinterDnD = None
+
+__version__ = "0.1.0"
 
 APP_DIR = Path(__file__).resolve().parent
 AUTH_FILE = APP_DIR / "browser.json"
@@ -113,6 +123,8 @@ ARTIST_HEADERS = ("artist", "artiste", "interprete", "interprète")
 TITLE_HEADERS = ("title", "titre", "song", "track", "chanson", "morceau", "name")
 STATION_HEADERS = ("station", "radio", "chaine", "chaîne", "source")
 
+AUDIO_EXTENSIONS = {".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus", ".wav", ".wma"}
+
 # Song Treeview columns: (column id, heading label). The station column is
 # only displayed when the loaded CSV actually has station values.
 SONG_COLUMNS = (("artist", "Artist"), ("title", "Song"), ("station", "Station"))
@@ -186,6 +198,52 @@ def read_songs_csv(path):
         if artist or title:
             songs.append((artist, title, station))
     return songs
+
+
+def read_songs_folder(path):
+    """Return (artist, title, station) tuples from a folder of music files.
+
+    The folder name fills the artist column and the file name (without
+    extension) the title column, so the YouTube Music search query becomes
+    "folder name + file name" — works best for folders named after an artist,
+    an album, or a station whose files are "Artist - Title.ext".
+    """
+    folder = Path(path)
+    artist = " ".join(folder.name.split())
+    return [
+        (artist, " ".join(f.stem.split()), "")
+        for f in sorted(folder.iterdir())
+        if f.is_file() and f.suffix.lower() in AUDIO_EXTENSIONS
+    ]
+
+
+def safe_filename(name):
+    """Turn a playlist title into a usable Windows/Linux file name."""
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip(" .")
+    return name or "playlist"
+
+
+def write_playlist_csv(title, tracks, dest_dir):
+    """Write one playlist to '<title>.csv' in dest_dir and return the Path.
+
+    tracks is the "tracks" list of ytmusicapi's get_playlist(). Columns are
+    Artist, Title, Album (album is often missing — then ""). Existing files
+    are never overwritten; a " (2)", " (3)"… suffix is added instead.
+    """
+    base = safe_filename(title)
+    path = Path(dest_dir) / f"{base}.csv"
+    n = 2
+    while path.exists():
+        path = Path(dest_dir) / f"{base} ({n}).csv"
+        n += 1
+    with path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["Artist", "Title", "Album"])
+        for t in tracks:
+            artists = ", ".join(a.get("name", "") for a in (t.get("artists") or []) if a.get("name"))
+            album = (t.get("album") or {}).get("name", "")
+            writer.writerow([artists, t.get("title", ""), album])
+    return path
 
 
 def normalize(s):
@@ -347,6 +405,7 @@ class CratefillApp:
         left_top = ttk.Frame(left)
         left_top.pack(fill="x", pady=(0, 6))
         ttk.Button(left_top, text="Load CSV…", command=self.load_csv).pack(side="left")
+        ttk.Button(left_top, text="Load folder…", command=self.load_folder).pack(side="left", padx=6)
         self.csv_label = ttk.Label(left_top, text="No file loaded")
         self.csv_label.pack(side="left", padx=8)
         ttk.Button(left_top, text="Select all", command=lambda: self.song_tree.selection_set(
@@ -369,6 +428,13 @@ class CratefillApp:
         self.song_tree.pack(side="left", fill="both", expand=True)
         song_scroll.pack(side="right", fill="y")
 
+        if DND_FILES:
+            try:
+                self.song_tree.drop_target_register(DND_FILES)
+                self.song_tree.dnd_bind("<<Drop>>", self._on_drop)
+            except tk.TclError:
+                pass  # root isn't a TkinterDnD.Tk (tests/previews) — no DnD, app still works
+
         # Right pane: account + playlists
         right = ttk.Frame(panes, padding=(8, 0, 0, 0))
         panes.add(right, weight=2)
@@ -378,6 +444,10 @@ class CratefillApp:
         self.login_button = ttk.Button(right_top, text="Log in…", command=self.login)
         self.login_button.pack(side="left")
         ttk.Button(right_top, text="Refresh", command=self.refresh_playlists).pack(side="left", padx=6)
+        self.export_button = ttk.Button(
+            right_top, text="Export CSV…", command=self.export_playlists
+        )
+        self.export_button.pack(side="left")
         self.account_label = ttk.Label(right_top, text="Not logged in")
         self.account_label.pack(side="left", padx=8)
 
@@ -422,8 +492,10 @@ class CratefillApp:
             title="Open songs CSV",
             filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
         )
-        if not path:
-            return
+        if path:
+            self.load_csv_path(path)
+
+    def load_csv_path(self, path):
         try:
             self.songs = read_songs_csv(path)
         except Exception as e:
@@ -432,6 +504,38 @@ class CratefillApp:
         self.populate_song_tree()
         self.csv_label.configure(text=f"{Path(path).name} — {len(self.songs)} songs")
         self.log(f"Loaded {len(self.songs)} songs from {path}")
+
+    def load_folder(self):
+        path = filedialog.askdirectory(title="Open a folder of music files")
+        if path:
+            self.load_folder_path(path)
+
+    def load_folder_path(self, path):
+        songs = read_songs_folder(path)
+        if not songs:
+            messagebox.showwarning("Cratefill", "No music files found in that folder.")
+            return
+        self.songs = songs
+        self.populate_song_tree()
+        self.csv_label.configure(text=f"{Path(path).name} — {len(self.songs)} songs")
+        self.log(f"Loaded {len(self.songs)} music files from {path}")
+
+    def _on_drop(self, event):
+        """Handle a file/folder dropped onto the song list."""
+        paths = [Path(p) for p in self.song_tree.tk.splitlist(event.data)]
+        if not paths:
+            return
+        if len(paths) > 1:
+            self.log("Multiple items dropped — loading only the first one.")
+        path = paths[0]
+        if path.is_dir():
+            self.load_folder_path(str(path))
+        elif path.suffix.lower() in (".csv", ".txt"):
+            self.load_csv_path(str(path))
+        else:
+            messagebox.showwarning(
+                "Cratefill", "Drop a .csv file (or a folder of music files)."
+            )
 
     def populate_song_tree(self):
         """(Re)fill the tree from self.songs, in CSV order.
@@ -527,9 +631,7 @@ class CratefillApp:
             messagebox.showwarning("Cratefill", "Select at least one playlist on the right.")
             return
 
-        self.working = True
-        self.add_button.configure(state="disabled")
-        self.progress.configure(maximum=len(selected_songs) + len(selected_playlists), value=0)
+        self._start_work(maximum=len(selected_songs) + len(selected_playlists))
         self.log(
             f"--- Adding {len(selected_songs)} song(s) to "
             f"{len(selected_playlists)} playlist(s) ---"
@@ -537,6 +639,32 @@ class CratefillApp:
         threading.Thread(
             target=self._worker, args=(selected_songs, selected_playlists), daemon=True
         ).start()
+
+    def export_playlists(self):
+        """Save each selected playlist as an Artist/Title/Album CSV file."""
+        if self.working:
+            return
+        if not self.yt:
+            messagebox.showwarning("Cratefill", "Log in to YouTube Music first.")
+            return
+        selected = [self.playlists[i] for i in self.playlist_list.curselection()]
+        if not selected:
+            messagebox.showwarning("Cratefill", "Select at least one playlist on the right.")
+            return
+        dest = filedialog.askdirectory(title="Choose where to save the CSV file(s)")
+        if not dest:
+            return
+        self._start_work(maximum=len(selected))
+        self.log(f"--- Exporting {len(selected)} playlist(s) to {dest} ---")
+        threading.Thread(
+            target=self._export_worker, args=(selected, dest), daemon=True
+        ).start()
+
+    def _start_work(self, maximum):
+        self.working = True
+        self.add_button.configure(state="disabled")
+        self.export_button.configure(state="disabled")
+        self.progress.configure(maximum=maximum, value=0)
 
     def _worker(self, songs, playlists):
         """Background thread: search every song, then add matches to each playlist."""
@@ -566,24 +694,64 @@ class CratefillApp:
                                 f"→ {found_artists} — {match.get('title')}"))
             put(("step", None))
 
+        video_ids = list(dict.fromkeys(video_ids))  # two rows can match the same YT song
+
+        def status_of(result):
+            return str(result.get("status", "")) if isinstance(result, dict) else str(result)
+
         for pl in playlists:
             if not video_ids:
                 put(("step", None))
                 continue
             try:
-                result = self.yt.add_playlist_items(pl["playlistId"], video_ids, duplicates=False)
-                status = result.get("status", "") if isinstance(result, dict) else str(result)
-                if "SUCCEEDED" in str(status):
-                    put(("log", f"→ Added {len(video_ids)} song(s) to '{pl['title']}'"))
+                # YT Music rejects the whole batch if even one song is already in
+                # the playlist (no items get added), so on failure drop the songs
+                # it already contains and retry with the rest.
+                to_add = video_ids
+                skipped = 0
+                result = self.yt.add_playlist_items(pl["playlistId"], to_add, duplicates=False)
+                if "SUCCEEDED" not in status_of(result):
+                    existing = {
+                        t.get("videoId")
+                        for t in self.yt.get_playlist(pl["playlistId"], limit=None).get("tracks", [])
+                    }
+                    to_add = [v for v in video_ids if v not in existing]
+                    skipped = len(video_ids) - len(to_add)
+                    if not to_add:
+                        put(("log", f"→ '{pl['title']}': all {len(video_ids)} song(s) "
+                                    "are already in the playlist — nothing to add"))
+                        put(("step", None))
+                        continue
+                    result = self.yt.add_playlist_items(pl["playlistId"], to_add, duplicates=False)
+                status = status_of(result)
+                if "SUCCEEDED" in status:
+                    message = f"→ Added {len(to_add)} song(s) to '{pl['title']}'"
+                    if skipped:
+                        message += f" ({skipped} already there, skipped)"
+                    put(("log", message))
                 else:
-                    put(("log", f"→ '{pl['title']}': {status} "
-                                "(some songs may be duplicates or the playlist is not editable)"))
+                    put(("log", f"→ '{pl['title']}': {status} (playlist not editable, or YT Music "
+                                "sees some of these songs as duplicates under different ids)"))
             except Exception as e:
                 put(("log", f"→ Failed to add to '{pl['title']}': {e}"))
             put(("step", None))
 
         summary = f"--- Done. {len(video_ids)} matched, {not_found} not found. ---"
         put(("log", summary))
+        put(("done", "refresh"))  # playlist counts changed — refetch them
+
+    def _export_worker(self, playlists, dest):
+        """Background thread: fetch each playlist's tracks and write a CSV."""
+        put = self.worker_queue.put
+        for pl in playlists:
+            try:
+                tracks = self.yt.get_playlist(pl["playlistId"], limit=None).get("tracks", [])
+                path = write_playlist_csv(pl["title"], tracks, dest)
+                put(("log", f"→ Saved '{pl['title']}' ({len(tracks)} tracks) to {path.name}"))
+            except Exception as e:
+                put(("log", f"→ Failed to export '{pl['title']}': {e}"))
+            put(("step", None))
+        put(("log", "--- Export done. ---"))
         put(("done", None))
 
     def _poll_worker(self):
@@ -597,15 +765,17 @@ class CratefillApp:
                 elif kind == "done":
                     self.working = False
                     self.add_button.configure(state="normal")
+                    self.export_button.configure(state="normal")
                     self.progress.configure(value=0)
-                    self.refresh_playlists()
+                    if payload == "refresh":
+                        self.refresh_playlists()
         except queue.Empty:
             pass
         self.root.after(100, self._poll_worker)
 
 
 def main():
-    root = tk.Tk()
+    root = TkinterDnD.Tk() if TkinterDnD else tk.Tk()
     apply_dark_theme(root)
     enable_dark_title_bar(root)
     CratefillApp(root)
