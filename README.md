@@ -93,31 +93,6 @@ See `sample.csv` for an example.
 | `browser.json` | Your saved login session (created on first login — keep private) |
 | `RESEARCH.md` | Notes on the approaches considered |
 
-## Releasing (maintainers)
-
-Cratefill is published to [PyPI](https://pypi.org/project/cratefill/) and as a
-GitHub release with a standalone Windows `.exe`.
-
-1. Bump the version in **both** `cratefill.py` (`__version__`) and
-   `pyproject.toml` — keep them identical — and commit.
-2. Tag and push. A `v*` tag triggers the
-   [publish workflow](.github/workflows/publish.yml), which builds and uploads
-   to PyPI via GitHub Actions trusted publishing (no token needed):
-
-   ```
-   git tag v0.2.0
-   git push origin v0.2.0
-   ```
-
-3. Build the standalone exe and attach it to the release:
-
-   ```
-   py -m PyInstaller --onefile --windowed --name Cratefill --collect-all tkinterdnd2 cratefill.py
-   gh release create v0.2.0 dist/Cratefill.exe --title "Cratefill v0.2.0" --notes "…"
-   ```
-
-See `implementation-notes.md` for the full packaging rationale.
-
 ## License
 
 [GNU General Public License v3.0](LICENSE)
