@@ -15,13 +15,37 @@ py -m pip install -r requirements.txt   # ytmusicapi + tkinterdnd2 (optional, dr
 py cratefill.py                        # run the app
 ```
 
-There is no test suite, linter, or build step. Headless smoke test after UI changes:
+There is no test suite or linter (packaging/release commands are under **Releasing**). Headless smoke test after UI changes:
 
 ```powershell
 py -c "import tkinter as tk; from cratefill import CratefillApp; r = tk.Tk(); r.withdraw(); CratefillApp(r); r.update(); r.destroy(); print('OK')"
 ```
 
 `read_songs_csv`, `read_songs_folder`, `pick_match`, `clean_pasted_headers`, `safe_filename`, and `write_playlist_csv` are pure functions — test them directly (e.g. against `sample.csv` or fixture folders/track dicts). Anything hitting YouTube Music (search, playlists, adding, exporting) requires a real logged-in session in `browser.json` and can only be tested manually.
+
+## Releasing
+
+Cratefill ships to **PyPI** (`pip install cratefill`) and as a **GitHub release** carrying a standalone Windows `.exe`. The version lives in **two** places that must stay identical: `__version__` in `cratefill.py` and `version` in `pyproject.toml`.
+
+1. Bump the version in both files, commit, then tag and push:
+
+   ```powershell
+   git tag v0.2.0
+   git push origin v0.2.0
+   ```
+
+   Pushing a `v*` tag triggers `.github/workflows/publish.yml`, which builds the sdist + wheel and publishes to PyPI over OIDC **trusted publishing** — no token is stored. (The one-time PyPI publisher config is already done: owner `flochrislas`, repo `cratefill`, workflow `publish.yml`, environment `pypi`.) Watch the run under the repo's Actions tab.
+
+2. The Windows `.exe` is **not** built by CI (it needs a Windows runner) — build and attach it manually:
+
+   ```powershell
+   py -m PyInstaller --onefile --windowed --name Cratefill --collect-all tkinterdnd2 cratefill.py
+   gh release create v0.2.0 dist/Cratefill.exe --title "Cratefill v0.2.0" --notes "..."
+   ```
+
+   `--collect-all tkinterdnd2` is required — without it the bundled tkdnd binaries are missing and the frozen app crashes at `TkinterDnD.Tk()`.
+
+To inspect the dists before tagging: `py -m build` then `py -m twine check dist/*`. Manual PyPI upload fallback (needs a `pypi-…` token and an **interactive** terminal — it can't be backgrounded, twine prompts for the token): `py -m twine upload dist/cratefill-<ver>*`. Build artifacts (`build/`, `dist/`, `*.spec`) are gitignored.
 
 ## Architecture essentials
 

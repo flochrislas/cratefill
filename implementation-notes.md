@@ -5,7 +5,7 @@ the app does from a user's point of view; this file explains how it's built and
 why. `RESEARCH.md` documents the alternatives that were considered before
 settling on this approach.
 
-*Last updated: 2026-06-11 — matches `cratefill.py` as of that date.*
+*Last updated: 2026-06-19 — matches `cratefill.py` as of that date (v0.1.0).*
 
 ## Stack and key decisions
 
@@ -15,11 +15,12 @@ settling on this approach.
 | YouTube Music access | [ytmusicapi](https://github.com/sigma67/ytmusicapi) (unofficial) | No API quota; searches the actual YT Music song catalog. The official YouTube Data API v3 costs ~150 quota units per track (≈65 tracks/day on the default 10k quota) and searches all of YouTube, not just music — see `RESEARCH.md` |
 | GUI | Tkinter (`ttk` widgets) | Ships with Python — no packaging issues on Windows |
 | Theme | Hand-rolled dark theme on built-in `clam` (`apply_dark_theme()`) | `clam` is the one built-in ttk theme that renders identically on Windows and Linux, so the dark UI is cross-platform with zero dependencies. sv-ttk was tried first and abandoned: on this Python 3.14 / Tk 8.6.15 build it registered its theme name but applied empty style settings (half-light UI). Palette lives in module constants (`BG`, `FIELD`, `BTN`, `FG`, `ACCENT`…); plain tk widgets (Text, Listbox) aren't covered by ttk themes and take `DARK_LIST_STYLE`/`DARK_TEXT_STYLE` directly. The title bar is darkened via `enable_dark_title_bar()` (Windows DWM attribute, best-effort no-op elsewhere; Linux title bars follow the desktop's window manager theme) |
-| Architecture | Single file, `cratefill.py` | Small enough (~370 lines); split only if it grows |
+| Architecture | Single file, `cratefill.py` | Small enough (~780 lines); split only if it grows |
 | Auth persistence | `browser.json` next to the script | ytmusicapi's standard browser-auth file format |
 
-Everything lives in `cratefill.py`. There is no build step, no config file, no
-database. `pip install ytmusicapi` and run.
+Everything lives in `cratefill.py`. There is no database. For day-to-day dev,
+`pip install ytmusicapi` and run; the only build-time artifact is the
+distribution metadata in `pyproject.toml` (see **Packaging & releasing**).
 
 **Dev environment note:** on the original dev machine the bare `python` command
 is a broken Windows Store shim — use the `py` launcher.
@@ -209,6 +210,39 @@ the buttons use). This needs the optional `tkinterdnd2` package and the
 without either, the app degrades to buttons-only (the import is guarded and
 `_build_ui` ignores the `TclError` raised when registering a drop target on a
 plain `tk.Tk()` root — which is what the smoke test and screenshot helper use).
+
+## Packaging & releasing
+
+Distribution metadata is in `pyproject.toml` (setuptools backend, single
+`py-modules = ["cratefill"]` — the app stays one file). `ytmusicapi` is a hard
+dependency; `tkinterdnd2` is the optional `[dnd]` extra. The console entry point
+is `[project.gui-scripts] cratefill = "cratefill:main"` (`gui-scripts`, not
+`scripts`, so Windows launches it without a console window). The version is
+declared in **two** places that must match: `__version__` in `cratefill.py` and
+`version` in `pyproject.toml`.
+
+Two deliverables per release:
+
+1. **PyPI** (`pip install cratefill`). Built with `py -m build` (sdist + wheel),
+   validated with `py -m twine check dist/*`. Publishing is automated:
+   `.github/workflows/publish.yml` runs on any pushed `v*` tag and uploads via
+   GitHub Actions **OIDC trusted publishing** — no API token is stored anywhere.
+   The matching PyPI-side publisher config (owner `flochrislas`, repo
+   `cratefill`, workflow `publish.yml`, environment `pypi`) is a one-time setup
+   already in place. Manual `twine upload` (with a `pypi-…` token) remains a
+   fallback, but must run in an interactive terminal — twine prompts for the
+   token and PyPI has no web upload.
+
+2. **Standalone Windows `.exe`**, attached to the GitHub release. Built with
+   `py -m PyInstaller --onefile --windowed --name Cratefill --collect-all
+   tkinterdnd2 cratefill.py`. The `--collect-all tkinterdnd2` is essential: it
+   bundles the native `tkdnd` binaries, without which the frozen app raises at
+   `TkinterDnD.Tk()` in `main()` and won't start. This step is **not** in CI
+   (it needs a Windows runner) — build locally and `gh release create` with the
+   exe. The README's screenshot is a committed `docs/screenshot.png` referenced
+   by absolute raw-GitHub URL so it renders on the PyPI project page too.
+
+`build/`, `dist/`, and `*.spec` are gitignored.
 
 ## Testing
 
