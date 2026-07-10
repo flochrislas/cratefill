@@ -27,9 +27,15 @@ try:
 except ImportError:  # optional: without it the app works, minus drag and drop
     DND_FILES = TkinterDnD = None
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
-APP_DIR = Path(__file__).resolve().parent
+if getattr(sys, "frozen", False):
+    # PyInstaller --onefile: __file__ resolves inside the temp _MEI... extraction
+    # directory, which is wiped on exit and re-randomized on every launch — so
+    # a browser.json saved there would be lost. Save next to the .exe instead.
+    APP_DIR = Path(sys.executable).resolve().parent
+else:
+    APP_DIR = Path(__file__).resolve().parent
 AUTH_FILE = APP_DIR / "browser.json"
 
 # Dark palette. The ttk side is themed by apply_dark_theme() on top of "clam"

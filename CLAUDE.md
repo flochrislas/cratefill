@@ -39,11 +39,13 @@ Cratefill ships to **PyPI** (`pip install cratefill`) and as a **GitHub release*
 2. The Windows `.exe` is **not** built by CI (it needs a Windows runner) — build and attach it manually:
 
    ```powershell
-   py -m PyInstaller --onefile --windowed --name Cratefill --collect-all tkinterdnd2 cratefill.py
+   py -m PyInstaller --onefile --windowed --name Cratefill --collect-all tkinterdnd2 --collect-all ytmusicapi cratefill.py
    gh release create v0.2.0 dist/Cratefill.exe --title "Cratefill v0.2.0" --notes "..."
    ```
 
-   `--collect-all tkinterdnd2` is required — without it the bundled tkdnd binaries are missing and the frozen app crashes at `TkinterDnD.Tk()`.
+   Both `--collect-all` flags are required:
+   - `tkinterdnd2` bundles the native tkdnd binaries — without it the frozen app crashes at `TkinterDnD.Tk()`.
+   - `ytmusicapi` bundles its `locales/*.mo` gettext files — without them the first ytmusicapi call in the exe (typically `ytmusicapi.setup()` during login) dies with the misleading `[Errno 2] No translation file found for domain: 'base'`, masking the real error.
 
 To inspect the dists before tagging: `py -m build` then `py -m twine check dist/*`. Manual PyPI upload fallback (needs a `pypi-…` token and an **interactive** terminal — it can't be backgrounded, twine prompts for the token): `py -m twine upload dist/cratefill-<ver>*`. Build artifacts (`build/`, `dist/`, `*.spec`) are gitignored.
 

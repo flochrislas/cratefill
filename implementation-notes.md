@@ -235,12 +235,20 @@ Two deliverables per release:
 
 2. **Standalone Windows `.exe`**, attached to the GitHub release. Built with
    `py -m PyInstaller --onefile --windowed --name Cratefill --collect-all
-   tkinterdnd2 cratefill.py`. The `--collect-all tkinterdnd2` is essential: it
-   bundles the native `tkdnd` binaries, without which the frozen app raises at
-   `TkinterDnD.Tk()` in `main()` and won't start. This step is **not** in CI
-   (it needs a Windows runner) — build locally and `gh release create` with the
-   exe. The README's screenshot is a committed `docs/screenshot.png` referenced
-   by absolute raw-GitHub URL so it renders on the PyPI project page too.
+   tkinterdnd2 --collect-all ytmusicapi cratefill.py`. Both `--collect-all`
+   flags are essential:
+   - `tkinterdnd2` bundles the native `tkdnd` binaries, without which the
+     frozen app raises at `TkinterDnD.Tk()` in `main()` and won't start.
+   - `ytmusicapi` bundles its `locales/` gettext `.mo` files. Without them
+     the first ytmusicapi call in the frozen exe (e.g. `ytmusicapi.setup()`
+     during login) dies with the misleading `[Errno 2] No translation file
+     found for domain: 'base'` — masking whatever real error would have been
+     raised (bad headers, missing cookie, etc.).
+
+   This step is **not** in CI (it needs a Windows runner) — build locally
+   and `gh release create` with the exe. The README's screenshot is a
+   committed `docs/screenshot.png` referenced by absolute raw-GitHub URL so
+   it renders on the PyPI project page too.
 
 `build/`, `dist/`, and `*.spec` are gitignored.
 
