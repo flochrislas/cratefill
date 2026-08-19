@@ -1,0 +1,8 @@
+# Files the wheel doesn't need but a source release should carry:
+# sample.csv is read by tests/test_storage.py, and run_cratefill.py is the
+# entry script the Windows .exe is built from.
+include sample.csv
+include run_cratefill.py
+include requirements.txt
+include implementation-notes.md
+include RESEARCH.md

@@ -42,7 +42,7 @@ py -m pip install -r requirements.txt
 Windows:
 
 ```
-py cratefill.py
+py -m cratefill
 ```
 
 Linux (e.g. Ubuntu) — Tkinter is packaged separately from Python there, so install it once:
@@ -50,8 +50,10 @@ Linux (e.g. Ubuntu) — Tkinter is packaged separately from Python there, so ins
 ```
 sudo apt install python3-tk
 python3 -m pip install -r requirements.txt
-python3 cratefill.py
+python3 -m cratefill
 ```
+
+Installed from PyPI (`pip install cratefill`), the `cratefill` command launches it directly.
 
 ## Logging in (first time)
 
@@ -99,7 +101,12 @@ See `sample.csv` for an example.
 
 | File | Purpose |
 |---|---|
-| `cratefill.py` | The app (single file) |
+| `cratefill/app.py` | Tkinter window, theme, dialogs, worker threads |
+| `cratefill/matching.py` | Which search result answers a request (pure) |
+| `cratefill/storage.py` | CSV import/export, music folders, data directory |
+| `cratefill/youtube.py` | YouTube Music calls and credential handling |
+| `run_cratefill.py` | Entry script used to build the Windows `.exe` |
+| `tests/` | Test suite (`py -m pytest`) — no network or login needed |
 | `sample.csv` | Example CSV |
 | `browser.json` | Your saved login session — created on first login in your user profile, *not* here (see [Logging in](#logging-in-first-time)); keep private |
 | `RESEARCH.md` | Notes on the approaches considered |

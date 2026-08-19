@@ -10,6 +10,7 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
+.pytest_cache/
 
 # Generated / local tooling
 ui_preview.png

@@ -5,7 +5,7 @@ the app does from a user's point of view; this file explains how it's built and
 why. `RESEARCH.md` documents the alternatives that were considered before
 settling on this approach.
 
-*Last updated: 2026-06-19 — matches `cratefill.py` as of that date (v0.1.0).*
+*Last updated: 2026-08-19 — matches the `cratefill/` package as of that date (v0.1.1).*
 
 ## Stack and key decisions
 
@@ -15,32 +15,54 @@ settling on this approach.
 | YouTube Music access | [ytmusicapi](https://github.com/sigma67/ytmusicapi) (unofficial) | No API quota; searches the actual YT Music song catalog. The official YouTube Data API v3 costs ~150 quota units per track (≈65 tracks/day on the default 10k quota) and searches all of YouTube, not just music — see `RESEARCH.md` |
 | GUI | Tkinter (`ttk` widgets) | Ships with Python — no packaging issues on Windows |
 | Theme | Hand-rolled dark theme on built-in `clam` (`apply_dark_theme()`) | `clam` is the one built-in ttk theme that renders identically on Windows and Linux, so the dark UI is cross-platform with zero dependencies. sv-ttk was tried first and abandoned: on this Python 3.14 / Tk 8.6.15 build it registered its theme name but applied empty style settings (half-light UI). Palette lives in module constants (`BG`, `FIELD`, `BTN`, `FG`, `ACCENT`…); plain tk widgets (Text, Listbox) aren't covered by ttk themes and take `DARK_LIST_STYLE`/`DARK_TEXT_STYLE` directly. The title bar is darkened via `enable_dark_title_bar()` (Windows DWM attribute, best-effort no-op elsewhere; Linux title bars follow the desktop's window manager theme) |
-| Architecture | Single file, `cratefill.py` | Small enough (~780 lines); split only if it grows |
+| Architecture | Small package, `cratefill/` (`app`, `matching`, `storage`, `youtube`) | Started as one file; split at ~1100 lines because UI layout, matching rules, local file handling and YouTube Music communication change for unrelated reasons, and the improved matching system needs a pure, testable core. Kept deliberately modest — no `utils.py`, no module-per-class |
 | Auth persistence | `browser.json` in the per-user data dir (`user_data_dir()`) | ytmusicapi's standard browser-auth file format. Kept out of the app directory: that can be read-only for system-wide installs, is wiped on every launch under PyInstaller `--onefile`, and invites copying session cookies around with the executable. Created `0600` in a `0700` directory on POSIX, since ytmusicapi writes it with the process umask |
 
-Everything lives in `cratefill.py`. There is no database. For day-to-day dev,
-`pip install ytmusicapi` and run; the only build-time artifact is the
-distribution metadata in `pyproject.toml` (see **Packaging & releasing**).
+There is no database. For day-to-day dev, `pip install -e ".[dev]"` and run
+`py -m cratefill`; the only build-time artifact is the distribution metadata in
+`pyproject.toml` (see **Packaging & releasing**).
 
 **Dev environment note:** on the original dev machine the bare `python` command
 is a broken Windows Store shim — use the `py` launcher.
 
-## Code structure (`cratefill.py`)
+## Code structure (`cratefill/`)
 
 ```
-module level
-├── constants: APP_DIR, AUTH_FILE, ARTIST/TITLE/STATION_HEADERS, SONG_COLUMNS,
-│                LOGIN_INSTRUCTIONS
-├── read_songs_csv(path)        # CSV → list[(artist, title, station)]
-├── read_songs_folder(path)     # music files → list[(folder, file stem, "")]
-├── clean_pasted_headers(raw)   # DevTools paste → {header: value}
-├── normalize(s) / pick_match() # search-result matching heuristic
-├── safe_filename(name)         # playlist title → legal file name
-├── write_playlist_csv(...)     # get_playlist tracks → Artist/Title/Album CSV
-├── class LoginDialog(Toplevel) # paste-headers auth dialog
-├── class CratefillApp         # main window + all behavior
-└── main()
+cratefill/
+├── __init__.py    __version__ only — the single source of the version, and kept
+│                  import-light because setuptools reads the attribute
+├── __main__.py    python -m cratefill → app.main()
+├── matching.py    normalize(s), pick_match(results, artist, title)
+│                  pure: zero imports, no I/O, deterministic
+├── storage.py     user_data_dir()            per-user data directory
+│                  read_songs_csv(path)       CSV → list[(artist, title, station)]
+│                  read_songs_folder(path)    music files → list[(folder, stem, "")]
+│                  safe_filename(name)        playlist title → legal file name
+│                  write_playlist_csv(...)    tracks → Artist/Title/Album CSV
+│                  ARTIST/TITLE/STATION_HEADERS, AUDIO_EXTENSIONS
+├── youtube.py     AUTH_FILE, LEGACY_AUTH_FILE, secure_auth_dir/file(),
+│                  migrate_legacy_auth_file()
+│                  clean_pasted_headers(raw)  DevTools paste → {header: value}
+│                  open_session()             saved session → YTMusic client
+│                  save_credentials(headers)  stage, validate, atomically install
+│                  fetch_playlists(yt, put)
+│                  add_songs_to_playlists(yt, songs, playlists, put)
+│                  export_playlists_to_csv(yt, playlists, dest, put)
+└── app.py         palette + apply_dark_theme(), enable_dark_title_bar()
+                   SONG_COLUMNS, LOGIN_INSTRUCTIONS, HELP_TEXT
+                   class LoginDialog(Toplevel)  paste-headers auth dialog
+                   class CratefillApp           window, selections, threads, queue
+                   main()
+
+run_cratefill.py   PyInstaller entry script (see PyInstaller section)
+tests/             test_matching.py, test_storage.py, test_workers.py
 ```
+
+Dependency direction is one-way: `app → youtube → {storage, matching}`. Nothing
+imports `app`. `matching.py` imports nothing at all; `storage.py` and
+`youtube.py` never import Tkinter; `app.py` makes no `yt.*` call of its own.
+Those four properties are what keep the test suite free of Tk and network, and
+they are worth asserting in review.
 
 ### `read_songs_csv(path)` — CSV ingestion
 
@@ -278,13 +300,18 @@ plain `tk.Tk()` root — which is what the smoke test and screenshot helper use)
 
 ## Packaging & releasing
 
-Distribution metadata is in `pyproject.toml` (setuptools backend, single
-`py-modules = ["cratefill"]` — the app stays one file). `ytmusicapi` is a hard
-dependency; `tkinterdnd2` is the optional `[dnd]` extra. The console entry point
-is `[project.gui-scripts] cratefill = "cratefill:main"` (`gui-scripts`, not
-`scripts`, so Windows launches it without a console window). The version is
-declared in **two** places that must match: `__version__` in `cratefill.py` and
-`version` in `pyproject.toml`.
+Distribution metadata is in `pyproject.toml` (setuptools backend, package
+discovery via `[tool.setuptools.packages.find] include = ["cratefill*"]`, which
+also keeps `tests/` out of the wheel). `ytmusicapi` is a hard dependency;
+`tkinterdnd2` is the optional `[dnd]` extra and `pytest` the `[dev]` extra. The
+console entry point is `[project.gui-scripts] cratefill = "cratefill.app:main"`
+(`gui-scripts`, not `scripts`, so Windows launches it without a console window).
+
+The version is declared **once**, as `__version__` in `cratefill/__init__.py`;
+`pyproject.toml` marks it `dynamic` and reads it back through
+`[tool.setuptools.dynamic] version = { attr = "cratefill.__version__" }`. That
+attribute read is the reason `__init__.py` must not import the GUI — setuptools
+has to get the version without pulling in Tkinter.
 
 Two deliverables per release:
 
@@ -300,8 +327,10 @@ Two deliverables per release:
 
 2. **Standalone Windows `.exe`**, attached to the GitHub release. Built with
    `py -m PyInstaller --onefile --windowed --name Cratefill --collect-all
-   tkinterdnd2 --collect-all ytmusicapi cratefill.py`. Both `--collect-all`
-   flags are essential:
+   tkinterdnd2 --collect-all ytmusicapi run_cratefill.py`. Build from
+   `run_cratefill.py`, not from `cratefill/__main__.py`: bundlers execute a
+   package's `__main__.py` as an ordinary script, which breaks its relative
+   imports. Both `--collect-all` flags are essential:
    - `tkinterdnd2` bundles the native `tkdnd` binaries, without which the
      frozen app raises at `TkinterDnD.Tk()` in `main()` and won't start.
    - `ytmusicapi` bundles its `locales/` gettext `.mo` files. Without them
@@ -319,17 +348,34 @@ Two deliverables per release:
 
 ## Testing
 
-There is no test suite yet. What was verified at build time:
+`py -m pytest` (pytest is the `[dev]` extra). The suite needs no Tk window, no
+network and no `browser.json` — that independence is the main practical payoff of
+the package split, so keep it.
 
-- `read_songs_csv`: header detection (`sample.csv`), French semicolon CSV with
-  accents, headerless two-column CSV.
-- UI construction: `root = tk.Tk(); root.withdraw(); CratefillApp(root);
-  root.update(); root.destroy()` — catches widget-level errors headlessly.
-- **Not** verified automatically: anything that hits YouTube Music (needs a
-  real session). Test manually with `sample.csv` and a throwaway playlist.
-
-`read_songs_csv` and `pick_match` are pure and are the natural first targets
-if a pytest suite is added.
+- **`tests/test_matching.py`** — `normalize()` and `pick_match()` directly:
+  casefolding/punctuation/accents, confident vs fallback vs no match, and a
+  parametrised sweep of malformed ytmusicapi shapes (`artists=None`, missing
+  keys, nameless artists, non-dict entries, `results=None`). Those last ones are
+  regression tests: a result with `artists=None` used to raise inside
+  `pick_match` and take the worker thread down with it.
+- **`tests/test_storage.py`** — CSV encodings (BOM, cp1252), delimiters
+  (`,` `;` tab), English/French headers, headerless files, station-by-header-name
+  only, quoted fields; `read_songs_folder` including its deliberate
+  non-recursiveness; `safe_filename`; `write_playlist_csv` collision suffixes and
+  missing artists/album. `sample.csv` is resolved relative to the test file, not
+  the working directory.
+- **`tests/test_workers.py`** — a `FakeYT` double and a list for `put`, against
+  `youtube.add_songs_to_playlists` / `export_playlists_to_csv` /
+  `fetch_playlists`: search failure, no match, uncertain match, videoId dedup,
+  the already-in-playlist retry, per-playlist failure isolation, step counts.
+  The completion guarantee is tested by calling the unbound wrappers on a stub
+  holding only a `worker_queue`, so no Tk instance is needed.
+- Headless UI construction is still the quick manual check after widget changes:
+  `root = tk.Tk(); root.withdraw(); CratefillApp(root); root.update(); root.destroy()`.
+- **Not** covered automatically: real search quality and real playlist mutation
+  (needs a live session). Test those manually with `sample.csv` and a throwaway
+  playlist. `_screenshot_preview.py` also needs a real X display — Pillow's
+  `ImageGrab` cannot grab the root window under Wayland/XWayland.
 
 ## Known limitations / ideas for whoever takes over
 

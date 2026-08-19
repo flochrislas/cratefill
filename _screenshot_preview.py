@@ -3,7 +3,8 @@ import tkinter as tk
 
 from PIL import ImageGrab
 
-from cratefill import CratefillApp, apply_dark_theme, enable_dark_title_bar, read_songs_csv
+from cratefill.app import CratefillApp, apply_dark_theme, enable_dark_title_bar
+from cratefill.storage import read_songs_csv
 
 root = tk.Tk()
 apply_dark_theme(root)

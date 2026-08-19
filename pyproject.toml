@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cratefill"
-version = "0.1.1"
+dynamic = ["version"]  # read from cratefill/__init__.py — bump the version there only
 description = "Desktop app to move songs between CSV files, music folders, and YouTube Music playlists."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -26,6 +26,7 @@ dependencies = ["ytmusicapi>=1.12"]
 
 [project.optional-dependencies]
 dnd = ["tkinterdnd2>=0.4"]
+dev = ["pytest>=7"]
 
 [project.urls]
 Homepage = "https://github.com/flochrislas/cratefill"
@@ -33,7 +34,15 @@ Repository = "https://github.com/flochrislas/cratefill"
 Issues = "https://github.com/flochrislas/cratefill/issues"
 
 [project.gui-scripts]
-cratefill = "cratefill:main"
+cratefill = "cratefill.app:main"
 
-[tool.setuptools]
-py-modules = ["cratefill"]
+[tool.setuptools.dynamic]
+version = { attr = "cratefill.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["cratefill*"]  # keeps tests/ out of the wheel
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Import cratefill from the checkout, so `pytest` works without installing first.
+pythonpath = ["."]

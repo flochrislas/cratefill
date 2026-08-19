@@ -1,4 +1,4 @@
-"""Cratefill — move songs between CSV files, folders and YouTube Music playlists.
+"""The Tkinter application: window, theme, dialogs and worker orchestration.
 
 Left pane:  songs loaded from a CSV (artist + title columns, optional station
 column shown for reference, extras ignored) or from a folder of music files
@@ -8,94 +8,26 @@ Select songs + playlists, click Add: each song is searched on YouTube Music
 and added to every selected playlist. Results are reported in the Messages pane.
 The reverse also works: select playlists and click "Export CSV…" to save each
 one as an Artist/Title/Album CSV file.
+
+This module owns presentation and threading only. The matching rules live in
+matching.py, local files in storage.py, and every network call in youtube.py.
 """
 
-import csv
-import os
 import queue
-import re
 import sys
-import tempfile
 import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-import ytmusicapi
-from ytmusicapi import YTMusic
+from . import youtube
+from .storage import read_songs_csv, read_songs_folder
+from .youtube import AUTH_FILE, clean_pasted_headers, migrate_legacy_auth_file, secure_auth_file
 
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
 except ImportError:  # optional: without it the app works, minus drag and drop
     DND_FILES = TkinterDnD = None
-
-__version__ = "0.1.1"
-
-def user_data_dir():
-    """Per-user directory for browser.json, following each platform's convention.
-
-    Deliberately *not* next to the script or the .exe: that location can be
-    read-only (system-wide installs), gets wiped on every launch under
-    PyInstaller --onefile, and invites copying the session cookies around
-    together with the executable.
-    """
-    if sys.platform == "win32":
-        base = os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming"
-        return Path(base) / "Cratefill"
-    if sys.platform == "darwin":
-        return Path.home() / "Library" / "Application Support" / "Cratefill"
-    base = os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config"
-    return Path(base) / "cratefill"
-
-
-AUTH_FILE = user_data_dir() / "browser.json"
-# Where browser.json used to live in earlier versions; migrated away on startup.
-LEGACY_AUTH_FILE = Path(
-    sys.executable if getattr(sys, "frozen", False) else __file__
-).resolve().parent / "browser.json"
-
-
-def secure_auth_dir():
-    """Create the data directory, owner-only on POSIX."""
-    AUTH_FILE.parent.mkdir(parents=True, exist_ok=True)
-    if os.name == "posix":
-        try:
-            AUTH_FILE.parent.chmod(0o700)
-        except OSError:
-            pass  # best effort; the file mode below is what actually matters
-
-
-def secure_auth_file(path=None):
-    """Restrict a credentials file to the owner — ytmusicapi writes it with the
-    process umask, which commonly leaves it world-readable."""
-    path = AUTH_FILE if path is None else Path(path)
-    if os.name == "posix" and path.exists():
-        try:
-            path.chmod(0o600)
-        except OSError:
-            pass
-
-
-def migrate_legacy_auth_file():
-    """Move an older browser.json into the user data dir, so upgrading
-    doesn't force a re-login and no readable copy is left behind."""
-    if LEGACY_AUTH_FILE == AUTH_FILE or not LEGACY_AUTH_FILE.exists():
-        return False
-    try:
-        secure_auth_dir()
-        if not AUTH_FILE.exists():
-            # Copy through os.open rather than replace()/shutil.move: the old and
-            # new locations are often on different filesystems, and this way the
-            # new file is never momentarily readable by anyone else.
-            data = LEGACY_AUTH_FILE.read_bytes()
-            fd = os.open(AUTH_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            with os.fdopen(fd, "wb") as f:
-                f.write(data)
-        LEGACY_AUTH_FILE.unlink()  # leave no readable copy behind
-        secure_auth_file()
-        return True
-    except OSError:
-        return False  # unwritable data dir: leave the old file alone, user re-logs in
 
 # Dark palette. The ttk side is themed by apply_dark_theme() on top of "clam"
 # (the only built-in theme that renders identically on Windows and Linux);
@@ -197,12 +129,6 @@ def enable_dark_title_bar(window):
     except Exception:
         pass  # cosmetic only — never block startup over it
 
-ARTIST_HEADERS = ("artist", "artiste", "interprete", "interprète")
-TITLE_HEADERS = ("title", "titre", "song", "track", "chanson", "morceau", "name")
-STATION_HEADERS = ("station", "radio", "chaine", "chaîne", "source")
-
-AUDIO_EXTENSIONS = {".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus", ".wav", ".wma"}
-
 # Song Treeview columns: (column id, heading label). The station column is
 # only displayed when the loaded CSV actually has station values.
 SONG_COLUMNS = (("artist", "Artist"), ("title", "Song"), ("station", "Station"))
@@ -235,188 +161,6 @@ How to use:
 4. Click the big "Add selected songs to selected playlist(s)" button.
 
 You can also export the list of songs from a selected playlist into a CSV file."""
-
-
-def read_songs_csv(path):
-    """Return a list of (artist, title, station) tuples from a CSV file.
-
-    Detects the delimiter, and finds the columns by header name; falls back
-    to artist/title in the first two columns when headers are unrecognized.
-    The station (where the user heard the song) is optional, only picked up
-    from a recognized header, and "" when absent.
-    """
-    raw = Path(path).read_bytes()
-    for encoding in ("utf-8-sig", "cp1252"):
-        try:
-            text = raw.decode(encoding)
-            break
-        except UnicodeDecodeError:
-            continue
-    else:
-        text = raw.decode("utf-8", errors="replace")
-
-    sample = text[:4096]
-    try:
-        dialect = csv.Sniffer().sniff(sample, delimiters=",;\t")
-    except csv.Error:
-        dialect = csv.excel
-
-    rows = [row for row in csv.reader(text.splitlines(), dialect) if any(cell.strip() for cell in row)]
-    if not rows:
-        return []
-
-    header = [cell.strip().casefold() for cell in rows[0]]
-    artist_col = next((i for i, h in enumerate(header) if h in ARTIST_HEADERS), None)
-    title_col = next((i for i, h in enumerate(header) if h in TITLE_HEADERS), None)
-    station_col = next((i for i, h in enumerate(header) if h in STATION_HEADERS), None)
-    if artist_col is not None and title_col is not None:
-        rows = rows[1:]
-    else:
-        artist_col, title_col = 0, 1
-        # Drop the first row anyway if it looks like a header we just couldn't map.
-        if header and any(h in ARTIST_HEADERS + TITLE_HEADERS for h in header):
-            rows = rows[1:]
-        else:
-            station_col = None  # no header row, so no way to spot a station column
-
-    songs = []
-    for row in rows:
-        if len(row) <= max(artist_col, title_col):
-            continue
-        artist = row[artist_col].strip()
-        title = row[title_col].strip()
-        station = row[station_col].strip() if station_col is not None and station_col < len(row) else ""
-        if artist or title:
-            songs.append((artist, title, station))
-    return songs
-
-
-def read_songs_folder(path):
-    """Return (artist, title, station) tuples from a folder of music files.
-
-    The folder name fills the artist column and the file name (without
-    extension) the title column, so the YouTube Music search query becomes
-    "folder name + file name" — works best for folders named after an artist,
-    an album, or a station whose files are "Artist - Title.ext".
-    """
-    folder = Path(path)
-    artist = " ".join(folder.name.split())
-    return [
-        (artist, " ".join(f.stem.split()), "")
-        for f in sorted(folder.iterdir())
-        if f.is_file() and f.suffix.lower() in AUDIO_EXTENSIONS
-    ]
-
-
-def safe_filename(name):
-    """Turn a playlist title into a usable Windows/Linux file name."""
-    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip(" .")
-    return name or "playlist"
-
-
-def write_playlist_csv(title, tracks, dest_dir):
-    """Write one playlist to '<title>.csv' in dest_dir and return the Path.
-
-    tracks is the "tracks" list of ytmusicapi's get_playlist(). Columns are
-    Artist, Title, Album (album is often missing — then ""). Existing files
-    are never overwritten; a " (2)", " (3)"… suffix is added instead.
-    """
-    base = safe_filename(title)
-    path = Path(dest_dir) / f"{base}.csv"
-    n = 2
-    while path.exists():
-        path = Path(dest_dir) / f"{base} ({n}).csv"
-        n += 1
-    with path.open("w", newline="", encoding="utf-8") as fh:
-        writer = csv.writer(fh)
-        writer.writerow(["Artist", "Title", "Album"])
-        for t in tracks:
-            artists = ", ".join(a.get("name", "") for a in (t.get("artists") or []) if a.get("name"))
-            album = (t.get("album") or {}).get("name", "")
-            writer.writerow([artists, t.get("title", ""), album])
-    return path
-
-
-def normalize(s):
-    """Casefold and strip punctuation. Tolerates None: YT Music leaves fields
-    like "title" or an artist "name" out (or null) on some results."""
-    return "".join(c for c in (s or "").casefold() if c.isalnum() or c.isspace()).strip()
-
-
-def pick_match(results, artist, title):
-    """Pick the best search result. Returns (result, confident) or (None, False).
-
-    Defensive about the shape of `results`: it comes straight from an
-    unofficial API, where "artists" can be absent, null, or hold entries
-    without a name. A TypeError here used to kill the whole worker thread.
-    """
-    want_artist, want_title = normalize(artist), normalize(title)
-    candidates = [
-        r for r in (results or []) if isinstance(r, dict) and r.get("videoId")
-    ]
-    for r in candidates:
-        got_title = normalize(r.get("title"))
-        got_artists = [
-            normalize(a.get("name"))
-            for a in (r.get("artists") or [])
-            if isinstance(a, dict)
-        ]
-        # Both titles must be non-empty: "" is a substring of everything, so a
-        # result with no title would otherwise pass as a confident match.
-        title_ok = bool(want_title and got_title) and (
-            want_title in got_title or got_title in want_title
-        )
-        artist_ok = not want_artist or any(
-            want_artist in a or a in want_artist for a in got_artists if a
-        )
-        if title_ok and artist_ok:
-            return r, True
-    if candidates:
-        return candidates[0], False
-    return None, False
-
-
-# Plausible header name, optionally with the ":" prefix of HTTP/2 pseudo-headers
-# (":authority") or the trailing ":" Chrome sometimes keeps on name lines.
-HEADER_NAME_RE = re.compile(r":?[A-Za-z][A-Za-z0-9_-]*:?")
-
-
-def clean_pasted_headers(raw):
-    """Rebuild a {name: value} dict from request headers pasted out of DevTools.
-
-    Accepts both the one-line format ("name: value", e.g. Firefox's Copy
-    Request Headers) and the Chrome/Edge headers-panel selection, where names
-    and values land on alternating lines. HTTP/2 pseudo-headers (":authority"
-    etc.) and the decoded x-client-data protobuf block are dropped: fed
-    straight to ytmusicapi they desync its parser into writing bogus headers
-    (e.g. a request path as a header name) that make YouTube reject every
-    request with a non-JSON error.
-    """
-    headers = {}
-    pending = None  # header name waiting for its value on the next line
-    in_decoded = False
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        if in_decoded:
-            in_decoded = line != "}"
-        elif pending is not None:
-            if not pending.startswith(":"):
-                headers[pending] = line
-            pending = None
-        elif line.startswith("Decoded:"):
-            in_decoded = True
-        else:
-            name, sep, value = line.partition(":")
-            if sep and value.strip() and HEADER_NAME_RE.fullmatch(name):
-                headers[name.lower()] = value.strip()
-            elif HEADER_NAME_RE.fullmatch(line):
-                # Name alone on its line; pseudo-header names keep their ":"
-                # so the pair is consumed but not stored. Anything else
-                # (request line, protobuf leftovers) is ignored.
-                pending = line.rstrip(":").lower()
-    return headers
 
 
 class LoginDialog(tk.Toplevel):
@@ -485,27 +229,7 @@ class LoginDialog(tk.Toplevel):
         the exception. Touches no widget.
         """
         try:
-            secure_auth_dir()
-            # Stage the new credentials in a sibling file and only swap them in
-            # once they are known to work, so a mistyped re-login leaves the
-            # existing session untouched. Same directory means same filesystem,
-            # which is what makes os.replace atomic.
-            fd, tmp_name = tempfile.mkstemp(
-                dir=AUTH_FILE.parent, prefix=".browser-", suffix=".json"
-            )
-            os.close(fd)  # mkstemp created it 0600; setup() rewrites it in place
-            staged = Path(tmp_name)
-            try:
-                ytmusicapi.setup(
-                    filepath=str(staged),
-                    headers_raw="\n".join(f"{k}: {v}" for k, v in headers.items()),
-                )
-                secure_auth_file(staged)  # ytmusicapi writes with the process umask
-                YTMusic(str(staged)).get_library_playlists(limit=1)  # validate
-                os.replace(staged, AUTH_FILE)  # atomic: never a half-written session
-            except BaseException:
-                staged.unlink(missing_ok=True)
-                raise
+            youtube.save_credentials(headers)
         except Exception as e:
             self.result_queue.put(e)
         else:
@@ -795,12 +519,12 @@ class CratefillApp:
         """Worker thread: open the saved session, then fetch its playlists."""
         put = self.worker_queue.put
         try:
-            yt = YTMusic(str(AUTH_FILE))
+            yt = youtube.open_session()
         except Exception as e:
             put(("connect_failed", (silent, str(e))))
         else:
             put(("connected", yt))
-            self._put_playlists(yt)
+            youtube.fetch_playlists(yt, put)
         finally:
             put(("done", None))
 
@@ -817,21 +541,9 @@ class CratefillApp:
 
     def _refresh_worker(self, yt):
         try:
-            self._put_playlists(yt)
+            youtube.fetch_playlists(yt, self.worker_queue.put)
         finally:
             self.worker_queue.put(("done", None))
-
-    def _put_playlists(self, yt):
-        """Worker thread: fetch the playlists and hand them to the UI.
-
-        Swallows its own errors so callers can use it as a final step without
-        losing whatever they already reported.
-        """
-        try:
-            self.worker_queue.put(("playlists", yt.get_library_playlists(limit=None)))
-        except Exception as e:
-            self.worker_queue.put(("log", f"Could not fetch playlists: {e}"))
-            self.worker_queue.put(("account", "Login expired? Re-log in."))
 
     def _show_playlists(self, playlists):
         """Main thread: refill the playlist Listbox."""
@@ -930,96 +642,18 @@ class CratefillApp:
         data, say — would leave the UI unusable until restart. Hence the
         try/finally: the thread cannot exit without re-enabling the UI.
         """
-        try:
-            self._add_to_playlists(yt, songs, playlists)
-        except Exception as e:
-            self.worker_queue.put(
-                ("log", f"✗ Unexpected error while adding: {type(e).__name__}: {e}")
-            )
-        finally:
-            self._put_playlists(yt)  # the track counts just changed — refetch here,
-            self.worker_queue.put(("done", None))  # still off the UI thread
-
-    def _add_to_playlists(self, yt, songs, playlists):
-        """Search every song, then add the matches to each playlist.
-
-        `yt` is passed in rather than read off self, so the job stays bound to
-        one account even if the user logs into another one afterwards.
-        """
         put = self.worker_queue.put
-        video_ids = []
-        not_found = 0
-        for artist, title, _station in songs:  # station is context for the user, not a search term
-            query = f"{artist} {title}".strip()
+        try:
+            youtube.add_songs_to_playlists(yt, songs, playlists, put)
+        except Exception as e:
+            put(("log", f"✗ Unexpected error while adding: {type(e).__name__}: {e}"))
+        finally:
+            # The refetch is nested so that nothing it does can stop the "done"
+            # message: that message is the only thing that re-enables the UI.
             try:
-                results = yt.search(query, filter="songs", limit=5)
-            except Exception as e:
-                put(("log", f"✗ {artist} — {title}: search failed ({e})"))
-                put(("step", None))
-                not_found += 1
-                continue
-            match, confident = pick_match(results, artist, title)
-            if match is None:
-                put(("log", f"✗ {artist} — {title}: no match found"))
-                not_found += 1
-            else:
-                video_ids.append(match["videoId"])
-                found_artists = ", ".join(
-                    a.get("name") or ""
-                    for a in (match.get("artists") or [])
-                    if isinstance(a, dict)
-                )
-                if confident:
-                    put(("log", f"✓ {artist} — {title}"))
-                else:
-                    put(("log", f"? {artist} — {title}: uncertain match "
-                                f"→ {found_artists} — {match.get('title')}"))
-            put(("step", None))
-
-        video_ids = list(dict.fromkeys(video_ids))  # two rows can match the same YT song
-
-        def status_of(result):
-            return str(result.get("status", "")) if isinstance(result, dict) else str(result)
-
-        for pl in playlists:
-            if not video_ids:
-                put(("step", None))
-                continue
-            try:
-                # YT Music rejects the whole batch if even one song is already in
-                # the playlist (no items get added), so on failure drop the songs
-                # it already contains and retry with the rest.
-                to_add = video_ids
-                skipped = 0
-                result = yt.add_playlist_items(pl["playlistId"], to_add, duplicates=False)
-                if "SUCCEEDED" not in status_of(result):
-                    existing = {
-                        t.get("videoId")
-                        for t in yt.get_playlist(pl["playlistId"], limit=None).get("tracks", [])
-                    }
-                    to_add = [v for v in video_ids if v not in existing]
-                    skipped = len(video_ids) - len(to_add)
-                    if not to_add:
-                        put(("log", f"→ '{pl['title']}': all {len(video_ids)} song(s) "
-                                    "are already in the playlist — nothing to add"))
-                        put(("step", None))
-                        continue
-                    result = yt.add_playlist_items(pl["playlistId"], to_add, duplicates=False)
-                status = status_of(result)
-                if "SUCCEEDED" in status:
-                    message = f"→ Added {len(to_add)} song(s) to '{pl['title']}'"
-                    if skipped:
-                        message += f" ({skipped} already there, skipped)"
-                    put(("log", message))
-                else:
-                    put(("log", f"→ '{pl['title']}': {status} (playlist not editable, or YT Music "
-                                "sees some of these songs as duplicates under different ids)"))
-            except Exception as e:
-                put(("log", f"→ Failed to add to '{pl['title']}': {e}"))
-            put(("step", None))
-
-        summary = f"--- Done. {len(video_ids)} matched, {not_found} not found. ---"
-        put(("log", summary))
+                youtube.fetch_playlists(yt, put)  # counts changed — refetch here,
+            finally:                              # still off the UI thread
+                put(("done", None))
 
     def _export_worker(self, yt, playlists, dest):
         """Background thread entry point: always reports completion.
@@ -1027,27 +661,13 @@ class CratefillApp:
         See _worker for why the try/finally is not optional.
         """
         try:
-            self._export_to_csv(yt, playlists, dest)
+            youtube.export_playlists_to_csv(yt, playlists, dest, self.worker_queue.put)
         except Exception as e:
             self.worker_queue.put(
                 ("log", f"✗ Unexpected error while exporting: {type(e).__name__}: {e}")
             )
         finally:
             self.worker_queue.put(("done", None))
-
-    def _export_to_csv(self, yt, playlists, dest):
-        """Fetch each playlist's tracks and write a CSV. `yt` is the snapshot
-        taken when the job started — see _add_to_playlists."""
-        put = self.worker_queue.put
-        for pl in playlists:
-            try:
-                tracks = yt.get_playlist(pl["playlistId"], limit=None).get("tracks", [])
-                path = write_playlist_csv(pl["title"], tracks, dest)
-                put(("log", f"→ Saved '{pl['title']}' ({len(tracks)} tracks) to {path.name}"))
-            except Exception as e:
-                put(("log", f"→ Failed to export '{pl['title']}': {e}"))
-            put(("step", None))
-        put(("log", "--- Export done. ---"))
 
     def _poll_worker(self):
         # The reschedule lives in a finally: if draining ever raises, dropping
