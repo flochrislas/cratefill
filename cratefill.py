@@ -5,7 +5,7 @@ column shown for reference, extras ignored) or from a folder of music files
 (folder name + file name). Click a column title to sort.
 Right pane: your YouTube Music playlists after logging in.
 Select songs + playlists, click Add: each song is searched on YouTube Music
-and added to every selected playlist. Results are reported in the log pane.
+and added to every selected playlist. Results are reported in the Messages pane.
 The reverse also works: select playlists and click "Export CSV…" to save each
 one as an Artist/Title/Album CSV file.
 """
@@ -50,6 +50,7 @@ FG_DIM = "#888888"
 BORDER = "#3c3c3c"
 ACCENT = "#0f4a8a"    # selection background
 ACCENT_BAR = "#4a9eff" # progress bar fill
+READY = "#3ddc84"     # "you can go now": Add button outline once songs + playlists are picked
 
 DARK_LIST_STYLE = dict(
     bg=FIELD,
@@ -78,11 +79,23 @@ def apply_dark_theme(root):
         selectbackground=ACCENT, selectforeground="#ffffff",
         insertcolor=FG,
     )
-    style.configure("TButton", background=BTN, padding=(10, 5))
+    style.configure("TButton", background=BTN, padding=(10, 5), borderwidth=2)
     style.map(
         "TButton",
         background=[("disabled", BG), ("pressed", "#2a2a2a"), ("active", BTN_ACTIVE)],
         foreground=[("disabled", FG_DIM)],
+    )
+    # Same geometry as TButton (borderwidth included) so swapping styles never
+    # shifts the layout — only the border and label colour change.
+    style.configure("Ready.TButton", bordercolor=READY, lightcolor=READY, darkcolor=READY,
+                    foreground=READY)
+    style.map(
+        "Ready.TButton",
+        background=[("disabled", BG), ("pressed", "#2a2a2a"), ("active", BTN_ACTIVE)],
+        foreground=[("disabled", FG_DIM), ("active", READY)],
+        bordercolor=[("disabled", BORDER)],
+        lightcolor=[("disabled", BG)],
+        darkcolor=[("disabled", BG)],
     )
     style.configure("Treeview", background=FIELD, fieldbackground=FIELD, rowheight=24)
     style.map(
@@ -150,6 +163,17 @@ To log in, Cratefill needs the request headers of your YouTube Music session:
 
 Your session is saved locally in browser.json next to the app, so you only
 need to do this once (until you log out of YouTube in that browser)."""
+
+# Shown in the Messages pane at startup, so the app never opens on a blank window.
+HELP_TEXT = """\
+How to use:
+
+1. Load a list of songs from a CSV file or a folder.
+2. Log into YouTube Music and select a playlist.
+3. Select the songs you want to add to this playlist.
+4. Click the big "Add selected songs to selected playlist(s)" button.
+
+You can also export the list of songs from a selected playlist into a CSV file."""
 
 
 def read_songs_csv(path):
@@ -391,6 +415,7 @@ class CratefillApp:
         self.working = False
 
         self._build_ui()
+        self.show_help()
         self.root.after(100, self._poll_worker)
         if AUTH_FILE.exists():
             self._connect(silent=True)
@@ -405,7 +430,7 @@ class CratefillApp:
         panes.pack(fill="both", expand=True)
 
         # Left pane: songs
-        left = ttk.Frame(panes, padding=(0, 0, 8, 0))
+        left = ttk.LabelFrame(panes, text="Songs list", padding=4)
         panes.add(left, weight=3)
 
         left_top = ttk.Frame(left)
@@ -429,6 +454,7 @@ class CratefillApp:
         self.song_tree.column("artist", width=200)
         self.song_tree.column("title", width=260)
         self.song_tree.column("station", width=120)
+        self.song_tree.bind("<<TreeviewSelect>>", lambda _e: self.refresh_add_button())
         song_scroll = ttk.Scrollbar(left, orient="vertical", command=self.song_tree.yview)
         self.song_tree.configure(yscrollcommand=song_scroll.set)
         self.song_tree.pack(side="left", fill="both", expand=True)
@@ -442,7 +468,7 @@ class CratefillApp:
                 pass  # root isn't a TkinterDnD.Tk (tests/previews) — no DnD, app still works
 
         # Right pane: account + playlists
-        right = ttk.Frame(panes, padding=(8, 0, 0, 0))
+        right = ttk.LabelFrame(panes, text="YouTube Music", padding=4)
         panes.add(right, weight=2)
 
         right_top = ttk.Frame(right)
@@ -460,13 +486,14 @@ class CratefillApp:
         self.playlist_list = tk.Listbox(
             right, selectmode="extended", exportselection=False, **DARK_LIST_STYLE
         )
+        self.playlist_list.bind("<<ListboxSelect>>", lambda _e: self.refresh_add_button())
         playlist_scroll = ttk.Scrollbar(right, orient="vertical", command=self.playlist_list.yview)
         self.playlist_list.configure(yscrollcommand=playlist_scroll.set)
         self.playlist_list.pack(side="left", fill="both", expand=True)
         playlist_scroll.pack(side="right", fill="y")
 
-        # Bottom: action button, progress, log
-        bottom = ttk.Frame(main)
+        # Bottom: action button, progress, messages
+        bottom = ttk.LabelFrame(main, text="Process", padding=4)
         bottom.pack(fill="x", pady=(8, 0))
         self.add_button = ttk.Button(
             bottom, text="Add selected songs to selected playlist(s)", command=self.add_songs
@@ -475,7 +502,7 @@ class CratefillApp:
         self.progress = ttk.Progressbar(bottom, mode="determinate")
         self.progress.pack(side="left", fill="x", expand=True, padx=8)
 
-        log_frame = ttk.LabelFrame(main, text="Log", padding=4)
+        log_frame = ttk.LabelFrame(main, text="Messages", padding=4)
         log_frame.pack(fill="both", pady=(8, 0))
         self.log_text = tk.Text(
             log_frame, height=9, state="disabled", wrap="word", **DARK_TEXT_STYLE
@@ -484,6 +511,20 @@ class CratefillApp:
         self.log_text.configure(yscrollcommand=log_scroll.set)
         self.log_text.pack(side="left", fill="both", expand=True)
         log_scroll.pack(side="right", fill="y")
+
+    def refresh_add_button(self):
+        """Outline the Add button in green once there is something to add.
+
+        Bound to <<TreeviewSelect>>/<<ListboxSelect>>, and called directly
+        wherever code changes a selection: the Listbox fires no virtual event
+        for programmatic selection changes, and neither pane fires one when
+        its contents are wiped and refilled.
+        """
+        ready = bool(self.song_tree.selection()) and bool(self.playlist_list.curselection())
+        self.add_button.configure(style="Ready.TButton" if ready else "TButton")
+
+    def show_help(self):
+        self.log(HELP_TEXT)
 
     def log(self, message):
         self.log_text.configure(state="normal")
@@ -559,6 +600,7 @@ class CratefillApp:
         self.song_sort = (None, False)
         for col, label in SONG_COLUMNS:
             self.song_tree.heading(col, text=label)
+        self.refresh_add_button()
 
     def sort_songs(self, col):
         """Sort rows by a column; clicking the same column again reverses.
@@ -618,6 +660,7 @@ class CratefillApp:
             count = pl.get("count")
             label = pl["title"] + (f"  ({count} tracks)" if count is not None else "")
             self.playlist_list.insert("end", label)
+        self.refresh_add_button()
         self.log(f"Found {len(self.playlists)} playlists.")
 
     # ---------- Add songs ----------
