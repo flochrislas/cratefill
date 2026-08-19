@@ -11,9 +11,11 @@ one as an Artist/Title/Album CSV file.
 """
 
 import csv
+import os
 import queue
 import re
 import sys
+import tempfile
 import threading
 import tkinter as tk
 from pathlib import Path
@@ -29,14 +31,71 @@ except ImportError:  # optional: without it the app works, minus drag and drop
 
 __version__ = "0.1.1"
 
-if getattr(sys, "frozen", False):
-    # PyInstaller --onefile: __file__ resolves inside the temp _MEI... extraction
-    # directory, which is wiped on exit and re-randomized on every launch — so
-    # a browser.json saved there would be lost. Save next to the .exe instead.
-    APP_DIR = Path(sys.executable).resolve().parent
-else:
-    APP_DIR = Path(__file__).resolve().parent
-AUTH_FILE = APP_DIR / "browser.json"
+def user_data_dir():
+    """Per-user directory for browser.json, following each platform's convention.
+
+    Deliberately *not* next to the script or the .exe: that location can be
+    read-only (system-wide installs), gets wiped on every launch under
+    PyInstaller --onefile, and invites copying the session cookies around
+    together with the executable.
+    """
+    if sys.platform == "win32":
+        base = os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming"
+        return Path(base) / "Cratefill"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "Cratefill"
+    base = os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config"
+    return Path(base) / "cratefill"
+
+
+AUTH_FILE = user_data_dir() / "browser.json"
+# Where browser.json used to live in earlier versions; migrated away on startup.
+LEGACY_AUTH_FILE = Path(
+    sys.executable if getattr(sys, "frozen", False) else __file__
+).resolve().parent / "browser.json"
+
+
+def secure_auth_dir():
+    """Create the data directory, owner-only on POSIX."""
+    AUTH_FILE.parent.mkdir(parents=True, exist_ok=True)
+    if os.name == "posix":
+        try:
+            AUTH_FILE.parent.chmod(0o700)
+        except OSError:
+            pass  # best effort; the file mode below is what actually matters
+
+
+def secure_auth_file(path=None):
+    """Restrict a credentials file to the owner — ytmusicapi writes it with the
+    process umask, which commonly leaves it world-readable."""
+    path = AUTH_FILE if path is None else Path(path)
+    if os.name == "posix" and path.exists():
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
+
+
+def migrate_legacy_auth_file():
+    """Move an older browser.json into the user data dir, so upgrading
+    doesn't force a re-login and no readable copy is left behind."""
+    if LEGACY_AUTH_FILE == AUTH_FILE or not LEGACY_AUTH_FILE.exists():
+        return False
+    try:
+        secure_auth_dir()
+        if not AUTH_FILE.exists():
+            # Copy through os.open rather than replace()/shutil.move: the old and
+            # new locations are often on different filesystems, and this way the
+            # new file is never momentarily readable by anyone else.
+            data = LEGACY_AUTH_FILE.read_bytes()
+            fd = os.open(AUTH_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+        LEGACY_AUTH_FILE.unlink()  # leave no readable copy behind
+        secure_auth_file()
+        return True
+    except OSError:
+        return False  # unwritable data dir: leave the old file alone, user re-logs in
 
 # Dark palette. The ttk side is themed by apply_dark_theme() on top of "clam"
 # (the only built-in theme that renders identically on Windows and Linux);
@@ -148,7 +207,7 @@ AUDIO_EXTENSIONS = {".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus", ".wav", ".
 # only displayed when the loaded CSV actually has station values.
 SONG_COLUMNS = (("artist", "Artist"), ("title", "Song"), ("station", "Station"))
 
-LOGIN_INSTRUCTIONS = """\
+LOGIN_INSTRUCTIONS = f"""\
 To log in, Cratefill needs the request headers of your YouTube Music session:
 
 1. Open https://music.youtube.com in your browser and make sure you are logged in.
@@ -161,8 +220,10 @@ To log in, Cratefill needs the request headers of your YouTube Music session:
      "Request Headers" and copy it (extra lines are ignored).
 6. Paste the copied headers below and click Log in.
 
-Your session is saved locally in browser.json next to the app, so you only
-need to do this once (until you log out of YouTube in that browser)."""
+Your session is saved locally, for your user account only, in
+{AUTH_FILE}
+so you only need to do this once (until you log out of YouTube in that
+browser)."""
 
 # Shown in the Messages pane at startup, so the app never opens on a blank window.
 HELP_TEXT = """\
@@ -277,17 +338,34 @@ def write_playlist_csv(title, tracks, dest_dir):
 
 
 def normalize(s):
-    return "".join(c for c in s.casefold() if c.isalnum() or c.isspace()).strip()
+    """Casefold and strip punctuation. Tolerates None: YT Music leaves fields
+    like "title" or an artist "name" out (or null) on some results."""
+    return "".join(c for c in (s or "").casefold() if c.isalnum() or c.isspace()).strip()
 
 
 def pick_match(results, artist, title):
-    """Pick the best search result. Returns (result, confident) or (None, False)."""
+    """Pick the best search result. Returns (result, confident) or (None, False).
+
+    Defensive about the shape of `results`: it comes straight from an
+    unofficial API, where "artists" can be absent, null, or hold entries
+    without a name. A TypeError here used to kill the whole worker thread.
+    """
     want_artist, want_title = normalize(artist), normalize(title)
-    candidates = [r for r in results if r.get("videoId")]
+    candidates = [
+        r for r in (results or []) if isinstance(r, dict) and r.get("videoId")
+    ]
     for r in candidates:
-        got_title = normalize(r.get("title", ""))
-        got_artists = [normalize(a.get("name", "")) for a in r.get("artists", [])]
-        title_ok = want_title and (want_title in got_title or got_title in want_title)
+        got_title = normalize(r.get("title"))
+        got_artists = [
+            normalize(a.get("name"))
+            for a in (r.get("artists") or [])
+            if isinstance(a, dict)
+        ]
+        # Both titles must be non-empty: "" is a substring of everything, so a
+        # result with no title would otherwise pass as a confident match.
+        title_ok = bool(want_title and got_title) and (
+            want_title in got_title or got_title in want_title
+        )
         artist_ok = not want_artist or any(
             want_artist in a or a in want_artist for a in got_artists if a
         )
@@ -353,6 +431,8 @@ class LoginDialog(tk.Toplevel):
         self.grab_set()
         enable_dark_title_bar(self)
         self.success = False
+        self.validating = False
+        self.result_queue = queue.Queue()  # worker thread → _poll_validation
 
         ttk.Label(self, text=LOGIN_INSTRUCTIONS, justify="left", wraplength=660).pack(
             padx=12, pady=(12, 8), anchor="w"
@@ -362,8 +442,15 @@ class LoginDialog(tk.Toplevel):
 
         buttons = ttk.Frame(self)
         buttons.pack(fill="x", padx=12, pady=10)
-        ttk.Button(buttons, text="Cancel", command=self.destroy).pack(side="right")
-        ttk.Button(buttons, text="Log in", command=self.submit).pack(side="right", padx=(0, 8))
+        self.cancel_button = ttk.Button(buttons, text="Cancel", command=self.destroy)
+        self.cancel_button.pack(side="right")
+        self.submit_button = ttk.Button(buttons, text="Log in", command=self.submit)
+        self.submit_button.pack(side="right", padx=(0, 8))
+        self.status_label = ttk.Label(buttons, text="")
+        self.status_label.pack(side="left")
+        # Don't let the window close while a validation thread still owns the
+        # staged credentials file.
+        self.protocol("WM_DELETE_WINDOW", lambda: None if self.validating else self.destroy())
 
     def submit(self):
         raw = self.headers_text.get("1.0", "end").strip()
@@ -382,23 +469,72 @@ class LoginDialog(tk.Toplevel):
         # Some requests omit it; 0 is the default Google account. The
         # validation call below still catches a wrong guess.
         headers.setdefault("x-goog-authuser", "0")
+        # Validating means a network round trip, so it runs on a worker thread:
+        # doing it here would freeze the dialog until YouTube answers.
+        self.validating = True
+        self.status_label.configure(text="Checking with YouTube Music…")
+        self.submit_button.configure(state="disabled")
+        self.cancel_button.configure(state="disabled")
+        threading.Thread(target=self._validate_worker, args=(headers,), daemon=True).start()
+        self.after(100, self._poll_validation)
+
+    def _validate_worker(self, headers):
+        """Worker thread: write the credentials, validate them, swap them in.
+
+        Reports the outcome on self.result_queue — None for success, otherwise
+        the exception. Touches no widget.
+        """
         try:
-            ytmusicapi.setup(
-                filepath=str(AUTH_FILE),
-                headers_raw="\n".join(f"{k}: {v}" for k, v in headers.items()),
+            secure_auth_dir()
+            # Stage the new credentials in a sibling file and only swap them in
+            # once they are known to work, so a mistyped re-login leaves the
+            # existing session untouched. Same directory means same filesystem,
+            # which is what makes os.replace atomic.
+            fd, tmp_name = tempfile.mkstemp(
+                dir=AUTH_FILE.parent, prefix=".browser-", suffix=".json"
             )
-            YTMusic(str(AUTH_FILE)).get_library_playlists(limit=1)  # validate
+            os.close(fd)  # mkstemp created it 0600; setup() rewrites it in place
+            staged = Path(tmp_name)
+            try:
+                ytmusicapi.setup(
+                    filepath=str(staged),
+                    headers_raw="\n".join(f"{k}: {v}" for k, v in headers.items()),
+                )
+                secure_auth_file(staged)  # ytmusicapi writes with the process umask
+                YTMusic(str(staged)).get_library_playlists(limit=1)  # validate
+                os.replace(staged, AUTH_FILE)  # atomic: never a half-written session
+            except BaseException:
+                staged.unlink(missing_ok=True)
+                raise
         except Exception as e:
-            AUTH_FILE.unlink(missing_ok=True)
-            messagebox.showerror(
-                "Cratefill",
-                "Login failed — the pasted headers were not accepted.\n\n"
-                f"Details: {e}",
-                parent=self,
-            )
+            self.result_queue.put(e)
+        else:
+            self.result_queue.put(None)
+
+    def _poll_validation(self):
+        """Main thread: wait for _validate_worker without blocking the dialog."""
+        if not self.winfo_exists():
             return
-        self.success = True
-        self.destroy()
+        try:
+            error = self.result_queue.get_nowait()
+        except queue.Empty:
+            self.after(100, self._poll_validation)
+            return
+        self.validating = False
+        if error is None:
+            self.success = True
+            self.destroy()
+            return
+        self.status_label.configure(text="")
+        self.submit_button.configure(state="normal")
+        self.cancel_button.configure(state="normal")
+        kept = " Your previous session is still in place." if AUTH_FILE.exists() else ""
+        messagebox.showerror(
+            "Cratefill",
+            f"Login failed — the pasted headers were not accepted.{kept}\n\n"
+            f"Details: {error}",
+            parent=self,
+        )
 
 
 class CratefillApp:
@@ -417,6 +553,9 @@ class CratefillApp:
         self._build_ui()
         self.show_help()
         self.root.after(100, self._poll_worker)
+        if migrate_legacy_auth_file():
+            self.log(f"Moved your saved session to {AUTH_FILE.parent}")
+        secure_auth_file()  # tighten a file written by an older version
         if AUTH_FILE.exists():
             self._connect(silent=True)
 
@@ -475,7 +614,10 @@ class CratefillApp:
         right_top.pack(fill="x", pady=(0, 6))
         self.login_button = ttk.Button(right_top, text="Log in…", command=self.login)
         self.login_button.pack(side="left")
-        ttk.Button(right_top, text="Refresh", command=self.refresh_playlists).pack(side="left", padx=6)
+        self.refresh_button = ttk.Button(
+            right_top, text="Refresh", command=self.refresh_playlists
+        )
+        self.refresh_button.pack(side="left", padx=6)
         self.export_button = ttk.Button(
             right_top, text="Export CSV…", command=self.export_playlists
         )
@@ -511,6 +653,12 @@ class CratefillApp:
         self.log_text.configure(yscrollcommand=log_scroll.set)
         self.log_text.pack(side="left", fill="both", expand=True)
         log_scroll.pack(side="right", fill="y")
+
+        # Everything that talks to YouTube Music, disabled for the duration of
+        # a job by _start_work — see there for why Log in and Refresh count.
+        self.busy_controls = (
+            self.add_button, self.export_button, self.login_button, self.refresh_button,
+        )
 
     def refresh_add_button(self):
         """Outline the Add button in green once there is something to add.
@@ -628,33 +776,66 @@ class CratefillApp:
     # ---------- Right pane: account ----------
 
     def login(self):
+        if self.working:  # the button is disabled too; belt and braces
+            return
         dialog = LoginDialog(self.root)
         self.root.wait_window(dialog)
         if dialog.success:
             self._connect()
 
     def _connect(self, silent=False):
-        try:
-            self.yt = YTMusic(str(AUTH_FILE))
-        except Exception as e:
-            self.yt = None
-            if not silent:
-                messagebox.showerror("Cratefill", f"Could not use saved login:\n{e}")
+        """Build the YTMusic client and load the playlists, off the UI thread."""
+        if self.working:
             return
-        self.account_label.configure(text="Logged in")
-        self.login_button.configure(text="Re-log in…")
-        self.refresh_playlists()
+        self._start_work()
+        self.log("Connecting to YouTube Music…")
+        threading.Thread(target=self._connect_worker, args=(silent,), daemon=True).start()
+
+    def _connect_worker(self, silent):
+        """Worker thread: open the saved session, then fetch its playlists."""
+        put = self.worker_queue.put
+        try:
+            yt = YTMusic(str(AUTH_FILE))
+        except Exception as e:
+            put(("connect_failed", (silent, str(e))))
+        else:
+            put(("connected", yt))
+            self._put_playlists(yt)
+        finally:
+            put(("done", None))
 
     def refresh_playlists(self):
+        # Never hit the API from here while a worker owns the client. _poll_worker
+        # calls _end_work() (clearing self.working) before starting this.
+        if self.working:
+            return
         if not self.yt:
             self.log("Not logged in — click 'Log in…' first.")
             return
+        self._start_work()
+        threading.Thread(target=self._refresh_worker, args=(self.yt,), daemon=True).start()
+
+    def _refresh_worker(self, yt):
         try:
-            self.playlists = self.yt.get_library_playlists(limit=None)
+            self._put_playlists(yt)
+        finally:
+            self.worker_queue.put(("done", None))
+
+    def _put_playlists(self, yt):
+        """Worker thread: fetch the playlists and hand them to the UI.
+
+        Swallows its own errors so callers can use it as a final step without
+        losing whatever they already reported.
+        """
+        try:
+            self.worker_queue.put(("playlists", yt.get_library_playlists(limit=None)))
         except Exception as e:
-            self.log(f"Could not fetch playlists: {e}")
-            self.account_label.configure(text="Login expired? Re-log in.")
-            return
+            self.worker_queue.put(("log", f"Could not fetch playlists: {e}"))
+            self.worker_queue.put(("account", "Login expired? Re-log in."))
+
+    def _show_playlists(self, playlists):
+        """Main thread: refill the playlist Listbox."""
+        self.playlists = playlists
         self.playlist_list.delete(0, "end")
         for pl in self.playlists:
             count = pl.get("count")
@@ -685,8 +866,12 @@ class CratefillApp:
             f"--- Adding {len(selected_songs)} song(s) to "
             f"{len(selected_playlists)} playlist(s) ---"
         )
+        # Snapshot the client: the worker must keep using the account it started
+        # with, even if self.yt is replaced later.
         threading.Thread(
-            target=self._worker, args=(selected_songs, selected_playlists), daemon=True
+            target=self._worker,
+            args=(self.yt, selected_songs, selected_playlists),
+            daemon=True,
         ).start()
 
     def export_playlists(self):
@@ -706,24 +891,68 @@ class CratefillApp:
         self._start_work(maximum=len(selected))
         self.log(f"--- Exporting {len(selected)} playlist(s) to {dest} ---")
         threading.Thread(
-            target=self._export_worker, args=(selected, dest), daemon=True
-        ).start()
+            target=self._export_worker, args=(self.yt, selected, dest), daemon=True
+        ).start()  # snapshot self.yt — see add_songs
 
-    def _start_work(self, maximum):
+    def _start_work(self, maximum=None):
+        """Lock every YouTube Music control for the duration of a job.
+
+        With no `maximum` the job has no countable steps (connect, refresh) and
+        the progress bar animates instead, so a slow network reads as "working"
+        rather than "hung".
+
+        Log in and Refresh are locked too, not just Add/Export: logging in
+        replaces self.yt, which would switch accounts under a running worker,
+        and Refresh would drive the same YTMusic client (and its requests
+        session) from two threads at once.
+        """
         self.working = True
-        self.add_button.configure(state="disabled")
-        self.export_button.configure(state="disabled")
-        self.progress.configure(maximum=maximum, value=0)
+        for button in self.busy_controls:
+            button.configure(state="disabled")
+        if maximum is None:
+            self.progress.configure(mode="indeterminate")
+            self.progress.start(15)
+        else:
+            self.progress.configure(mode="determinate", maximum=maximum, value=0)
 
-    def _worker(self, songs, playlists):
-        """Background thread: search every song, then add matches to each playlist."""
+    def _end_work(self):
+        self.working = False
+        for button in self.busy_controls:
+            button.configure(state="normal")
+        self.progress.stop()  # no-op in determinate mode
+        self.progress.configure(mode="determinate", value=0)
+
+    def _worker(self, yt, songs, playlists):
+        """Background thread entry point: always reports completion.
+
+        The Add/Export buttons stay disabled until a ("done", …) message
+        arrives, so a worker that dies on an unexpected error — malformed API
+        data, say — would leave the UI unusable until restart. Hence the
+        try/finally: the thread cannot exit without re-enabling the UI.
+        """
+        try:
+            self._add_to_playlists(yt, songs, playlists)
+        except Exception as e:
+            self.worker_queue.put(
+                ("log", f"✗ Unexpected error while adding: {type(e).__name__}: {e}")
+            )
+        finally:
+            self._put_playlists(yt)  # the track counts just changed — refetch here,
+            self.worker_queue.put(("done", None))  # still off the UI thread
+
+    def _add_to_playlists(self, yt, songs, playlists):
+        """Search every song, then add the matches to each playlist.
+
+        `yt` is passed in rather than read off self, so the job stays bound to
+        one account even if the user logs into another one afterwards.
+        """
         put = self.worker_queue.put
         video_ids = []
         not_found = 0
         for artist, title, _station in songs:  # station is context for the user, not a search term
             query = f"{artist} {title}".strip()
             try:
-                results = self.yt.search(query, filter="songs", limit=5)
+                results = yt.search(query, filter="songs", limit=5)
             except Exception as e:
                 put(("log", f"✗ {artist} — {title}: search failed ({e})"))
                 put(("step", None))
@@ -735,7 +964,11 @@ class CratefillApp:
                 not_found += 1
             else:
                 video_ids.append(match["videoId"])
-                found_artists = ", ".join(a.get("name", "") for a in match.get("artists", []))
+                found_artists = ", ".join(
+                    a.get("name") or ""
+                    for a in (match.get("artists") or [])
+                    if isinstance(a, dict)
+                )
                 if confident:
                     put(("log", f"✓ {artist} — {title}"))
                 else:
@@ -758,11 +991,11 @@ class CratefillApp:
                 # it already contains and retry with the rest.
                 to_add = video_ids
                 skipped = 0
-                result = self.yt.add_playlist_items(pl["playlistId"], to_add, duplicates=False)
+                result = yt.add_playlist_items(pl["playlistId"], to_add, duplicates=False)
                 if "SUCCEEDED" not in status_of(result):
                     existing = {
                         t.get("videoId")
-                        for t in self.yt.get_playlist(pl["playlistId"], limit=None).get("tracks", [])
+                        for t in yt.get_playlist(pl["playlistId"], limit=None).get("tracks", [])
                     }
                     to_add = [v for v in video_ids if v not in existing]
                     skipped = len(video_ids) - len(to_add)
@@ -771,7 +1004,7 @@ class CratefillApp:
                                     "are already in the playlist — nothing to add"))
                         put(("step", None))
                         continue
-                    result = self.yt.add_playlist_items(pl["playlistId"], to_add, duplicates=False)
+                    result = yt.add_playlist_items(pl["playlistId"], to_add, duplicates=False)
                 status = status_of(result)
                 if "SUCCEEDED" in status:
                     message = f"→ Added {len(to_add)} song(s) to '{pl['title']}'"
@@ -787,23 +1020,38 @@ class CratefillApp:
 
         summary = f"--- Done. {len(video_ids)} matched, {not_found} not found. ---"
         put(("log", summary))
-        put(("done", "refresh"))  # playlist counts changed — refetch them
 
-    def _export_worker(self, playlists, dest):
-        """Background thread: fetch each playlist's tracks and write a CSV."""
+    def _export_worker(self, yt, playlists, dest):
+        """Background thread entry point: always reports completion.
+
+        See _worker for why the try/finally is not optional.
+        """
+        try:
+            self._export_to_csv(yt, playlists, dest)
+        except Exception as e:
+            self.worker_queue.put(
+                ("log", f"✗ Unexpected error while exporting: {type(e).__name__}: {e}")
+            )
+        finally:
+            self.worker_queue.put(("done", None))
+
+    def _export_to_csv(self, yt, playlists, dest):
+        """Fetch each playlist's tracks and write a CSV. `yt` is the snapshot
+        taken when the job started — see _add_to_playlists."""
         put = self.worker_queue.put
         for pl in playlists:
             try:
-                tracks = self.yt.get_playlist(pl["playlistId"], limit=None).get("tracks", [])
+                tracks = yt.get_playlist(pl["playlistId"], limit=None).get("tracks", [])
                 path = write_playlist_csv(pl["title"], tracks, dest)
                 put(("log", f"→ Saved '{pl['title']}' ({len(tracks)} tracks) to {path.name}"))
             except Exception as e:
                 put(("log", f"→ Failed to export '{pl['title']}': {e}"))
             put(("step", None))
         put(("log", "--- Export done. ---"))
-        put(("done", None))
 
     def _poll_worker(self):
+        # The reschedule lives in a finally: if draining ever raises, dropping
+        # out of the after() chain would freeze every future worker's output.
         try:
             while True:
                 kind, payload = self.worker_queue.get_nowait()
@@ -811,16 +1059,27 @@ class CratefillApp:
                     self.log(payload)
                 elif kind == "step":
                     self.progress.step(1)
+                elif kind == "playlists":
+                    self._show_playlists(payload)
+                elif kind == "account":
+                    self.account_label.configure(text=payload)
+                elif kind == "connected":
+                    self.yt = payload
+                    self.account_label.configure(text="Logged in")
+                    self.login_button.configure(text="Re-log in…")
+                elif kind == "connect_failed":
+                    silent, message = payload
+                    self.yt = None
+                    if not silent:
+                        messagebox.showerror(
+                            "Cratefill", f"Could not use saved login:\n{message}"
+                        )
                 elif kind == "done":
-                    self.working = False
-                    self.add_button.configure(state="normal")
-                    self.export_button.configure(state="normal")
-                    self.progress.configure(value=0)
-                    if payload == "refresh":
-                        self.refresh_playlists()
+                    self._end_work()
         except queue.Empty:
             pass
-        self.root.after(100, self._poll_worker)
+        finally:
+            self.root.after(100, self._poll_worker)
 
 
 def main():

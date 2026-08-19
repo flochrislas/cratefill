@@ -12,7 +12,7 @@ and your YouTube Music playlists.
 - **Right pane:** log in to YouTube Music and see your playlists.
 - Select songs on the left, one or more playlists on the right, click **Add** —
   each song is searched on YouTube Music and added to every selected playlist.
-- The log pane shows what matched (`✓`), what matched only loosely (`?` — review these),
+- The Messages pane shows what matched (`✓`), what matched only loosely (`?` — review these),
   and what wasn't found (`✗`).
 - The reverse works too: select playlists and click **Export CSV…** to save each
   one as a CSV file with artist, track name, and album columns.
@@ -68,9 +68,20 @@ does — by reusing your browser session:
      *Request Headers* and copy it.
 5. In Cratefill, click **Log in…**, paste the headers, click **Log in**.
 
-The session is saved to `browser.json` next to the app, so subsequent launches
-log in automatically. It stays valid until you log out of YouTube in that
-browser. **`browser.json` contains your session cookies — don't share it.**
+The session is saved to a `browser.json` in your own user profile, so subsequent
+launches log in automatically. It stays valid until you log out of YouTube in
+that browser.
+
+| Platform | Location |
+|---|---|
+| Windows | `%APPDATA%\Cratefill\browser.json` |
+| macOS | `~/Library/Application Support/Cratefill/browser.json` |
+| Linux | `$XDG_CONFIG_HOME/cratefill/browser.json` (default `~/.config/cratefill/`) |
+
+**`browser.json` contains your session cookies — don't share it.** On macOS and
+Linux the file is created mode `0600` (owner-only) inside a `0700` directory.
+Older versions kept it next to the app; that copy is moved to the new location
+automatically on first launch.
 
 ## CSV format
 
@@ -90,7 +101,7 @@ See `sample.csv` for an example.
 |---|---|
 | `cratefill.py` | The app (single file) |
 | `sample.csv` | Example CSV |
-| `browser.json` | Your saved login session (created on first login — keep private) |
+| `browser.json` | Your saved login session — created on first login in your user profile, *not* here (see [Logging in](#logging-in-first-time)); keep private |
 | `RESEARCH.md` | Notes on the approaches considered |
 
 ## License

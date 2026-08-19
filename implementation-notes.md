@@ -16,7 +16,7 @@ settling on this approach.
 | GUI | Tkinter (`ttk` widgets) | Ships with Python — no packaging issues on Windows |
 | Theme | Hand-rolled dark theme on built-in `clam` (`apply_dark_theme()`) | `clam` is the one built-in ttk theme that renders identically on Windows and Linux, so the dark UI is cross-platform with zero dependencies. sv-ttk was tried first and abandoned: on this Python 3.14 / Tk 8.6.15 build it registered its theme name but applied empty style settings (half-light UI). Palette lives in module constants (`BG`, `FIELD`, `BTN`, `FG`, `ACCENT`…); plain tk widgets (Text, Listbox) aren't covered by ttk themes and take `DARK_LIST_STYLE`/`DARK_TEXT_STYLE` directly. The title bar is darkened via `enable_dark_title_bar()` (Windows DWM attribute, best-effort no-op elsewhere; Linux title bars follow the desktop's window manager theme) |
 | Architecture | Single file, `cratefill.py` | Small enough (~780 lines); split only if it grows |
-| Auth persistence | `browser.json` next to the script | ytmusicapi's standard browser-auth file format |
+| Auth persistence | `browser.json` in the per-user data dir (`user_data_dir()`) | ytmusicapi's standard browser-auth file format. Kept out of the app directory: that can be read-only for system-wide installs, is wiped on every launch under PyInstaller `--onefile`, and invites copying session cookies around with the executable. Created `0600` in a `0700` directory on POSIX, since ytmusicapi writes it with the process umask |
 
 Everything lives in `cratefill.py`. There is no database. For day-to-day dev,
 `pip install ytmusicapi` and run; the only build-time artifact is the
@@ -70,7 +70,9 @@ Given ytmusicapi search results, returns `(result, confident)`:
 
 - **Confident match:** normalized title is a substring of the result title (or
   vice versa) *and* the normalized artist matches one of the result's artists
-  the same way. Normalization = casefold + strip non-alphanumerics.
+  the same way. Normalization = casefold + strip non-alphanumerics. Both titles
+  must be non-empty — `""` is a substring of everything, so a result with no
+  title would otherwise pass as confident.
 - **Fallback:** first result that has a `videoId`, flagged `confident=False`.
   These show as `?` lines in the log with what was actually found, so the user
   can review; they are still added to the playlist.
@@ -81,6 +83,13 @@ Substring matching is deliberately loose — it tolerates "(Radio Edit)",
 improve (e.g. `difflib.SequenceMatcher` ratio, or duration comparison if the
 CSV ever carries durations). Note `videoId` can be `None` on some result types,
 hence the filter.
+
+ytmusicapi is unofficial, so every field here is treated as optional: `results`
+itself may be `None`, entries may not be dicts, `artists` may be missing/`null`
+/hold entries without a `name`, and `title` may be absent. `normalize()` maps
+`None` to `""` for that reason. This is not hypothetical — a result with
+`artists=None` used to raise `TypeError` inside `pick_match` and take down the
+whole worker thread with it.
 
 ### Authentication flow
 
@@ -97,11 +106,25 @@ the user copies the request headers of an authenticated `music.youtube.com`
    name) into `browser.json`, which makes YouTube reject every request with a
    non-JSON body ("Expecting value: line 1 column 1"). The dialog also errors
    early if no `cookie` was found, and defaults `x-goog-authuser` to `0`.
-2. `ytmusicapi.setup(filepath=AUTH_FILE, headers_raw=...)` — fed the cleaned
-   `name: value` lines, writes `browser.json`.
-3. Validates by calling `get_library_playlists(limit=1)`; on failure the file
-   is deleted and an error shown (so a bad paste never leaves a broken
-   `browser.json` behind).
+2. `ytmusicapi.setup(filepath=…, headers_raw=…)` — fed the cleaned
+   `name: value` lines. It writes to a **staged** sibling file from
+   `tempfile.mkstemp(dir=AUTH_FILE.parent)`, never to the live `browser.json`.
+3. Validates the staged file by calling `get_library_playlists(limit=1)`, then
+   `os.replace()`s it onto `browser.json` — atomic, because staging in the same
+   directory guarantees the same filesystem. On failure the staged file is
+   removed and an error shown, leaving any existing session untouched: a
+   mistyped re-login must not cost the user a working session (it used to,
+   because setup() overwrote the live file and the error path deleted it).
+   `mkstemp` also creates the staged file `0600`, so the new credentials are
+   never briefly world-readable.
+
+Steps 2–3 are a network round trip, so they run in `_validate_worker` on its own
+thread; the dialog keeps its own `result_queue` and polls it with
+`_poll_validation` (`after(100, …)`), showing "Checking with YouTube Music…" and
+disabling both buttons meanwhile. `self.validating` also blocks the window's
+close button, so the dialog can't be destroyed while a thread still owns the
+staged file. `_poll_validation` re-checks `winfo_exists()` before touching
+widgets.
 
 On startup, if `browser.json` exists, `_connect(silent=True)` reuses it.
 Sessions die when the user logs out of YouTube in that browser, or after some
@@ -116,28 +139,70 @@ https://ytmusicapi.readthedocs.io/en/stable/setup/oauth.html
 **`browser.json` contains the user's session cookies. Never commit it.** (It
 is in `.gitignore`, together with patterns for other auth-file variants.)
 
+It lives in the per-user data directory returned by `user_data_dir()` —
+`%APPDATA%\Cratefill` on Windows, `~/Library/Application Support/Cratefill` on
+macOS, `$XDG_CONFIG_HOME/cratefill` (default `~/.config/cratefill`) elsewhere.
+Three helpers guard it: `secure_auth_dir()` creates the directory `0700`,
+`secure_auth_file()` chmods the file to `0600` (ytmusicapi writes it through
+plain `open(..., "w")`, so its mode is whatever the umask allows — commonly
+world-readable), and `migrate_legacy_auth_file()` moves an older file from
+beside the script/exe on startup so upgrading doesn't force a re-login and no
+readable copy is left behind. The migration copies via
+`os.open(..., 0o600)` rather than `Path.replace`/`shutil.move`: the old and new
+locations are usually on different filesystems, and this way the new file is
+never briefly readable by other users.
+
 ### Threading model
 
 Tkinter is single-threaded; network calls would freeze the UI. The pattern used:
 
 - The **Add** button (`add_songs`) and **Export CSV…** button
-  (`export_playlists`) snapshot the selections, disable both buttons
-  (`_start_work`), and start a daemon `threading.Thread` running `_worker` /
-  `_export_worker` respectively.
+  (`export_playlists`) snapshot the selections *and the `YTMusic` client*,
+  lock the controls (`_start_work`), and start a daemon `threading.Thread`
+  running `_worker` / `_export_worker` respectively.
+- `_start_work` disables everything in `self.busy_controls` — Add, Export,
+  **Log in and Refresh too** — and `_end_work` re-enables them. The last two
+  matter because they race with a running job: logging in rebinds `self.yt`,
+  which would switch accounts halfway through, and Refresh would drive the same
+  client (and its `requests` session, which isn't thread-safe) from two threads.
+  `login()` and `refresh_playlists()` also return early when `self.working`, so
+  the invariant doesn't rest on widget state alone.
+- The client is **passed to the worker as an argument**, never read off `self`
+  mid-run, so a job stays bound to the account it started with.
+- **Every** ytmusicapi call runs on a worker — including the two that used to be
+  synchronous, connecting (`_connect` → `_connect_worker`) and refreshing
+  (`refresh_playlists` → `_refresh_worker`). Both were noticeably blocking: a
+  slow handshake or a library that paginates over many playlists made the window
+  stop repainting and look hung. `_put_playlists(yt)` is the shared worker-side
+  helper that fetches the library and queues it; `_add_to_playlists` ends with it
+  too, so the post-add count refresh also happens off the UI thread (that
+  replaced the old `("done", "refresh")` round trip).
 - The workers do all network I/O and communicate *only* by putting
   `(kind, payload)` tuples on `self.worker_queue` (a `queue.Queue`). Kinds:
-  `"log"` (a line for the log pane), `"step"` (advance progress bar), and
-  `"done"` — with payload `"refresh"` when the playlists should be refetched
-  (after adding; pointless after an export).
+  `"log"` (a line for the Messages pane), `"step"` (advance progress bar),
+  `"playlists"` (a fetched library → `_show_playlists`), `"account"` (text for
+  the account label), `"connected"` (a live `YTMusic` client → `self.yt`),
+  `"connect_failed"` (`(silent, message)`), and `"done"`.
 - `_poll_worker`, rescheduled every 100 ms via `root.after`, drains the queue
   on the main thread and touches the widgets.
+- Jobs with countable steps pass `_start_work(maximum=n)` and emit `"step"`;
+  connect and refresh call `_start_work()` with no maximum, which puts the
+  progress bar in `indeterminate` mode and animates it — on a slow network that
+  animation is the difference between "working" and "hung". `_end_work` stops it
+  and restores `determinate`.
+
+Because the buttons only come back when a `"done"` message arrives, **both
+worker entry points must always emit one.** `_worker` and `_export_worker` are
+thin wrappers that call `_add_to_playlists` / `_export_to_csv` inside a
+`try/except Exception` (logged as "Unexpected error…") with the `"done"` put in
+a `finally` — a thread that dies on unforeseen data must not leave the UI
+permanently disabled. `_poll_worker` reschedules itself in a `finally` for the
+same reason: an exception escaping the drain loop would otherwise break the
+`after` chain and silence every later worker.
 
 **Rule: no Tk widget is ever touched from the worker thread.** Keep it that way
 — violating it causes intermittent crashes that are miserable to reproduce.
-The only ytmusicapi calls *not* on a worker thread are login validation and
-`refresh_playlists`; they're quick single requests and were left synchronous
-for simplicity (acceptable freeze of <1 s; move them to the worker pattern if
-that ever bothers anyone).
+No ytmusicapi call is left on the UI thread; if you add one, put it on a worker.
 
 `self.working` guards against double-starting a job.
 
