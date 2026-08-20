@@ -133,13 +133,31 @@ The stages, all in `matching.py`:
    won't split (`Cœur → coeur`, `ß → ss`) and interior `!`/`$` → `i`/`s` for
    stylised names (`P!nk → pink`, `Ke$ha → kesha`).
 4. **Keep version information** — `version_markers()` reads the *whole* title,
-   brackets included. Hard markers (live, remix, acoustic, instrumental, karaoke,
-   cover, demo, radio edit, extended, sped up, slowed, clean, explicit) must
-   agree in **both** directions: a studio request must not become a live take,
-   and a live request must not become the studio one. Soft markers (remastered,
-   deluxe, anniversary, album version, official video…) are stripped by
-   `core_title()`, which is why `Wonderwall` still matches
+   brackets included. Hard markers are live, remix, acoustic, instrumental,
+   karaoke, cover, demo, radio edit, extended, sped up, slowed, clean, explicit.
+   Soft markers (remastered, deluxe, anniversary, album version, official video…)
+   are stripped by `core_title()`, which is why `Wonderwall` still matches
    `Wonderwall (Remastered)`. `core_title()` also drops `feat. X`.
+
+   `version_relation()` compares hard markers **asymmetrically**, because the two
+   directions are not equally bad:
+
+   | relation | example | outcome |
+   |---|---|---|
+   | `same` | ask *Wonderwall (Live)*, get *Wonderwall (Live)* | can be `high` |
+   | `extra` | ask *Wonderwall*, get *Wonderwall (Live)* | `rejected` |
+   | `missing` | ask *Wonderwall (Live)*, get *Wonderwall* | capped at `ambiguous` |
+
+   The `missing` case is a deliberate concession: if the live version simply
+   isn't on YouTube Music, offering the album version beats returning nothing —
+   but it is never silent, so it can only ever be ambiguous. `extra` stays a
+   hard refusal, and so does a candidate whose markers merely *differ* (asking
+   for live and being handed a remix is `extra`, not a fallback).
+
+   Ranking keeps the two apart: exact-version candidates are sorted ahead of
+   fallbacks, and the runner-up margin is computed within a group. A fallback is
+   strictly inferior, so it must neither outrank the requested recording nor make
+   it look like a near tie — it is still listed in `alternatives`.
 5. **Compare whole tokens** — `score_text()` scores 1.0 for equal token sets;
    otherwise the token sets must genuinely intersect before any fuzzy score is
    trusted. That gate is what kills `one → someone` and `cher → cherub`, where

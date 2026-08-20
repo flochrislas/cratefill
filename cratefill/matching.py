@@ -170,14 +170,31 @@ def version_markers(text):
     return hard, soft
 
 
-def has_version_conflict(want_title, got_title):
-    """True when the two titles describe different recordings.
+def version_relation(want_title, got_title):
+    """How the candidate's recording relates to the requested one.
 
-    Set inequality, so it catches both directions — asking for a studio track and
-    being offered a remix, or asking for the live version and being offered the
-    studio one.
+    Deliberately asymmetric, because the two directions are not equally bad:
+
+    "extra"   the candidate carries a marker that wasn't asked for — a remix,
+              a live take, a karaoke version when the plain song was requested.
+              Never acceptable: it is not the song the user asked for.
+    "missing" the candidate is the *less* specific recording: the live (or
+              acoustic, or remix) version was requested and only the standard
+              one came back. Not a silent match, but worth offering — getting
+              the album version beats getting nothing.
+    "same"    the markers agree.
     """
-    return version_markers(want_title)[0] != version_markers(got_title)[0]
+    want, got = version_markers(want_title)[0], version_markers(got_title)[0]
+    if got - want:
+        return "extra"
+    if want - got:
+        return "missing"
+    return "same"
+
+
+def has_version_conflict(want_title, got_title):
+    """True when the two titles don't describe the same recording."""
+    return version_relation(want_title, got_title) != "same"
 
 
 def core_title(text):
@@ -348,40 +365,51 @@ def choose_match(artist, title, results):
             continue  # no videoId means nothing can be added
         title_score = score_text(core_title(title), core_title(result.get("title")))
         artist_score = score_artist(artist, result.get("artists"))
-        conflict = has_version_conflict(title, result.get("title"))
+        relation = version_relation(title, result.get("title"))
         overall = TITLE_WEIGHT * title_score + ARTIST_WEIGHT * artist_score
-        scored.append((overall, title_score, artist_score, conflict, result))
+        scored.append((overall, title_score, artist_score, relation, result))
 
     if not scored:
         return MatchDecision("rejected", reasons=["no usable search results"])
 
-    # Credible candidates only: both minimums met and no conflicting version.
-    # Anything else can still be reported, but must never be added.
+    # Credible candidates only: both minimums met, and no marker the request
+    # didn't ask for. A candidate that merely *lacks* a requested marker stays
+    # credible — see version_relation — but can only ever be ambiguous.
     credible = [s for s in scored
-                if s[1] >= MIN_TITLE and s[2] >= MIN_ARTIST and not s[3]]
+                if s[1] >= MIN_TITLE and s[2] >= MIN_ARTIST and s[3] != "extra"]
     scored.sort(key=lambda s: s[0], reverse=True)
 
     if not credible:
-        overall, title_score, artist_score, conflict, result = scored[0]
+        overall, title_score, artist_score, relation, result = scored[0]
         return MatchDecision(
             "rejected",
             candidate=None,          # deliberately not offered: nothing here is addable
             title_score=title_score,
             artist_score=artist_score,
             overall_score=overall,
-            reasons=_rejection_reasons(title_score, artist_score, conflict, title, result),
+            reasons=_rejection_reasons(title_score, artist_score, relation, title, result),
             alternatives=[s[4] for s in scored[:3]],
         )
 
-    credible.sort(key=lambda s: s[0], reverse=True)
-    overall, title_score, artist_score, _conflict, result = credible[0]
-    runner_up = credible[1][0] if len(credible) > 1 else None
+    # Candidates matching the requested recording exactly always beat ones that
+    # merely lack a requested marker, whatever the scores say. Ranking within
+    # each group separately also keeps the runner-up comparison honest: a
+    # strictly inferior fallback is not a rival, so it must not make an exact
+    # match look like a near tie.
+    exact = sorted((s for s in credible if s[3] == "same"), key=lambda s: -s[0])
+    fallback = sorted((s for s in credible if s[3] == "missing"), key=lambda s: -s[0])
+    ranked = exact or fallback
+    overall, title_score, artist_score, relation, result = ranked[0]
+    runner_up = ranked[1][0] if len(ranked) > 1 else None
 
     reasons = []
     if title_score < HIGH_TITLE:
         reasons.append(f"title similarity {title_score:.2f} below {HIGH_TITLE:.2f}")
     if artist_score < HIGH_ARTIST:
         reasons.append(f"artist similarity {artist_score:.2f} below {HIGH_ARTIST:.2f}")
+    if relation == "missing":
+        wanted = ", ".join(sorted(version_markers(title)[0] - version_markers(result.get("title"))[0]))
+        reasons.append(f"no {wanted} version found — this is the standard recording")
     if runner_up is not None and overall - runner_up < WINNER_MARGIN:
         reasons.append(
             f"another candidate scores almost the same ({runner_up:.2f} vs {overall:.2f})"
@@ -395,19 +423,17 @@ def choose_match(artist, title, results):
         overall_score=overall,
         runner_up_score=runner_up,
         reasons=reasons,
-        alternatives=[s[4] for s in credible[1:4]],
+        alternatives=[s[4] for s in (ranked[1:] + (fallback if exact else []))[:3]],
     )
 
 
-def _rejection_reasons(title_score, artist_score, conflict, want_title, result):
+def _rejection_reasons(title_score, artist_score, relation, want_title, result):
     reasons = []
     if title_score < MIN_TITLE:
         reasons.append(f"title similarity {title_score:.2f} below {MIN_TITLE:.2f}")
     if artist_score < MIN_ARTIST:
         reasons.append(f"artist similarity {artist_score:.2f} below {MIN_ARTIST:.2f}")
-    if conflict and not reasons:
-        want = version_markers(want_title)[0]
-        got = version_markers(result.get("title"))[0]
-        differing = sorted(want ^ got) or ["version"]
-        reasons.append(f"different recording ({', '.join(differing)})")
+    if relation == "extra" and not reasons:
+        extra = version_markers(result.get("title"))[0] - version_markers(want_title)[0]
+        reasons.append(f"this is the {', '.join(sorted(extra))} version, which wasn't asked for")
     return reasons or ["no candidate met the minimum scores"]

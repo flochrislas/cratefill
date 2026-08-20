@@ -15,8 +15,12 @@ and your YouTube Music playlists.
 - Cratefill won't add a song it isn't sure about. Every match is either
   **confident** (`✓`, added), **uncertain** (`?`) or **no credible match**
   (`✗`, always skipped, with the reason given). A perfect title never makes up
-  for the wrong artist, and a studio recording is never silently swapped for a
-  live version, remix, cover or karaoke track.
+  for the wrong artist, and asking for a song never lands you a live version,
+  remix, cover or karaoke track you didn't ask for.
+- The reverse *is* offered: if you ask for a live (or acoustic, or remix) version
+  and only the standard recording exists, Cratefill proposes it as uncertain
+  rather than giving up — getting the album version beats getting nothing. When
+  the exact version does exist, it always wins.
 - The **On ambiguous match** dropdown next to the Add button decides what happens
   to the uncertain ones: **Always ask** (the default — you get a Requested /
   Proposed / Reason prompt with Skip and Add), **Always skip**, or **Always add**.

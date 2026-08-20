@@ -20,6 +20,7 @@ from cratefill.matching import (
     tokens,
     validate_request,
     version_markers,
+    version_relation,
 )
 
 
@@ -123,6 +124,20 @@ class TestVersionMarkers:
     def test_conflicts_both_ways(self, want, got, conflict):
         assert has_version_conflict(want, got) is conflict
 
+    @pytest.mark.parametrize("want, got, relation", [
+        ("Wonderwall", "Wonderwall", "same"),
+        ("Wonderwall (Live)", "Wonderwall (Live)", "same"),
+        ("Wonderwall", "Wonderwall (Remastered)", "same"),     # soft markers ignored
+        ("Wonderwall", "Wonderwall (Live)", "extra"),          # not what was asked for
+        ("Wonderwall (Live)", "Wonderwall", "missing"),        # the usable fallback
+        ("Wonderwall (Live)", "Wonderwall (Remix)", "extra"),  # a different recording
+        ("Wonderwall (Live)", "Wonderwall (Live Remix)", "extra"),
+        ("Wonderwall (Live Acoustic)", "Wonderwall (Live)", "missing"),
+    ])
+    def test_relation_is_asymmetric(self, want, got, relation):
+        """The two directions are not equally bad, so they are named separately."""
+        assert version_relation(want, got) == relation
+
     def test_core_title_drops_markers_and_features(self):
         assert core_title("Wonderwall (Remastered)") == "wonderwall"
         assert core_title("This Is It (feat. Guest)") == "this is it"
@@ -209,7 +224,6 @@ class TestRejected:
 
     @pytest.mark.parametrize("title, got", [
         ("Wonderwall", "Wonderwall (Live at Wembley)"),
-        ("Wonderwall (Live)", "Wonderwall"),
         ("One More Time", "One More Time (Radio Edit)"),
         ("One More Time", "One More Time (Skrillex Remix)"),
         ("Stronger", "Stronger (Instrumental)"),
@@ -245,6 +259,63 @@ class TestRejected:
     def test_rejection_explains_itself(self):
         d = decide("Cher", "Believe", result("Believe", "Cherub"))
         assert "artist similarity" in d.reason
+
+
+class TestVersionFallback:
+    """Asking for a specific recording and only finding the standard one.
+
+    Deliberately asymmetric: getting the album version when the live one isn't
+    on YouTube Music beats getting nothing, so it is offered rather than
+    refused — but never silently, so it can only ever be ambiguous.
+    """
+
+    @pytest.mark.parametrize("asked, marker", [
+        ("Wonderwall (Live)", "live"),
+        ("Wonderwall (Acoustic)", "acoustic"),
+        ("Wonderwall (Remix)", "remix"),
+        ("Wonderwall (Instrumental)", "instrumental"),
+    ])
+    def test_the_standard_recording_is_offered(self, asked, marker):
+        d = decide("Oasis", asked, result("Wonderwall", "Oasis"))
+        assert d.status == "ambiguous"
+        assert d.video_id == "v1"
+        assert f"no {marker} version found" in d.reason
+
+    def test_the_exact_version_wins_when_it_exists(self):
+        """A fallback must never outrank the recording that was actually asked
+        for, nor make it look like a near tie."""
+        for order in ([("Wonderwall", "album"), ("Wonderwall (Live)", "live")],
+                      [("Wonderwall (Live)", "live"), ("Wonderwall", "album")]):
+            d = decide("Oasis", "Wonderwall (Live)",
+                       *[result(t, "Oasis", vid=v) for t, v in order])
+            assert d.status == "high", d
+            assert d.video_id == "live"
+
+    def test_the_fallback_is_still_listed_as_an_alternative(self):
+        d = decide("Oasis", "Wonderwall (Live)",
+                   result("Wonderwall (Live)", "Oasis", vid="live"),
+                   result("Wonderwall", "Oasis", vid="album"))
+        assert [a["videoId"] for a in d.alternatives] == ["album"]
+
+    def test_a_partial_marker_match_is_still_a_fallback(self):
+        d = decide("Oasis", "Wonderwall (Live Acoustic)",
+                   result("Wonderwall (Live)", "Oasis"))
+        assert d.status == "ambiguous"
+        assert "no acoustic version found" in d.reason
+
+    @pytest.mark.parametrize("asked, offered", [
+        ("Wonderwall (Live)", "Wonderwall (Remix)"),
+        ("Wonderwall (Acoustic)", "Wonderwall (Karaoke)"),
+    ])
+    def test_a_different_marked_version_is_not_a_fallback(self, asked, offered):
+        """Asking for live and being handed a remix is not "close enough" — it
+        carries a marker that was never requested."""
+        d = decide("Oasis", asked, result(offered, "Oasis"))
+        assert d.status == "rejected"
+
+    def test_the_rejection_names_the_unwanted_marker(self):
+        d = decide("Oasis", "Wonderwall", result("Wonderwall (Karaoke)", "Oasis"))
+        assert "karaoke version, which wasn't asked for" in d.reason
 
 
 class TestAmbiguity:
