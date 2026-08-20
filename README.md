@@ -12,15 +12,18 @@ and your YouTube Music playlists.
 - **Right pane:** log in to YouTube Music and see your playlists.
 - Select songs on the left, one or more playlists on the right, click **Add** —
   each song is searched on YouTube Music and added to every selected playlist.
-- Cratefill won't add a song it isn't sure about. Every match is either
-  **confident** (`✓`, added), **uncertain** (`?`) or **no credible match**
-  (`✗`, always skipped, with the reason given). A perfect title never makes up
-  for the wrong artist, and asking for a song never lands you a live version,
-  remix, cover or karaoke track you didn't ask for.
-- The reverse *is* offered: if you ask for a live (or acoustic, or remix) version
-  and only the standard recording exists, Cratefill proposes it as uncertain
-  rather than giving up — getting the album version beats getting nothing. When
-  the exact version does exist, it always wins.
+- Cratefill won't *silently* add a song it isn't sure about. Every match is either
+  **confident** (`✓`, added), **uncertain** (`?`, your choice) or **no match**
+  (`✗`, skipped, with the reason given).
+- It also tries hard not to come back empty-handed. If the exact recording isn't
+  on YouTube Music but another version of the same song is — a live take, a
+  remix, an acoustic version, even another band's cover — you're offered that
+  rather than nothing, with the difference spelled out ("this is the live
+  version, not the one asked for"). When the exact version *is* there, it wins.
+- `✗` is reserved for a genuinely different song: nothing came back that shares
+  a word with the title you asked for. So `Cher — One` never becomes
+  `Cherub — Someone`, and a different track by the right artist is never
+  substituted.
 - The **On ambiguous match** dropdown next to the Add button decides what happens
   to the uncertain ones: **Always ask** (the default — you get a Requested /
   Proposed / Reason prompt with Skip and Add), **Always skip**, or **Always add**.

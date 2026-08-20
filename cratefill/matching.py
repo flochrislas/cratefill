@@ -3,19 +3,29 @@
 Deliberately pure: `rapidfuzz` is the only import, there is no I/O, and the same
 inputs always give the same answer. See tests/test_matching.py.
 
-The rules exist to stop Cratefill adding an unrelated song just because YouTube
-Music returned it first. Three outcomes:
+Three outcomes:
 
-    high        artist and title both match strongly, no version conflict → add
-    ambiguous   credible, but not certain → the user's policy decides
-    rejected    fails a minimum, or the recording version conflicts → skip
+    high        near-identical artist and title, the recording asked for, and a
+                clear win over the runner-up → added without asking
+    ambiguous   recognisably the same song, but something is off → the user's
+                policy decides (ask / skip / add)
+    rejected    nothing here is the same song → skipped
 
-Two invariants hold everywhere below:
+The balance being struck: **coming back empty-handed is the worst outcome.** If
+YouTube Music has a remix, a live take, or another artist's cover of the song
+that was asked for, that is worth offering — a playlist entry the user can
+review beats a silent miss. So a version difference or a wrong artist no longer
+excludes a candidate; it costs it points and blocks the `high` tier, which is
+what keeps the offer honest rather than silent.
 
-* A great title score never compensates for the wrong artist, and vice versa —
-  they are thresholded independently before the weighted score is even used.
-* There is no "first result" fallback. If nothing clears the minimums the answer
-  is `rejected`, and no policy setting can turn that into an add.
+What still gets refused outright is a *different song*: `rejected` means no
+result shared a single whole word with the requested title. That is the rule that
+keeps `One` from becoming `Someone`, `Cher` from becoming `Cherub`, and
+`Lisztomania` from becoming some other Phoenix track.
+
+`high` is deliberately hard to earn — everything doubtful is offered, not
+assumed. Nothing here knows what an ambiguous match should *lead to*; see
+policy.action_for_match.
 """
 
 import re
@@ -23,17 +33,23 @@ import unicodedata
 
 from rapidfuzz import fuzz
 
-# Tunable starting values. Deliberately strict: a false negative costs the user a
-# prompt, a false positive puts a wrong song in their playlist. Loosen only with
-# real examples and tests to back it up.
-MIN_TITLE = 0.75        # below this → rejected, whatever the artist score says
-MIN_ARTIST = 0.80       # below this → rejected, whatever the title score says
-HIGH_TITLE = 0.94       # both HIGH_* plus the margin → high confidence
-HIGH_ARTIST = 0.92
-TITLE_WEIGHT = 0.65     # overall = 0.65 * title + 0.35 * artist
+# Tunable values. The balance they encode: coming back empty-handed is the worst
+# outcome, so anything recognisably the same song gets offered; being *confident*
+# is what stays hard to earn.
+TITLE_FLOOR = 0.0       # at or below this the titles are unrelated → rejected
+HIGH_TITLE = 0.90       # both HIGH_* plus the margin and an exact version → high
+HIGH_ARTIST = 0.88
+TITLE_WEIGHT = 0.65     # base = 0.65 * title + 0.35 * artist
 ARTIST_WEIGHT = 0.35
-WINNER_MARGIN = 0.08    # a near-tied runner-up makes the winner ambiguous
+WINNER_MARGIN = 0.05    # a near-tied runner-up makes the winner ambiguous
 SEARCH_LIMIT = 10       # candidates to ask YouTube Music for
+
+# How much a recording-version difference costs a candidate when ranking. Folded
+# into the score rather than used to exclude, so a version difference can be
+# outweighed — the real artist's live take should beat a tribute band's studio
+# cut. Getting the plain recording you didn't ask for ("missing") is a milder
+# disappointment than getting a remix you never wanted ("extra").
+VERSION_PENALTY = {"same": 0.0, "missing": 0.10, "extra": 0.20}
 
 # Text this short is compared by exact equality only — fuzzy matching on a
 # handful of characters is how "Cher" becomes "Cherub".
@@ -197,20 +213,31 @@ def has_version_conflict(want_title, got_title):
     return version_relation(want_title, got_title) != "same"
 
 
+BRACKETED_RE = re.compile(r"[\(\[\{][^\)\]\}]*[\)\]\}]")
+
+
 def core_title(text):
     """The title with everything that isn't the song's identity removed.
 
-    Drops "feat. X", soft markers like "(Remastered)", and the words naming hard
-    markers — hard markers are compared separately by has_version_conflict, so
-    leaving them in would double-penalise a legitimately matching live version.
+    A bracketed group naming a version is dropped *whole*, not word by word:
+    "(Live at Wembley)" is one piece of version metadata, and keeping "at
+    wembley" would make the live take look like a different song and drag its
+    score below a tribute band's studio cut. Bare marker words outside brackets
+    go too, along with "feat. X".
+
+    Version markers are compared separately by version_relation(), so removing
+    them here is what lets a legitimately matching live version score 1.00.
     """
-    main, _guests = split_featured(text)
+    kept = [
+        group for group in BRACKETED_RE.findall(text or "")
+        if not any(version_markers(group))
+    ]
+    stripped = BRACKETED_RE.sub(" ", text or "")
+    main, _guests = split_featured(" ".join([stripped, *kept]))
     normalized = normalize(main)
-    for pattern in SOFT_VERSION_MARKERS:
+    for pattern in (*SOFT_VERSION_MARKERS,
+                    *(p for ps in HARD_VERSION_MARKERS.values() for p in ps)):
         normalized = re.sub(pattern, " ", normalized)
-    for patterns in HARD_VERSION_MARKERS.values():
-        for pattern in patterns:
-            normalized = re.sub(pattern, " ", normalized)
     return " ".join(normalized.split())
 
 
@@ -366,50 +393,49 @@ def choose_match(artist, title, results):
         title_score = score_text(core_title(title), core_title(result.get("title")))
         artist_score = score_artist(artist, result.get("artists"))
         relation = version_relation(title, result.get("title"))
-        overall = TITLE_WEIGHT * title_score + ARTIST_WEIGHT * artist_score
+        base = TITLE_WEIGHT * title_score + ARTIST_WEIGHT * artist_score
+        overall = base * (1.0 - VERSION_PENALTY[relation])
         scored.append((overall, title_score, artist_score, relation, result))
 
     if not scored:
         return MatchDecision("rejected", reasons=["no usable search results"])
 
-    # Credible candidates only: both minimums met, and no marker the request
-    # didn't ask for. A candidate that merely *lacks* a requested marker stays
-    # credible — see version_relation — but can only ever be ambiguous.
-    credible = [s for s in scored
-                if s[1] >= MIN_TITLE and s[2] >= MIN_ARTIST and s[3] != "extra"]
+    # The only reason to refuse outright: nothing here is recognisably the same
+    # song. score_text yields exactly 0.0 when the titles share no whole word, so
+    # this rejects "One" → "Someone" and "Lisztomania" → "1901" while still
+    # offering a remix, a live take or another artist's cover of the right song.
+    related = [s for s in scored if s[1] > TITLE_FLOOR]
     scored.sort(key=lambda s: s[0], reverse=True)
 
-    if not credible:
-        overall, title_score, artist_score, relation, result = scored[0]
+    if not related:
+        _overall, title_score, artist_score, _relation, _result = scored[0]
         return MatchDecision(
             "rejected",
-            candidate=None,          # deliberately not offered: nothing here is addable
+            candidate=None,          # deliberately not offered: it's a different song
             title_score=title_score,
             artist_score=artist_score,
-            overall_score=overall,
-            reasons=_rejection_reasons(title_score, artist_score, relation, title, result),
+            reasons=["no result with a related title"],
             alternatives=[s[4] for s in scored[:3]],
         )
 
-    # Candidates matching the requested recording exactly always beat ones that
-    # merely lack a requested marker, whatever the scores say. Ranking within
-    # each group separately also keeps the runner-up comparison honest: a
-    # strictly inferior fallback is not a rival, so it must not make an exact
-    # match look like a near tie.
-    exact = sorted((s for s in credible if s[3] == "same"), key=lambda s: -s[0])
-    fallback = sorted((s for s in credible if s[3] == "missing"), key=lambda s: -s[0])
-    ranked = exact or fallback
-    overall, title_score, artist_score, relation, result = ranked[0]
-    runner_up = ranked[1][0] if len(ranked) > 1 else None
+    related.sort(key=lambda s: s[0], reverse=True)
+    overall, title_score, artist_score, relation, result = related[0]
+    runner_up = related[1][0] if len(related) > 1 else None
 
+    # Confidence has to be earned: near-identical title *and* artist, the
+    # recording actually requested, and a clear win over the runner-up. Anything
+    # short of that is still offered — as ambiguous, with the shortfall named so
+    # the user can judge it.
     reasons = []
     if title_score < HIGH_TITLE:
         reasons.append(f"title similarity {title_score:.2f} below {HIGH_TITLE:.2f}")
     if artist_score < HIGH_ARTIST:
-        reasons.append(f"artist similarity {artist_score:.2f} below {HIGH_ARTIST:.2f}")
-    if relation == "missing":
-        wanted = ", ".join(sorted(version_markers(title)[0] - version_markers(result.get("title"))[0]))
-        reasons.append(f"no {wanted} version found — this is the standard recording")
+        reasons.append(
+            f"artist similarity {artist_score:.2f} below {HIGH_ARTIST:.2f}"
+            f" (found {artists_label(result) or 'no artist'})"
+        )
+    if relation != "same":
+        reasons.append(_version_reason(relation, title, result))
     if runner_up is not None and overall - runner_up < WINNER_MARGIN:
         reasons.append(
             f"another candidate scores almost the same ({runner_up:.2f} vs {overall:.2f})"
@@ -423,17 +449,18 @@ def choose_match(artist, title, results):
         overall_score=overall,
         runner_up_score=runner_up,
         reasons=reasons,
-        alternatives=[s[4] for s in (ranked[1:] + (fallback if exact else []))[:3]],
+        alternatives=[s[4] for s in related[1:4]],
     )
 
 
-def _rejection_reasons(title_score, artist_score, relation, want_title, result):
-    reasons = []
-    if title_score < MIN_TITLE:
-        reasons.append(f"title similarity {title_score:.2f} below {MIN_TITLE:.2f}")
-    if artist_score < MIN_ARTIST:
-        reasons.append(f"artist similarity {artist_score:.2f} below {MIN_ARTIST:.2f}")
-    if relation == "extra" and not reasons:
-        extra = version_markers(result.get("title"))[0] - version_markers(want_title)[0]
-        reasons.append(f"this is the {', '.join(sorted(extra))} version, which wasn't asked for")
-    return reasons or ["no candidate met the minimum scores"]
+def _version_reason(relation, want_title, result):
+    """Explain a recording-version difference in the user's terms."""
+    want = version_markers(want_title)[0]
+    got = version_markers(result.get("title"))[0]
+    if relation == "missing":
+        wanted = ", ".join(sorted(want - got))
+        return f"no {wanted} version found — this is the standard recording"
+    extra = ", ".join(sorted(got - want)) or "different"
+    return f"this is the {extra} version, not the one asked for"
+
+

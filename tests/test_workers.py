@@ -127,11 +127,19 @@ class TestEvaluateSongs:
         assert evaluated[0][1].status == "rejected"
         assert called(yt, "search") == []
 
-    def test_logs_each_outcome_distinctly(self):
+    def test_logs_an_unrelated_result_as_no_match(self):
         out = []
-        results = [{"videoId": "v1", "title": "Lisztomania", "artists": [{"name": "Nobody"}]}]
+        results = [{"videoId": "v1", "title": "Something Else", "artists": [{"name": "Nobody"}]}]
         youtube.evaluate_songs(FakeYT(search_results=results), [SONG], out.append)
         assert kinds(out, "log")[0].startswith("✗ Phoenix — Lisztomania")
+
+    def test_logs_a_wrong_artist_as_uncertain_rather_than_no_match(self):
+        """The right song by the wrong artist is offered, not discarded."""
+        out = []
+        results = [{"videoId": "v1", "title": "Lisztomania", "artists": [{"name": "Nobody"}]}]
+        evaluated = youtube.evaluate_songs(FakeYT(search_results=results), [SONG], out.append)
+        assert evaluated[0][1].status == "ambiguous"
+        assert kinds(out, "log")[0].startswith("? Phoenix — Lisztomania")
 
     def test_ambiguous_log_shows_the_proposal(self):
         out = []

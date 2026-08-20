@@ -9,8 +9,6 @@ import pytest
 from cratefill.matching import (
     HIGH_ARTIST,
     HIGH_TITLE,
-    MIN_ARTIST,
-    MIN_TITLE,
     choose_match,
     core_title,
     has_version_conflict,
@@ -138,9 +136,31 @@ class TestVersionMarkers:
         """The two directions are not equally bad, so they are named separately."""
         assert version_relation(want, got) == relation
 
-    def test_core_title_drops_markers_and_features(self):
-        assert core_title("Wonderwall (Remastered)") == "wonderwall"
-        assert core_title("This Is It (feat. Guest)") == "this is it"
+    @pytest.mark.parametrize("title, core", [
+        ("Wonderwall", "wonderwall"),
+        ("Wonderwall (Remastered)", "wonderwall"),
+        ("This Is It (feat. Guest)", "this is it"),
+        # A bracketed version group goes whole: keeping "at wembley" would make
+        # the live take look like a different song and drag its score below an
+        # unrelated band's studio cut.
+        ("Wonderwall (Live at Wembley)", "wonderwall"),
+        ("Wonderwall (Karaoke Version)", "wonderwall"),
+        ("Bad Habit (Slowed + Reverb)", "bad habit"),
+        ("One More Time (Skrillex Remix)", "one more time"),
+        ("Hurt (Johnny Cash Cover)", "hurt"),
+        ("Song (2009 Remaster) (Live)", "song"),
+        # A bracketed group with no version marker is part of the title.
+        ("Song (Reprise)", "song reprise"),
+    ])
+    def test_core_title(self, title, core):
+        assert core_title(title) == core
+
+    def test_a_live_recording_scores_as_the_same_song(self):
+        """The venue text must not cost the candidate title similarity — the
+        version difference is reported separately."""
+        d = decide("Oasis", "Wonderwall", result("Wonderwall (Live at Wembley)", "Oasis"))
+        assert d.title_score == 1.0
+        assert d.reason == "this is the live version, not the one asked for"
 
 
 class TestScoreText:
@@ -159,8 +179,9 @@ class TestScoreText:
         assert score_text(want, got) == 0.0
 
     def test_extra_words_are_penalised_symmetrically(self):
-        """"hello" must not pass as "hello world goodbye" just by being inside it."""
-        assert score_text("hello", "hello world goodbye") < MIN_TITLE
+        """"hello" must not score as highly as an exact hit just by being inside
+        "hello world goodbye"."""
+        assert score_text("hello", "hello world goodbye") < HIGH_TITLE
 
     def test_missing_side_scores_zero(self):
         assert score_text("", "wonderwall") == 0.0
@@ -209,33 +230,20 @@ class TestHighConfidence:
 
 
 class TestRejected:
+    """Rejection is reserved for a *different song*. Coming back empty-handed is
+    the worst outcome, so anything recognisably the same song is offered instead
+    — see TestOfferedRatherThanNothing."""
+
     @pytest.mark.parametrize("label, artist, title, res", [
         ("one vs someone", "Cher", "One", result("Someone", "Cherub")),
-        ("cher vs cherub", "Cher", "Believe", result("Believe", "Cherub")),
-        ("same title, other artist", "Phoenix", "Lisztomania",
-         result("Lisztomania", "Some Orchestra Ensemble")),
         ("right artist, wrong song", "Phoenix", "Lisztomania", result("1901", "Phoenix")),
-        ("title inside another", "Adele", "Hello", result("Hello World Goodbye", "Adele")),
+        ("unrelated entirely", "Adele", "Hello", result("Bohemian Rhapsody", "Queen")),
     ])
-    def test_thresholds_cannot_compensate_each_other(self, label, artist, title, res):
+    def test_no_shared_title_word_means_no_match(self, label, artist, title, res):
         d = decide(artist, title, res)
         assert d.status == "rejected", f"{label}: {d}"
-        assert d.title_score < MIN_TITLE or d.artist_score < MIN_ARTIST
-
-    @pytest.mark.parametrize("title, got", [
-        ("Wonderwall", "Wonderwall (Live at Wembley)"),
-        ("One More Time", "One More Time (Radio Edit)"),
-        ("One More Time", "One More Time (Skrillex Remix)"),
-        ("Stronger", "Stronger (Instrumental)"),
-        ("Wonderwall", "Wonderwall (Cover)"),
-        ("Bad Habit", "Bad Habit (Sped Up)"),
-        ("Bad Habit", "Bad Habit (Slowed)"),
-        ("Stan", "Stan (Explicit)"),
-    ])
-    def test_a_different_recording_is_never_added(self, title, got):
-        d = decide("Oasis", title, result(got, "Oasis"))
-        assert d.status == "rejected"
         assert d.candidate is None, "a rejected decision must offer nothing to add"
+        assert "related title" in d.reason
 
     def test_no_usable_results(self):
         assert decide("Phoenix", "Lisztomania").status == "rejected"
@@ -245,20 +253,63 @@ class TestRejected:
                    {"title": "Lisztomania", "artists": [{"name": "Phoenix"}]})
         assert d.status == "rejected"
 
-    def test_missing_artist_data_cannot_be_high_confidence(self):
-        d = decide("Phoenix", "Lisztomania",
-                   {"videoId": "v1", "title": "Lisztomania", "artists": None})
-        assert d.status == "rejected"
-
     @pytest.mark.parametrize("artist, title", [("", "Lisztomania"), ("Phoenix", "")])
     def test_incomplete_imported_row(self, artist, title):
         d = decide(artist, title, result("Lisztomania", "Phoenix"))
         assert d.status == "rejected"
         assert "imported row" in d.reason
 
-    def test_rejection_explains_itself(self):
-        d = decide("Cher", "Believe", result("Believe", "Cherub"))
-        assert "artist similarity" in d.reason
+
+class TestOfferedRatherThanNothing:
+    """The whole point: a remix, a live take or another band's cover of the right
+    song beats a silent miss. None of these may be *confident*, so they land in
+    the ambiguous bucket where the user's policy decides."""
+
+    @pytest.mark.parametrize("title, got, expected_in_reason", [
+        ("Wonderwall", "Wonderwall (Live at Wembley)", "live version"),
+        ("One More Time", "One More Time (Radio Edit)", "radio edit version"),
+        ("One More Time", "One More Time (Skrillex Remix)", "remix version"),
+        ("Stronger", "Stronger (Instrumental)", "instrumental version"),
+        ("Wonderwall", "Wonderwall (Cover)", "cover version"),
+        ("Bad Habit", "Bad Habit (Sped Up)", "sped up version"),
+        ("Stan", "Stan (Explicit)", "explicit version"),
+    ])
+    def test_a_different_recording_is_offered_not_refused(self, title, got, expected_in_reason):
+        d = decide("Oasis", title, result(got, "Oasis"))
+        assert d.status == "ambiguous"
+        assert d.video_id == "v1", "the user should get the chance to take it"
+        assert expected_in_reason in d.reason
+
+    def test_another_artists_cover_is_offered(self):
+        """A cover is by definition someone else, so a wrong artist can't be a
+        hard refusal — it just can't be confident."""
+        d = decide("Oasis", "Wonderwall", result("Wonderwall", "Tribute Players"))
+        assert d.status == "ambiguous"
+        assert d.video_id == "v1"
+        assert "Tribute Players" in d.reason
+
+    def test_a_partial_title_overlap_is_offered(self):
+        d = decide("Adele", "Hello", result("Hello World Goodbye", "Adele"))
+        assert d.status == "ambiguous"
+
+    def test_missing_artist_data_is_offered_but_never_confident(self):
+        d = decide("Phoenix", "Lisztomania",
+                   {"videoId": "v1", "title": "Lisztomania", "artists": None})
+        assert d.status == "ambiguous"
+        assert "no artist" in d.reason
+
+    def test_the_real_artist_beats_another_bands_exact_version(self):
+        """Version fidelity must not outweigh being the right performer: the
+        penalty is folded into the score rather than used to exclude."""
+        d = decide("Oasis", "Wonderwall",
+                   result("Wonderwall", "Tribute Players", vid="cover"),
+                   result("Wonderwall (Live)", "Oasis", vid="oasis-live"))
+        assert d.video_id == "oasis-live"
+
+    def test_every_shortfall_is_named(self):
+        d = decide("Oasis", "Wonderwall", result("Wonderwall (Live)", "Tribute Players"))
+        assert d.status == "ambiguous"
+        assert "artist similarity" in d.reason and "live version" in d.reason
 
 
 class TestVersionFallback:
@@ -303,19 +354,28 @@ class TestVersionFallback:
         assert d.status == "ambiguous"
         assert "no acoustic version found" in d.reason
 
-    @pytest.mark.parametrize("asked, offered", [
-        ("Wonderwall (Live)", "Wonderwall (Remix)"),
-        ("Wonderwall (Acoustic)", "Wonderwall (Karaoke)"),
+    @pytest.mark.parametrize("asked, offered, marker", [
+        ("Wonderwall (Live)", "Wonderwall (Remix)", "remix"),
+        ("Wonderwall (Acoustic)", "Wonderwall (Karaoke)", "karaoke"),
     ])
-    def test_a_different_marked_version_is_not_a_fallback(self, asked, offered):
-        """Asking for live and being handed a remix is not "close enough" — it
-        carries a marker that was never requested."""
+    def test_a_wrongly_marked_version_is_still_offered(self, asked, offered, marker):
+        """Asking for live and being handed a remix isn't what was wanted, but
+        it is the same song — so it's offered, with the mismatch named."""
         d = decide("Oasis", asked, result(offered, "Oasis"))
-        assert d.status == "rejected"
+        assert d.status == "ambiguous"
+        assert f"this is the {marker} version" in d.reason
 
-    def test_the_rejection_names_the_unwanted_marker(self):
+    def test_the_standard_recording_outranks_a_wrongly_marked_one(self):
+        """Both are imperfect, but being handed the plain recording is a milder
+        disappointment than being handed a remix nobody asked for."""
+        d = decide("Oasis", "Wonderwall (Live)",
+                   result("Wonderwall (Remix)", "Oasis", vid="remix"),
+                   result("Wonderwall", "Oasis", vid="standard"))
+        assert d.video_id == "standard"
+
+    def test_the_mismatch_names_the_unwanted_marker(self):
         d = decide("Oasis", "Wonderwall", result("Wonderwall (Karaoke)", "Oasis"))
-        assert "karaoke version, which wasn't asked for" in d.reason
+        assert "this is the karaoke version, not the one asked for" in d.reason
 
 
 class TestAmbiguity:

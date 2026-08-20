@@ -104,21 +104,35 @@ Returns a `MatchDecision` whose `status` is one of:
 
 | status | meaning | what happens |
 |---|---|---|
-| `high` | artist and title both match strongly, no version conflict | added |
-| `ambiguous` | credible, but not certain | the user's policy decides |
-| `rejected` | failed a minimum, or a conflicting recording | always skipped |
+| `high` | near-identical artist and title, the recording asked for, clear winner | added |
+| `ambiguous` | recognisably the same song, but something is off | the user's policy decides |
+| `rejected` | a *different* song — no result shared a whole title word | always skipped |
 
-**This replaced a much looser heuristic**, and the replacement is the point of
-the design. The old version compared substrings and, when nothing matched,
-returned the first search result anyway — flagged `?` but added regardless. That
-made `Cher — One` silently become `Cherub — Someone`, and turned studio requests
-into live versions, remixes and karaoke tracks. Two rules now prevent that:
+**Two opposite failures are being avoided here, and the balance between them is
+the whole design.**
 
-* **There is no fallback.** Nothing credible → `rejected`, and no policy setting
-  can override it.
-* **Artist and title are thresholded independently** (`MIN_ARTIST`, `MIN_TITLE`)
-  before the weighted `overall_score` is used at all, so a perfect title can
-  never carry the wrong artist, or vice versa.
+The original heuristic compared substrings and, when nothing matched, returned
+the first search result anyway — flagged `?` but added regardless. That made
+`Cher — One` silently become `Cherub — Someone` and turned studio requests into
+live takes and karaoke tracks. So substring comparison went, and confidence
+became hard to earn.
+
+But the first replacement over-corrected: it required artist *and* title to clear
+minimums and refused any version mismatch outright, so a live-only track, a
+remix, or another band's cover produced **nothing at all**. Coming back
+empty-handed is the worse failure — a proposal the user can glance at and accept
+beats a silent miss. So:
+
+* **`rejected` is reserved for a different song.** The only bar is a shared whole
+  word in the title (`title_score > TITLE_FLOOR`; `score_text` returns exactly
+  0.0 when nothing is shared). That still rejects `One → Someone`,
+  `Cher → Cherub`, and `Lisztomania → 1901`.
+* **A wrong artist or wrong recording costs points and blocks `high`** — it never
+  excludes. Every shortfall is named in `reasons`, so an offer is explicit rather
+  than silent. This is the sense in which a high title score still can't
+  compensate for the wrong artist: it can't make the match *confident*.
+* **`high` is deliberately hard to earn**, so everything doubtful reaches the
+  user rather than being assumed.
 
 The stages, all in `matching.py`:
 
@@ -135,29 +149,29 @@ The stages, all in `matching.py`:
 4. **Keep version information** — `version_markers()` reads the *whole* title,
    brackets included. Hard markers are live, remix, acoustic, instrumental,
    karaoke, cover, demo, radio edit, extended, sped up, slowed, clean, explicit.
-   Soft markers (remastered, deluxe, anniversary, album version, official video…)
-   are stripped by `core_title()`, which is why `Wonderwall` still matches
-   `Wonderwall (Remastered)`. `core_title()` also drops `feat. X`.
+   `core_title()` removes it all before scoring: a bracketed group naming a
+   version is dropped **whole**, not word by word, because `(Live at Wembley)` is
+   one piece of metadata — keeping `at wembley` made the live take look like a
+   different song and dragged it below an unrelated band's studio cut. Soft
+   markers (remastered, deluxe, anniversary, album version, official video…),
+   bare marker words and `feat. X` go the same way, which is why `Wonderwall`
+   scores 1.00 against both `Wonderwall (Remastered)` and
+   `Wonderwall (Live at Wembley)`.
 
-   `version_relation()` compares hard markers **asymmetrically**, because the two
-   directions are not equally bad:
+   `version_relation()` then compares hard markers **asymmetrically**, because
+   the two directions aren't equally disappointing:
 
-   | relation | example | outcome |
+   | relation | example | penalty |
    |---|---|---|
-   | `same` | ask *Wonderwall (Live)*, get *Wonderwall (Live)* | can be `high` |
-   | `extra` | ask *Wonderwall*, get *Wonderwall (Live)* | `rejected` |
-   | `missing` | ask *Wonderwall (Live)*, get *Wonderwall* | capped at `ambiguous` |
+   | `same` | ask *Wonderwall (Live)*, get *Wonderwall (Live)* | 0 — can be `high` |
+   | `missing` | ask *Wonderwall (Live)*, get *Wonderwall* | 0.10 |
+   | `extra` | ask *Wonderwall*, get *Wonderwall (Live)* | 0.20 |
 
-   The `missing` case is a deliberate concession: if the live version simply
-   isn't on YouTube Music, offering the album version beats returning nothing —
-   but it is never silent, so it can only ever be ambiguous. `extra` stays a
-   hard refusal, and so does a candidate whose markers merely *differ* (asking
-   for live and being handed a remix is `extra`, not a fallback).
-
-   Ranking keeps the two apart: exact-version candidates are sorted ahead of
-   fallbacks, and the runner-up margin is computed within a group. A fallback is
-   strictly inferior, so it must neither outrank the requested recording nor make
-   it look like a near tie — it is still listed in `alternatives`.
+   `VERSION_PENALTY` is applied to the score, **not** used to exclude. That is
+   deliberate and was got wrong once: filtering on version meant a tribute band's
+   exact studio version outranked the real artist's live take. Scaling the score
+   instead lets being the right performer outweigh being the right recording,
+   while still preferring the exact version when it exists.
 5. **Compare whole tokens** — `score_text()` scores 1.0 for equal token sets;
    otherwise the token sets must genuinely intersect before any fuzzy score is
    trusted. That gate is what kills `one → someone` and `cher → cherub`, where
@@ -169,15 +183,17 @@ The stages, all in `matching.py`:
    returned artist, ignoring nameless/malformed entries, strips a leading "the"
    (`The Beatles ≡ Beatles`), and lets requested `feat.` guests match any
    returned artist. Extra artists on the result never penalise it.
-7. **Rank and classify** — candidates failing a minimum or conflicting on version
-   are dropped *before* ranking, so a live variant alongside the studio one
-   doesn't make the result ambiguous. `high` additionally needs `HIGH_TITLE` /
-   `HIGH_ARTIST` and to beat the runner-up by `WINNER_MARGIN`; otherwise
-   `ambiguous`, with `reasons` explaining which condition failed.
+7. **Rank and classify** — everything with a related title is ranked by
+   `base × (1 − version penalty)`, where `base = 0.65·title + 0.35·artist`. Only
+   candidates sharing no title word are dropped. `high` needs `HIGH_TITLE` /
+   `HIGH_ARTIST`, `relation == "same"`, *and* a `WINNER_MARGIN` lead over the
+   runner-up; anything else is `ambiguous` with `reasons` naming each shortfall
+   (including which artist was actually found, so the dialog can show it).
 
-All thresholds are module constants at the top of the file, deliberately strict:
-a false negative costs a prompt, a false positive puts the wrong song in a
-playlist. Loosen them only with real examples and tests.
+All thresholds are module constants at the top of the file. They encode one
+trade-off: being *confident* is hard to earn, but being *offered* is easy — a
+prompt costs the user a click, a silent miss costs them the song. Loosen them
+only with real examples and tests.
 
 ytmusicapi is unofficial, so every field is treated as optional: `results` itself
 may be `None`, entries may not be dicts, `artists` may be missing/`null`/hold
@@ -538,10 +554,14 @@ the package split, so keep it.
 - **No matching report.** An optional CSV of requested/proposed/scores/action/
   reason would make threshold tuning far easier than reading the Messages pane.
 - **Thresholds are guesses.** The constants at the top of `matching.py` were
-  chosen conservatively and validated against a hand-written corpus, not real
-  imports. `explicit`/`clean` in particular are treated as hard conflicts, which
-  may prove too strict — ytmusicapi exposes an `isExplicit` field that the
-  matcher currently ignores. Expect to revisit these with real data.
+  validated against a hand-written corpus, not real imports. Two things to watch:
+  `explicit`/`clean` are treated as version markers even though ytmusicapi
+  exposes a separate `isExplicit` field the matcher ignores, so an
+  explicit-tagged track may prompt when it shouldn't; and the relaxed
+  `TITLE_FLOOR` means a loose title overlap (`Hello` vs `Hello World Goodbye`)
+  now reaches the user as a proposal rather than being dropped. Both are
+  deliberate — a prompt beats a silent miss — but both are worth revisiting once
+  there's real data on how noisy they are.
 - **No playlist creation** from the app — users must create the playlist on
   YT Music first. `yt.create_playlist(title, description)` makes this a small
   feature (button + name prompt + refresh).
