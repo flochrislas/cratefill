@@ -20,7 +20,7 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from . import youtube
+from . import policy, youtube
 from .storage import read_songs_csv, read_songs_folder
 from .youtube import AUTH_FILE, clean_pasted_headers, migrate_legacy_auth_file, secure_auth_file
 
@@ -88,6 +88,27 @@ def apply_dark_theme(root):
         lightcolor=[("disabled", BG)],
         darkcolor=[("disabled", BG)],
     )
+    # Combobox needs its field styled explicitly, and its drop-down list is a
+    # plain tk Listbox that ttk styles don't reach at all — hence option_add.
+    style.configure(
+        "TCombobox",
+        fieldbackground=FIELD, background=BTN, foreground=FG,
+        arrowcolor=FG, bordercolor=BORDER, lightcolor=BTN, darkcolor=BTN,
+        selectbackground=FIELD, selectforeground=FG, padding=4,
+    )
+    style.map(
+        "TCombobox",
+        fieldbackground=[("readonly", FIELD), ("disabled", BG)],
+        foreground=[("disabled", FG_DIM)],
+        arrowcolor=[("disabled", FG_DIM), ("active", ACCENT_BAR)],
+        background=[("active", BTN_ACTIVE)],
+    )
+    root.option_add("*TCombobox*Listbox.background", FIELD)
+    root.option_add("*TCombobox*Listbox.foreground", FG)
+    root.option_add("*TCombobox*Listbox.selectBackground", ACCENT)
+    root.option_add("*TCombobox*Listbox.selectForeground", "#ffffff")
+    root.option_add("*TCombobox*Listbox.borderWidth", 0)
+
     style.configure("Treeview", background=FIELD, fieldbackground=FIELD, rowheight=24)
     style.map(
         "Treeview",
@@ -261,6 +282,59 @@ class LoginDialog(tk.Toplevel):
         )
 
 
+class AmbiguousMatchDialog(tk.Toplevel):
+    """Asks what to do about one credible-but-uncertain match.
+
+    Sets `action` to "add" or "skip", or leaves it None if the user dismissed the
+    window — which the caller treats as "cancel the whole import", so no playlist
+    is touched. `remember` reports whether the choice should become the policy.
+    """
+
+    def __init__(self, parent, artist, title, decision):
+        super().__init__(parent)
+        self.title("Ambiguous match")
+        self.configure(bg=BG)
+        self.transient(parent)
+        self.grab_set()
+        enable_dark_title_bar(self)
+        self.action = None
+        self.remember = False
+
+        body = ttk.Frame(self, padding=12)
+        body.pack(fill="both", expand=True)
+        for caption, value in (
+            ("Requested:", f"{artist} — {title}"),
+            ("Proposed:", decision.label),
+            ("Reason:", decision.reason),
+        ):
+            ttk.Label(body, text=caption, foreground=FG_DIM).pack(anchor="w")
+            ttk.Label(body, text=value, wraplength=460, justify="left").pack(
+                anchor="w", padx=(12, 0), pady=(0, 8)
+            )
+
+        self.remember_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            body,
+            text="Use this choice for future ambiguous matches",
+            variable=self.remember_var,
+        ).pack(anchor="w", pady=(4, 0))
+
+        buttons = ttk.Frame(body)
+        buttons.pack(fill="x", pady=(12, 0))
+        add = ttk.Button(buttons, text="Add", command=lambda: self._choose(policy.ADD))
+        add.pack(side="right")
+        ttk.Button(buttons, text="Skip", command=lambda: self._choose(policy.SKIP)).pack(
+            side="right", padx=(0, 8)
+        )
+        add.focus_set()
+        self.bind("<Escape>", lambda _e: self.destroy())  # dismiss = cancel the import
+
+    def _choose(self, action):
+        self.action = action
+        self.remember = bool(self.remember_var.get())
+        self.destroy()
+
+
 class CratefillApp:
     def __init__(self, root):
         self.root = root
@@ -273,6 +347,9 @@ class CratefillApp:
         self.playlists = []  # list of dicts from get_library_playlists
         self.worker_queue = queue.Queue()
         self.working = False
+        # Match decisions waiting to be reviewed between the two add phases.
+        self.pending_review = None
+        self.ambiguous_policy = policy.load_policy()
 
         self._build_ui()
         self.show_help()
@@ -358,9 +435,19 @@ class CratefillApp:
         self.playlist_list.pack(side="left", fill="both", expand=True)
         playlist_scroll.pack(side="right", fill="y")
 
-        # Bottom: action button, progress, messages
+        # Bottom: ambiguous-match policy, action button, progress
         bottom = ttk.LabelFrame(main, text="Process", padding=4)
         bottom.pack(fill="x", pady=(8, 0))
+        ttk.Label(bottom, text="On ambiguous match:").pack(side="left", padx=(0, 6))
+        self.policy_combo = ttk.Combobox(
+            bottom,
+            state="readonly",
+            width=12,
+            values=[policy.POLICY_LABELS[p] for p in policy.POLICIES],
+        )
+        self.policy_combo.set(policy.POLICY_LABELS[self.ambiguous_policy])
+        self.policy_combo.bind("<<ComboboxSelected>>", self._on_policy_selected)
+        self.policy_combo.pack(side="left", padx=(0, 10))
         self.add_button = ttk.Button(
             bottom, text="Add selected songs to selected playlist(s)", command=self.add_songs
         )
@@ -383,6 +470,22 @@ class CratefillApp:
         self.busy_controls = (
             self.add_button, self.export_button, self.login_button, self.refresh_button,
         )
+
+    # ---------- Ambiguous-match policy ----------
+
+    def _on_policy_selected(self, _event=None):
+        self.set_ambiguous_policy(policy.LABEL_POLICIES[self.policy_combo.get()])
+
+    def set_ambiguous_policy(self, value):
+        """Adopt a policy and persist it immediately, keeping the dropdown in sync.
+
+        Called both by the dropdown and by "use this choice for future ambiguous
+        matches" in the review dialog — they must not drift apart.
+        """
+        self.ambiguous_policy = value
+        self.policy_combo.set(policy.POLICY_LABELS[value])
+        if not policy.save_policy(value):
+            self.log(f"Could not save your preference to {policy.SETTINGS_FILE}")
 
     def refresh_add_button(self):
         """Outline the Add button in green once there is something to add.
@@ -573,9 +676,9 @@ class CratefillApp:
             messagebox.showwarning("Cratefill", "Select at least one playlist on the right.")
             return
 
-        self._start_work(maximum=len(selected_songs) + len(selected_playlists))
+        self._start_work(maximum=len(selected_songs))
         self.log(
-            f"--- Adding {len(selected_songs)} song(s) to "
+            f"--- Matching {len(selected_songs)} song(s) for "
             f"{len(selected_playlists)} playlist(s) ---"
         )
         # Snapshot the client: the worker must keep using the account it started
@@ -585,6 +688,53 @@ class CratefillApp:
             args=(self.yt, selected_songs, selected_playlists),
             daemon=True,
         ).start()
+
+    # ---------- Reviewing matches, then adding ----------
+
+    def _review_and_add(self, yt, evaluated, playlists):
+        """Main thread: turn match decisions into an approved list, then add.
+
+        Runs between the two worker phases. Nothing has touched a playlist yet,
+        which is what makes cancelling here safe and predictable.
+        """
+        approved, counts = [], {"add": 0, "skip": 0}
+        for song, decision in evaluated:
+            artist, title = song[0], song[1]
+            action = policy.action_for_match(decision, self.ambiguous_policy)
+            if action == policy.ASK:
+                choice = self._ask_about_match(artist, title, decision)
+                if choice is None:  # dialog dismissed → abandon the whole import
+                    self.log("--- Cancelled. No playlist was changed. ---")
+                    return
+                action = choice
+            elif decision.status == "ambiguous":
+                verb = "added" if action == policy.ADD else "skipped"
+                self.log(f"    → ambiguous match {verb} by policy")
+            if action == policy.ADD and decision.video_id:
+                approved.append(decision.video_id)
+                counts["add"] += 1
+            else:
+                counts["skip"] += 1
+
+        self.log(f"--- {counts['add']} to add, {counts['skip']} skipped. ---")
+        if not approved:
+            self.log("Nothing approved — no playlist was changed.")
+            return
+        self._start_work(maximum=len(playlists))
+        threading.Thread(
+            target=self._add_worker, args=(yt, approved, playlists), daemon=True
+        ).start()
+
+    def _ask_about_match(self, artist, title, decision):
+        """Show the review dialog. Returns "add", "skip", or None to cancel."""
+        dialog = AmbiguousMatchDialog(self.root, artist, title, decision)
+        self.root.wait_window(dialog)
+        if dialog.action:
+            self.log(f"    → {dialog.action} (your choice)")
+        if dialog.remember and dialog.action:
+            self.set_ambiguous_policy(dialog.action)
+            self.log(f"    → remembering '{policy.POLICY_LABELS[dialog.action]}'")
+        return dialog.action
 
     def export_playlists(self):
         """Save each selected playlist as an Artist/Title/Album CSV file."""
@@ -635,16 +785,28 @@ class CratefillApp:
         self.progress.configure(mode="determinate", value=0)
 
     def _worker(self, yt, songs, playlists):
-        """Background thread entry point: always reports completion.
+        """Phase one, on a background thread: search and score, never mutate.
 
-        The Add/Export buttons stay disabled until a ("done", …) message
-        arrives, so a worker that dies on an unexpected error — malformed API
-        data, say — would leave the UI unusable until restart. Hence the
-        try/finally: the thread cannot exit without re-enabling the UI.
+        Always reports completion. The Add/Export buttons stay disabled until a
+        ("done", …) message arrives, so a worker that dies on an unexpected
+        error — malformed API data, say — would leave the UI unusable until
+        restart. Hence the try/finally: the thread cannot exit without
+        re-enabling the UI.
         """
         put = self.worker_queue.put
         try:
-            youtube.add_songs_to_playlists(yt, songs, playlists, put)
+            evaluated = youtube.evaluate_songs(yt, songs, put)
+            put(("decisions", (yt, evaluated, playlists)))
+        except Exception as e:
+            put(("log", f"✗ Unexpected error while matching: {type(e).__name__}: {e}"))
+        finally:
+            put(("done", None))
+
+    def _add_worker(self, yt, video_ids, playlists):
+        """Phase two, on a background thread: add the approved video ids."""
+        put = self.worker_queue.put
+        try:
+            youtube.add_video_ids_to_playlists(yt, video_ids, playlists, put)
         except Exception as e:
             put(("log", f"✗ Unexpected error while adding: {type(e).__name__}: {e}"))
         finally:
@@ -694,8 +856,16 @@ class CratefillApp:
                         messagebox.showerror(
                             "Cratefill", f"Could not use saved login:\n{message}"
                         )
+                elif kind == "decisions":
+                    # Stashed rather than acted on immediately: the review has to
+                    # wait for this job's "done" below, because starting phase two
+                    # needs _end_work() to have cleared self.working first.
+                    self.pending_review = payload
                 elif kind == "done":
                     self._end_work()
+                    review, self.pending_review = self.pending_review, None
+                    if review:
+                        self._review_and_add(*review)
         except queue.Empty:
             pass
         finally:

@@ -16,6 +16,8 @@ settling on this approach.
 | GUI | Tkinter (`ttk` widgets) | Ships with Python — no packaging issues on Windows |
 | Theme | Hand-rolled dark theme on built-in `clam` (`apply_dark_theme()`) | `clam` is the one built-in ttk theme that renders identically on Windows and Linux, so the dark UI is cross-platform with zero dependencies. sv-ttk was tried first and abandoned: on this Python 3.14 / Tk 8.6.15 build it registered its theme name but applied empty style settings (half-light UI). Palette lives in module constants (`BG`, `FIELD`, `BTN`, `FG`, `ACCENT`…); plain tk widgets (Text, Listbox) aren't covered by ttk themes and take `DARK_LIST_STYLE`/`DARK_TEXT_STYLE` directly. The title bar is darkened via `enable_dark_title_bar()` (Windows DWM attribute, best-effort no-op elsewhere; Linux title bars follow the desktop's window manager theme) |
 | Architecture | Small package, `cratefill/` (`app`, `matching`, `storage`, `youtube`) | Started as one file; split at ~1100 lines because UI layout, matching rules, local file handling and YouTube Music communication change for unrelated reasons, and the improved matching system needs a pure, testable core. Kept deliberately modest — no `utils.py`, no module-per-class |
+| Song matching | Token-aware scoring on top of `rapidfuzz`, with independent artist/title thresholds and version-marker checks | Substring matching accepted `one → someone` and `cher → cherub`, and the old first-result fallback added unrelated songs silently. `rapidfuzz` gives order-tolerant scorers (`token_set_ratio`, `WRatio`) far better than `difflib` and is fast enough to be irrelevant at these sizes; the fuzzy call is isolated in `_ratio()` so it can be swapped |
+| Ambiguous matches | User policy in `settings.json` (`ask`/`skip`/`add`, default `ask`), applied by `policy.py` | Matching can only say how credible a candidate is; what to do about "credible but uncertain" is a user preference. Kept out of `matching.py` so the rules stay pure and testable, and out of `browser.json` so a preference never shares a file with session cookies |
 | Auth persistence | `browser.json` in the per-user data dir (`user_data_dir()`) | ytmusicapi's standard browser-auth file format. Kept out of the app directory: that can be read-only for system-wide installs, is wiped on every launch under PyInstaller `--onefile`, and invites copying session cookies around with the executable. Created `0600` in a `0700` directory on POSIX, since ytmusicapi writes it with the process umask |
 
 There is no database. For day-to-day dev, `pip install -e ".[dev]"` and run
@@ -32,9 +34,13 @@ cratefill/
 ├── __init__.py    __version__ only — the single source of the version, and kept
 │                  import-light because setuptools reads the attribute
 ├── __main__.py    python -m cratefill → app.main()
-├── matching.py    normalize(s), pick_match(results, artist, title)
-│                  pure: zero imports, no I/O, deterministic
+├── matching.py    normalize/tokens/core_title, version_markers,
+│                  score_text/score_artist, choose_match → MatchDecision
+│                  pure: re + unicodedata + rapidfuzz, no I/O, deterministic
+├── policy.py      POLICIES ("ask"/"skip"/"add"), load_policy/save_policy,
+│                  action_for_match(decision, policy) → "add"/"skip"/"ask"
 ├── storage.py     user_data_dir()            per-user data directory
+│                  read_json/write_json_atomic  settings file mechanics
 │                  read_songs_csv(path)       CSV → list[(artist, title, station)]
 │                  read_songs_folder(path)    music files → list[(folder, stem, "")]
 │                  safe_filename(name)        playlist title → legal file name
@@ -46,22 +52,28 @@ cratefill/
 │                  open_session()             saved session → YTMusic client
 │                  save_credentials(headers)  stage, validate, atomically install
 │                  fetch_playlists(yt, put)
-│                  add_songs_to_playlists(yt, songs, playlists, put)
+│                  search_candidates(yt, artist, title)
+│                  evaluate_songs(yt, songs, put) → [(song, MatchDecision)]
+│                  add_video_ids_to_playlists(yt, ids, playlists, put)
 │                  export_playlists_to_csv(yt, playlists, dest, put)
 └── app.py         palette + apply_dark_theme(), enable_dark_title_bar()
                    SONG_COLUMNS, LOGIN_INSTRUCTIONS, HELP_TEXT
-                   class LoginDialog(Toplevel)  paste-headers auth dialog
+                   class LoginDialog(Toplevel)           paste-headers auth dialog
+                   class AmbiguousMatchDialog(Toplevel)  Skip/Add + remember
                    class CratefillApp           window, selections, threads, queue
                    main()
 
 run_cratefill.py   PyInstaller entry script (see PyInstaller section)
-tests/             test_matching.py, test_storage.py, test_workers.py
+tests/             test_matching.py, test_policy.py, test_storage.py,
+                   test_workers.py, test_review.py, test_dialog.py
 ```
 
-Dependency direction is one-way: `app → youtube → {storage, matching}`. Nothing
-imports `app`. `matching.py` imports nothing at all; `storage.py` and
-`youtube.py` never import Tkinter; `app.py` makes no `yt.*` call of its own.
-Those four properties are what keep the test suite free of Tk and network, and
+Dependency direction is one-way:
+`__main__ → app → {youtube → {matching, storage}, policy → storage}`. Nothing
+imports `app`. `matching.py` imports only `re`, `unicodedata` and `rapidfuzz`;
+`storage.py`, `policy.py` and `youtube.py` never import Tkinter; `app.py` makes
+no `yt.*` call of its own; and `matching.py` knows nothing about the ambiguous
+policy. Those properties are what keep the test suite free of Tk and network, and
 they are worth asserting in review.
 
 ### `read_songs_csv(path)` — CSV ingestion
@@ -86,32 +98,97 @@ messiness in this order:
 
 To support new header names, just extend the tuples at the top of the file.
 
-### `pick_match(results, artist, title)` — match heuristic
+### `choose_match(artist, title, results)` — the matching pipeline
 
-Given ytmusicapi search results, returns `(result, confident)`:
+Returns a `MatchDecision` whose `status` is one of:
 
-- **Confident match:** normalized title is a substring of the result title (or
-  vice versa) *and* the normalized artist matches one of the result's artists
-  the same way. Normalization = casefold + strip non-alphanumerics. Both titles
-  must be non-empty — `""` is a substring of everything, so a result with no
-  title would otherwise pass as confident.
-- **Fallback:** first result that has a `videoId`, flagged `confident=False`.
-  These show as `?` lines in the log with what was actually found, so the user
-  can review; they are still added to the playlist.
-- `(None, False)` if nothing usable.
+| status | meaning | what happens |
+|---|---|---|
+| `high` | artist and title both match strongly, no version conflict | added |
+| `ambiguous` | credible, but not certain | the user's policy decides |
+| `rejected` | failed a minimum, or a conflicting recording | always skipped |
 
-Substring matching is deliberately loose — it tolerates "(Radio Edit)",
-"feat. X" etc. If match quality becomes a problem, this is the function to
-improve (e.g. `difflib.SequenceMatcher` ratio, or duration comparison if the
-CSV ever carries durations). Note `videoId` can be `None` on some result types,
-hence the filter.
+**This replaced a much looser heuristic**, and the replacement is the point of
+the design. The old version compared substrings and, when nothing matched,
+returned the first search result anyway — flagged `?` but added regardless. That
+made `Cher — One` silently become `Cherub — Someone`, and turned studio requests
+into live versions, remixes and karaoke tracks. Two rules now prevent that:
 
-ytmusicapi is unofficial, so every field here is treated as optional: `results`
-itself may be `None`, entries may not be dicts, `artists` may be missing/`null`
-/hold entries without a `name`, and `title` may be absent. `normalize()` maps
-`None` to `""` for that reason. This is not hypothetical — a result with
-`artists=None` used to raise `TypeError` inside `pick_match` and take down the
-whole worker thread with it.
+* **There is no fallback.** Nothing credible → `rejected`, and no policy setting
+  can override it.
+* **Artist and title are thresholded independently** (`MIN_ARTIST`, `MIN_TITLE`)
+  before the weighted `overall_score` is used at all, so a perfect title can
+  never carry the wrong artist, or vice versa.
+
+The stages, all in `matching.py`:
+
+1. **Validate the row** — `validate_request()` refuses an empty title or artist.
+   `youtube.evaluate_songs` calls it *before* searching, so a hopeless row costs
+   no network call.
+2. **Search several candidates** — `SEARCH_LIMIT = 10`, and every result with a
+   `videoId` is scored. Result order is not trusted.
+3. **Normalize** — `normalize()` does NFKD accent stripping (`Beyoncé → beyonce`),
+   curly-quote flattening, punctuation → space (`AC/DC → ac dc`), whitespace
+   collapsing, plus two special cases: a `_LIGATURES` table for letters NFKD
+   won't split (`Cœur → coeur`, `ß → ss`) and interior `!`/`$` → `i`/`s` for
+   stylised names (`P!nk → pink`, `Ke$ha → kesha`).
+4. **Keep version information** — `version_markers()` reads the *whole* title,
+   brackets included. Hard markers (live, remix, acoustic, instrumental, karaoke,
+   cover, demo, radio edit, extended, sped up, slowed, clean, explicit) must
+   agree in **both** directions: a studio request must not become a live take,
+   and a live request must not become the studio one. Soft markers (remastered,
+   deluxe, anniversary, album version, official video…) are stripped by
+   `core_title()`, which is why `Wonderwall` still matches
+   `Wonderwall (Remastered)`. `core_title()` also drops `feat. X`.
+5. **Compare whole tokens** — `score_text()` scores 1.0 for equal token sets;
+   otherwise the token sets must genuinely intersect before any fuzzy score is
+   trusted. That gate is what kills `one → someone` and `cher → cherub`, where
+   character similarity is high but no whole word is shared. Overlap is divided
+   by the **longer** side, so `hello` can't pass as `hello world goodbye` either.
+   Values of four characters or fewer get no fuzzy credit at all. The fuzzy part
+   is `max(rapidfuzz.fuzz.token_set_ratio, WRatio) / 100`, isolated in `_ratio()`.
+6. **Score the artist** — `score_artist()` takes the best score across every
+   returned artist, ignoring nameless/malformed entries, strips a leading "the"
+   (`The Beatles ≡ Beatles`), and lets requested `feat.` guests match any
+   returned artist. Extra artists on the result never penalise it.
+7. **Rank and classify** — candidates failing a minimum or conflicting on version
+   are dropped *before* ranking, so a live variant alongside the studio one
+   doesn't make the result ambiguous. `high` additionally needs `HIGH_TITLE` /
+   `HIGH_ARTIST` and to beat the runner-up by `WINNER_MARGIN`; otherwise
+   `ambiguous`, with `reasons` explaining which condition failed.
+
+All thresholds are module constants at the top of the file, deliberately strict:
+a false negative costs a prompt, a false positive puts the wrong song in a
+playlist. Loosen them only with real examples and tests.
+
+ytmusicapi is unofficial, so every field is treated as optional: `results` itself
+may be `None`, entries may not be dicts, `artists` may be missing/`null`/hold
+entries without a `name`, and `title` may be absent. `normalize()` maps `None` to
+`""` for that reason. This is not hypothetical — a result with `artists=None`
+used to raise `TypeError` and take down the whole worker thread with it.
+
+### Ambiguous-match policy (`policy.py`)
+
+`matching.py` deliberately does not know what an ambiguous result should *lead
+to*. `policy.action_for_match(decision, saved)` makes that call and returns
+`"add"`, `"skip"` or `"ask"`:
+
+```python
+high     → "add"    whatever the setting says
+rejected → "skip"   whatever the setting says
+ambiguous→ the saved policy ("ask" | "skip" | "add")
+```
+
+The asymmetry is the safety property: **"Always add" means "accept credible but
+uncertain candidates", never "add the first unrelated search result"**.
+
+The setting is stored as `{"ambiguous_match_policy": "ask"}` in `settings.json`
+in `storage.user_data_dir()` — beside `browser.json`, never inside it: a
+preference has no business sharing a file with session cookies. Writes go through
+`storage.write_json_atomic()` (staged sibling + `os.replace`, same reasoning as
+`save_credentials`) and preserve unrelated keys, so a future version's settings
+survive an older version writing. Anything wrong with the file — absent,
+unreadable, malformed, not an object, unknown value — falls back to `ask`.
 
 ### Authentication flow
 
@@ -228,22 +305,40 @@ No ytmusicapi call is left on the UI thread; if you add one, put it on a worker.
 
 `self.working` guards against double-starting a job.
 
-### The add operation (`_worker`)
+### The add operation — match, review, then add
 
-Two phases, on purpose:
+Three stages, and the middle one is why the first two are separate jobs rather
+than one loop. **No playlist may be touched while a decision is outstanding**, so
+cancelling is predictable and the user can see the whole import before it changes
+anything.
 
-1. **Search phase:** one `yt.search(f"{artist} {title}", filter="songs",
-   limit=5)` per song; collect matched `videoId`s. Per-song failures (search
-   exception, no match) are logged and *don't* abort the run.
-2. **Add phase:** one `yt.add_playlist_items(playlistId, video_ids,
-   duplicates=False)` call **per playlist** with all matched IDs batched — not
-   one call per song, which would be slow and rate-limit-prone.
+1. **Match phase** — `_worker` → `youtube.evaluate_songs()`. One
+   `yt.search(f"{artist} {title}", filter="songs", limit=SEARCH_LIMIT)` per song
+   (the station column is never part of the query), then `choose_match()`. Emits
+   a log line per song and a `("step", …)` each. Per-song failures (search
+   exception, unmatched) become `rejected` decisions and *don't* abort the run.
+   This phase makes **no** mutating call. It finishes by handing
+   `("decisions", (yt, evaluated, playlists))` to the UI.
+2. **Review** — `_review_and_add()`, on the main thread. `_poll_worker` stashes
+   the decisions and only runs this once that job's `("done", …)` has been
+   processed, because `_end_work()` has to clear `self.working` before phase three
+   can call `_start_work()` again. Each decision goes through
+   `policy.action_for_match()`; `"ask"` results open `AmbiguousMatchDialog`
+   sequentially. Ticking "use this choice for future ambiguous matches" calls
+   `set_ambiguous_policy()`, which saves the setting, updates the dropdown, and
+   therefore governs the *remaining* songs in the same run. Dismissing the dialog
+   (Escape or the window close button) leaves `action` as `None`, which abandons
+   the entire import — including high-confidence matches already approved.
+3. **Add phase** — `_add_worker` → `youtube.add_video_ids_to_playlists()`. One
+   `yt.add_playlist_items(playlistId, video_ids, duplicates=False)` call **per
+   playlist** with all approved IDs batched — not one call per song, which would
+   be slow and rate-limit-prone.
 
 `duplicates=False` does **not** make YT Music skip songs already in the
 playlist — it makes the whole batch fail atomically (nothing added) if even
 one song is a duplicate, and ytmusicapi's `duplicates=True` would add the
-duplicates. So on a failed status, `_worker` fetches the playlist's current
-videoIds, filters them out of the batch, and retries once with the rest
+duplicates. So on a failed status, `add_video_ids_to_playlists` fetches the
+playlist's current videoIds, filters them out of the batch, and retries once with the rest
 (logging "N already there, skipped"); matched videoIds are also deduped
 within the batch. If the retry still fails (playlist not editable, or YT
 considers a song a duplicate under a *different* videoId), a soft warning is
@@ -352,12 +447,32 @@ Two deliverables per release:
 network and no `browser.json` — that independence is the main practical payoff of
 the package split, so keep it.
 
-- **`tests/test_matching.py`** — `normalize()` and `pick_match()` directly:
-  casefolding/punctuation/accents, confident vs fallback vs no match, and a
-  parametrised sweep of malformed ytmusicapi shapes (`artists=None`, missing
-  keys, nameless artists, non-dict entries, `results=None`). Those last ones are
-  regression tests: a result with `artists=None` used to raise inside
-  `pick_match` and take the worker thread down with it.
+- **`tests/test_matching.py`** — every stage directly: `normalize()` (casefolding,
+  accents, ligatures, stylised names, punctuation), `split_featured()`,
+  `version_markers()`/`has_version_conflict()` in both directions,
+  `score_text()`, and `choose_match()` across a fixture set of harmless variants
+  that must be accepted (accents, leading "The", featured artists, remasters,
+  album versions), false positives that must be refused (`One`/`Someone`,
+  `Cher`/`Cherub`, same title by another artist, right artist wrong song),
+  recording variants that must be refused (live, remix, instrumental, cover,
+  sped up, explicit), and the ambiguity margin. Plus a parametrised sweep of
+  malformed ytmusicapi shapes (`artists=None`, missing keys, nameless artists,
+  non-dict entries, `results=None`) — regression tests: a result with
+  `artists=None` used to raise and take the worker thread down with it.
+- **`tests/test_policy.py`** — the default and every fallback (absent,
+  truncated, non-object, unknown value, unreadable), the save/load round trip,
+  atomic writes leaving no partial file, unrelated keys surviving, and the
+  `action_for_match` matrix — including that `high` ignores the policy and that
+  `rejected` survives "Always add".
+- **`tests/test_review.py`** — `CratefillApp._review_and_add` on a stub, with
+  threading patched out: high-confidence added without prompting under every
+  policy, rejected never added under any policy, skip/add policies applied
+  without a prompt, remembering a choice governing the rest of the run, and a
+  cancelled review mutating nothing at all.
+- **`tests/test_dialog.py`** — `AmbiguousMatchDialog` itself: what it displays,
+  Skip/Add, the remember checkbox, and that Escape or closing the window leaves
+  `action` as `None` (which the caller reads as "cancel the import"). Skips
+  automatically when there's no display.
 - **`tests/test_storage.py`** — CSV encodings (BOM, cp1252), delimiters
   (`,` `;` tab), English/French headers, headerless files, station-by-header-name
   only, quoted fields; `read_songs_folder` including its deliberate
@@ -365,11 +480,13 @@ the package split, so keep it.
   missing artists/album. `sample.csv` is resolved relative to the test file, not
   the working directory.
 - **`tests/test_workers.py`** — a `FakeYT` double and a list for `put`, against
-  `youtube.add_songs_to_playlists` / `export_playlists_to_csv` /
-  `fetch_playlists`: search failure, no match, uncertain match, videoId dedup,
-  the already-in-playlist retry, per-playlist failure isolation, step counts.
-  The completion guarantee is tested by calling the unbound wrappers on a stub
-  holding only a `worker_queue`, so no Tk instance is needed.
+  `youtube.evaluate_songs` / `add_video_ids_to_playlists` /
+  `export_playlists_to_csv` / `fetch_playlists`: search failure, no match,
+  uncertain match, videoId dedup, the already-in-playlist retry, per-playlist
+  failure isolation, step counts — and that the match phase issues no
+  `add_playlist_items` at all. The completion guarantee is tested by calling the
+  unbound wrappers on a stub holding only a `worker_queue`, so no Tk instance is
+  needed.
 - Headless UI construction is still the quick manual check after widget changes:
   `root = tk.Tk(); root.withdraw(); CratefillApp(root); root.update(); root.destroy()`.
 - **Not** covered automatically: real search quality and real playlist mutation
@@ -381,8 +498,32 @@ the package split, so keep it.
 
 - **No retry/rate-limit handling** on search. Fine for tens of songs; for
   hundreds, add a small delay or retry-on-exception in the search loop.
-- **Uncertain matches are auto-added.** A nicer flow: collect `?` matches and
-  show a confirmation dialog before adding.
+- **One modal per ambiguous song.** Fine for a handful, tedious for a long
+  import. The intended replacement is a single batch-review table (Requested /
+  Proposed / Confidence / Default action, high-confidence rows pre-checked,
+  rejected rows disabled) confirmed in one go. The decision data is already in
+  the right shape for it: `_review_and_add` receives every `MatchDecision`
+  up-front, so only the UI needs replacing.
+- **Matching ignores album and duration.** Cratefill already *exports* an Album
+  column but doesn't read one on import, and a large duration difference is a
+  strong signal of a live/extended/wrong recording. Both would improve ranking
+  as secondary signals — album shouldn't be a hard requirement, since
+  compilations and reissues rename it constantly.
+- **Folder imports don't read audio tags.** `mutagen` would give real artist /
+  title / album / duration instead of guessing from folder and file names.
+- **No artist-ID cache.** YT Music search results carry artist IDs; caching the
+  mapping after a high-confidence or user-confirmed match would let later songs
+  by the same artist score more confidently. Seed it *only* from confirmed
+  matches.
+- **No undo.** Recording the items added by the last run would allow an "Undo
+  last import" action — a safety net even after confirmation.
+- **No matching report.** An optional CSV of requested/proposed/scores/action/
+  reason would make threshold tuning far easier than reading the Messages pane.
+- **Thresholds are guesses.** The constants at the top of `matching.py` were
+  chosen conservatively and validated against a hand-written corpus, not real
+  imports. `explicit`/`clean` in particular are treated as hard conflicts, which
+  may prove too strict — ytmusicapi exposes an `isExplicit` field that the
+  matcher currently ignores. Expect to revisit these with real data.
 - **No playlist creation** from the app — users must create the playlist on
   YT Music first. `yt.create_playlist(title, description)` makes this a small
   feature (button + name prompt + refresh).

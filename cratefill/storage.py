@@ -5,14 +5,17 @@ is directly testable. See tests/test_storage.py.
 """
 
 import csv
+import json
 import os
 import re
 import sys
+import tempfile
 from pathlib import Path
 
 
 def user_data_dir():
-    """Per-user directory for browser.json, following each platform's convention.
+    """Per-user directory for browser.json and settings.json, following each
+    platform's convention.
 
     Deliberately *not* next to the script or the .exe: that location can be
     read-only (system-wide installs), gets wiped on every launch under
@@ -26,6 +29,43 @@ def user_data_dir():
         return Path.home() / "Library" / "Application Support" / "Cratefill"
     base = os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config"
     return Path(base) / "cratefill"
+
+
+def read_json(path):
+    """Parse a JSON file, or return None if it is missing or unusable.
+
+    Callers decide what a missing value means — nothing here raises, because a
+    corrupt settings file must never stop the app from starting.
+    """
+    try:
+        with Path(path).open(encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def write_json_atomic(path, data):
+    """Write JSON via a staged sibling file, then swap it in with os.replace.
+
+    Same reason as youtube.save_credentials: a crash mid-write must not leave a
+    half-written file that the next launch can't parse. Staging in the same
+    directory keeps the replace atomic. Returns True on success.
+    """
+    path = Path(path)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}-")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, indent=2)
+                fh.write("\n")
+            os.replace(tmp_name, path)
+        except BaseException:
+            Path(tmp_name).unlink(missing_ok=True)
+            raise
+        return True
+    except OSError:
+        return False  # read-only home, full disk… not worth crashing over
 
 
 ARTIST_HEADERS = ("artist", "artiste", "interprete", "interprète")

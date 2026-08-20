@@ -23,7 +23,7 @@ from pathlib import Path
 import ytmusicapi
 from ytmusicapi import YTMusic
 
-from .matching import pick_match
+from .matching import SEARCH_LIMIT, MatchDecision, choose_match, validate_request
 from .storage import user_data_dir, write_playlist_csv
 
 AUTH_FILE = user_data_dir() / "browser.json"
@@ -170,41 +170,59 @@ def fetch_playlists(yt, put):
         put(("account", "Login expired? Re-log in."))
 
 
-def add_songs_to_playlists(yt, songs, playlists, put):
-    """Search every song, then add the matches to each playlist.
+def search_candidates(yt, artist, title):
+    """Ask YouTube Music for candidates for one song.
 
-    `yt` is the client captured when the job started, so the job stays bound to
-    one account even if the user logs into another one afterwards.
+    Several, not one: the results are evaluated on their merits rather than
+    trusting whatever came back first.
     """
-    video_ids = []
-    not_found = 0
-    for artist, title, _station in songs:  # station is context for the user, not a search term
-        query = f"{artist} {title}".strip()
-        try:
-            results = yt.search(query, filter="songs", limit=5)
-        except Exception as e:
-            put(("log", f"✗ {artist} — {title}: search failed ({e})"))
-            put(("step", None))
-            not_found += 1
-            continue
-        match, confident = pick_match(results, artist, title)
-        if match is None:
-            put(("log", f"✗ {artist} — {title}: no match found"))
-            not_found += 1
-        else:
-            video_ids.append(match["videoId"])
-            found_artists = ", ".join(
-                a.get("name") or ""
-                for a in (match.get("artists") or [])
-                if isinstance(a, dict)
-            )
-            if confident:
-                put(("log", f"✓ {artist} — {title}"))
-            else:
-                put(("log", f"? {artist} — {title}: uncertain match "
-                            f"→ {found_artists} — {match.get('title')}"))
-        put(("step", None))
+    query = f"{artist} {title}".strip()
+    return yt.search(query, filter="songs", limit=SEARCH_LIMIT)
 
+
+def evaluate_songs(yt, songs, put):
+    """Search and score every song. Returns [(song, MatchDecision), …].
+
+    Phase one of adding: this function performs **no** mutating call, so the user
+    can still cancel after seeing what would happen. `yt` is the client captured
+    when the job started, so the job stays bound to one account even if the user
+    logs into another one afterwards.
+    """
+    evaluated = []
+    for song in songs:
+        artist, title = song[0], song[1]  # song[2] is the station: context, not a search term
+        blocking = validate_request(artist, title)
+        if blocking:
+            # Nothing to search for — don't spend a network call on it.
+            decision = MatchDecision("rejected", reasons=blocking)
+        else:
+            try:
+                results = search_candidates(yt, artist, title)
+            except Exception as e:
+                decision = MatchDecision("rejected", reasons=[f"search failed ({e})"])
+            else:
+                decision = choose_match(artist, title, results)
+        evaluated.append((song, decision))
+        put(("log", _decision_line(artist, title, decision)))
+        put(("step", None))
+    return evaluated
+
+
+def _decision_line(artist, title, decision):
+    """One Messages-pane line describing what matching concluded."""
+    if decision.status == "high":
+        return f"✓ {artist} — {title}"
+    if decision.status == "ambiguous":
+        return f"? {artist} — {title}: uncertain — {decision.reason}\n    Proposed: {decision.label}"
+    return f"✗ {artist} — {title}: no credible match — {decision.reason}"
+
+
+def add_video_ids_to_playlists(yt, video_ids, playlists, put):
+    """Add already-approved video ids to each playlist.
+
+    Phase two of adding: by the time this runs, every match has been classified
+    and every ambiguous one decided, so nothing here needs to judge anything.
+    """
     video_ids = list(dict.fromkeys(video_ids))  # two rows can match the same YT song
 
     def status_of(result):
@@ -247,8 +265,7 @@ def add_songs_to_playlists(yt, songs, playlists, put):
             put(("log", f"→ Failed to add to '{pl['title']}': {e}"))
         put(("step", None))
 
-    summary = f"--- Done. {len(video_ids)} matched, {not_found} not found. ---"
-    put(("log", summary))
+    put(("log", "--- Done. ---"))
 
 
 def export_playlists_to_csv(yt, playlists, dest, put):

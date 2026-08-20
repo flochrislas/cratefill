@@ -12,8 +12,17 @@ and your YouTube Music playlists.
 - **Right pane:** log in to YouTube Music and see your playlists.
 - Select songs on the left, one or more playlists on the right, click **Add** —
   each song is searched on YouTube Music and added to every selected playlist.
-- The Messages pane shows what matched (`✓`), what matched only loosely (`?` — review these),
-  and what wasn't found (`✗`).
+- Cratefill won't add a song it isn't sure about. Every match is either
+  **confident** (`✓`, added), **uncertain** (`?`) or **no credible match**
+  (`✗`, always skipped, with the reason given). A perfect title never makes up
+  for the wrong artist, and a studio recording is never silently swapped for a
+  live version, remix, cover or karaoke track.
+- The **On ambiguous match** dropdown next to the Add button decides what happens
+  to the uncertain ones: **Always ask** (the default — you get a Requested /
+  Proposed / Reason prompt with Skip and Add), **Always skip**, or **Always add**.
+  Your choice is remembered between runs. It never applies to `✗` results.
+- Nothing is written to a playlist until every decision is made, so closing the
+  prompt cancels the whole import and leaves your playlists untouched.
 - The reverse works too: select playlists and click **Export CSV…** to save each
   one as a CSV file with artist, track name, and album columns.
 
@@ -30,6 +39,7 @@ and your YouTube Music playlists.
 
 - Python 3.10+ (uses the built-in Tkinter GUI)
 - [ytmusicapi](https://github.com/sigma67/ytmusicapi)
+- [rapidfuzz](https://github.com/rapidfuzz/RapidFuzz) (song-title/artist similarity)
 - [tkinterdnd2](https://github.com/Eliav2/tkinterdnd2) (optional — enables
   drag-and-drop; the app runs fine without it)
 
@@ -102,13 +112,15 @@ See `sample.csv` for an example.
 | File | Purpose |
 |---|---|
 | `cratefill/app.py` | Tkinter window, theme, dialogs, worker threads |
-| `cratefill/matching.py` | Which search result answers a request (pure) |
+| `cratefill/matching.py` | Which search result answers a request, and how sure we are |
+| `cratefill/policy.py` | What to do about an uncertain match, and remembering it |
 | `cratefill/storage.py` | CSV import/export, music folders, data directory |
 | `cratefill/youtube.py` | YouTube Music calls and credential handling |
 | `run_cratefill.py` | Entry script used to build the Windows `.exe` |
 | `tests/` | Test suite (`py -m pytest`) — no network or login needed |
 | `sample.csv` | Example CSV |
 | `browser.json` | Your saved login session — created on first login in your user profile, *not* here (see [Logging in](#logging-in-first-time)); keep private |
+| `settings.json` | Your **On ambiguous match** preference, saved next to `browser.json` in your user profile |
 | `RESEARCH.md` | Notes on the approaches considered |
 
 ## License
