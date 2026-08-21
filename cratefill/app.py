@@ -410,12 +410,17 @@ class CratefillApp:
         self._build_ui()
         self.show_help()
         self.root.after(100, self._poll_worker)
-        if policy.migrate_settings():
-            self.ambiguous_policy = policy.load_policy()
-            self.policy_combo.set(policy.POLICY_LABELS[self.ambiguous_policy])
+        reset, saved = policy.migrate_settings()
+        if reset:
+            # Forced in memory even when the file couldn't be written: the whole
+            # point is not to keep adding unreviewed under the old agreement.
+            # Re-reading the file here would hand back the stale "add".
+            self.set_ambiguous_policy(policy.ASK, persist=saved)
             self.log(
                 "'Always add' has been reset to 'Always ask': this version offers "
                 "matches it used to refuse, so re-select it if you still want it."
+                + ("" if saved else f"\n    (Could not save that to {policy.SETTINGS_FILE} —"
+                                    " it will be reset again next launch.)")
             )
         if migrate_legacy_auth_file():
             self.log(f"Moved your saved session to {AUTH_FILE.parent}")
@@ -552,15 +557,17 @@ class CratefillApp:
             return
         self.set_ambiguous_policy(chosen)
 
-    def set_ambiguous_policy(self, value):
+    def set_ambiguous_policy(self, value, persist=True):
         """Adopt a policy and persist it immediately, keeping the dropdown in sync.
 
-        Called both by the dropdown and by "use this choice for future ambiguous
-        matches" in the review dialog — they must not drift apart.
+        Called by the dropdown, by "use this choice for future ambiguous matches"
+        in the review dialog, and by the startup migration — they must not drift
+        apart. `persist=False` skips the write for a caller that has already
+        written (or already failed to) and reports that itself.
         """
         self.ambiguous_policy = value
         self.policy_combo.set(policy.POLICY_LABELS[value])
-        if not policy.save_policy(value):
+        if persist and not policy.save_policy(value):
             self.log(f"Could not save your preference to {policy.SETTINGS_FILE}")
 
     def refresh_add_button(self):

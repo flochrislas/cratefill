@@ -13,6 +13,7 @@ from cratefill.matching import (
     core_title,
     has_version_conflict,
     normalize,
+    score_artist,
     score_text,
     split_featured,
     tokens,
@@ -308,6 +309,30 @@ class TestPrincipalArtist:
         d = decide("Ella Fitzgerald with Louis Armstrong", "Cheek to Cheek",
                    result("Cheek to Cheek", "Ella Fitzgerald", "Louis Armstrong"))
         assert d.status == "high"
+
+    def test_a_guest_bonus_cannot_carry_a_near_miss_principal_over_the_bar(self):
+        """The bonus is for ranking only. Comparing the *combined* score against
+        HIGH_ARTIST let one matching guest lift a 0.833 principal to 0.883 and
+        clear the 0.88 gate the principal itself had failed."""
+        want = "Nick Cave and the Bad Seeds feat. Guest Star"
+        got = "Nick Cave & The Bad Seeds"          # 0.833 — just under the 0.88 gate
+        principal, combined = score_artist(want, [{"name": got}, {"name": "Guest Star"}])
+        assert principal < HIGH_ARTIST <= combined, "the reachable window this guards"
+        d = decide(want, "A Sufficiently Long Title",
+                   result("A Sufficiently Long Title", got, "Guest Star"))
+        assert d.status != "high"
+        assert "artist similarity" in d.reason
+
+    def test_the_guest_bonus_still_helps_a_candidate_win(self):
+        """Ranking must still prefer the result crediting everyone asked for —
+        the bonus was removed from the *gate*, not from the score."""
+        want, got = "Calvin Harris feat. Rihanna", "Calvin Harris Music"
+        assert (score_artist(want, [{"name": got}, {"name": "Rihanna"}])[1]
+                > score_artist(want, [{"name": got}])[1])
+        d = decide(want, "This Is What You Came For",
+                   result("This Is What You Came For", got, vid="solo"),
+                   result("This Is What You Came For", got, "Rihanna", vid="both"))
+        assert d.video_id == "both"
 
 
 class TestRepeatedWords:

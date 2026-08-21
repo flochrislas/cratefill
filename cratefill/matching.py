@@ -3,25 +3,32 @@
 Deliberately pure: `rapidfuzz` is the only import, there is no I/O, and the same
 inputs always give the same answer. See tests/test_matching.py.
 
-Three outcomes:
+Four outcomes:
 
     high        near-identical artist and title, the recording asked for, and a
                 clear win over the runner-up → added without asking
     ambiguous   recognisably the same song, but something is off → the user's
                 policy decides (ask / skip / add)
+    weak        plausibly the same song, on thin evidence → always asks, whatever
+                the policy says
     rejected    nothing here is the same song → skipped
 
 The balance being struck: **coming back empty-handed is the worst outcome.** If
 YouTube Music has a remix, a live take, or another artist's cover of the song
 that was asked for, that is worth offering — a playlist entry the user can
 review beats a silent miss. So a version difference or a wrong artist no longer
-excludes a candidate; it costs it points and blocks the `high` tier, which is
-what keeps the offer honest rather than silent.
+excludes a candidate; it costs it points (VERSION_PENALTY) and blocks the `high`
+tier, which is what keeps the offer honest rather than silent. `weak` exists
+because "the user can review it" is only true when the user is actually asked, so
+the thinnest evidence is never handed to a saved "Always add".
 
-What still gets refused outright is a *different song*: `rejected` means no
-result shared a single whole word with the requested title. That is the rule that
-keeps `One` from becoming `Someone`, `Cher` from becoming `Cherub`, and
-`Lisztomania` from becoming some other Phoenix track.
+What still gets refused outright is a *different song*. `rejected` means no
+result shared a **content word** with the requested title: `has_content_overlap`
+discounts STOP_WORDS, so "The End" and "The Beginning" don't qualify on "the".
+That is the rule that keeps `One` from becoming `Someone`, `Cher` from becoming
+`Cherub`, and `Lisztomania` from becoming some other Phoenix track. Scripts
+without word boundaries (CJK, Thai) have no whole words to share, so
+`_score_spaceless` supplies a script-gated character-similarity fallback there.
 
 `high` is deliberately hard to earn — everything doubtful is offered, not
 assumed. Nothing here knows what an ambiguous match should *lead to*; see
@@ -236,14 +243,20 @@ def version_relation(want_title, got_title):
 
     Deliberately asymmetric, because the two directions are not equally bad:
 
-    "extra"   the candidate carries a marker that wasn't asked for — a remix,
-              a live take, a karaoke version when the plain song was requested.
-              Never acceptable: it is not the song the user asked for.
+    "extra"   the candidate carries a marker that wasn't asked for — a remix, a
+              live take, a karaoke version when the plain song was requested.
+              Offered, but never silently: it costs the most (VERSION_PENALTY)
+              and can never be `high`, so the user always sees it first.
     "missing" the candidate is the *less* specific recording: the live (or
               acoustic, or remix) version was requested and only the standard
-              one came back. Not a silent match, but worth offering — getting
-              the album version beats getting nothing.
+              one came back. Also offered, and penalised less — getting the
+              album version is a milder disappointment than getting a remix
+              nobody asked for.
     "same"    the markers agree.
+
+    Neither difference *excludes* a candidate. Filtering on version was tried and
+    was wrong: it let a tribute band's exact studio cut outrank the real artist's
+    live take.
     """
     if normalize(want_title) == normalize(got_title):
         return "same"  # literally the same string; nothing to compare
@@ -375,13 +388,23 @@ def score_title(want, got):
 
 
 def score_artist(want_artist, result_artists):
-    """Score the requested artist against a result's artist list, 0.0–1.0.
+    """Score the requested artist against a result's artist list.
 
-    The **principal** artist carries the requirement. Guests can only add
-    GUEST_BONUS each, so a perfect guest match can never stand in for a missing
-    principal: "Jay-Z feat. Alicia Keys" against a result credited to Alicia
-    Keys alone scores ~0.05, not 1.00. Extra artists on the result (guests,
-    collaborators) never penalise it. Malformed entries are ignored.
+    Returns `(principal, combined)`, both 0.0–1.0, and the two are **not**
+    interchangeable:
+
+    * `principal` is how well the requested principal artist is represented. It
+      alone decides whether a match may be `high`.
+    * `combined` adds GUEST_BONUS per matched guest and is for ranking only.
+
+    Keeping them apart is the point. Collapsing them let a guest bonus lift a
+    near-miss principal over HIGH_ARTIST — "Nick Cave and the Bad Seeds" against
+    "Nick Cave & The Bad Seeds" scores 0.833, and one matching guest made 0.883,
+    clearing the 0.88 gate the principal had failed. Guests help a candidate
+    *win*; they never make it certain.
+
+    Extra artists on the result (guests, collaborators) never penalise it, and
+    malformed entries are ignored.
     """
     names = [
         a.get("name")
@@ -389,11 +412,11 @@ def score_artist(want_artist, result_artists):
         if isinstance(a, dict) and a.get("name")
     ]
     if not names:
-        return 0.0
+        return 0.0, 0.0
 
     principal, guests = split_featured(want_artist, allow_with=True)
     if not tokens(principal):
-        return 0.0
+        return 0.0, 0.0
 
     def best(one):
         one_text = " ".join(strip_leading_the(tokens(one)))
@@ -403,8 +426,9 @@ def score_artist(want_artist, result_artists):
         scores.append(score_text(one_text, " ".join(names)))
         return max(scores, default=0.0)
 
+    principal_score = best(principal)
     found_guests = sum(1 for guest in guests if tokens(guest) and best(guest) >= HIGH_ARTIST)
-    return min(1.0, best(principal) + GUEST_BONUS * found_guests)
+    return principal_score, min(1.0, principal_score + GUEST_BONUS * found_guests)
 
 
 def artists_label(result):
@@ -456,12 +480,16 @@ class Candidate:
     alternatives without recomputing anything.
     """
 
-    __slots__ = ("result", "title_score", "artist_score", "overall_score", "relation", "reasons")
+    __slots__ = ("result", "title_score", "artist_score", "principal_score",
+                 "overall_score", "relation", "reasons")
 
-    def __init__(self, result, title_score, artist_score, overall_score, relation, reasons=None):
+    def __init__(self, result, title_score, artist_score, overall_score, relation,
+                 reasons=None, principal_score=None):
         self.result = result
         self.title_score = title_score
-        self.artist_score = artist_score
+        self.artist_score = artist_score        # with the guest bonus: for ranking
+        # Without it: the only artist number allowed to decide confidence.
+        self.principal_score = artist_score if principal_score is None else principal_score
         self.overall_score = overall_score
         self.relation = relation
         self.reasons = reasons or []
@@ -548,12 +576,13 @@ def choose_match(artist, title, results):
         if not isinstance(result, dict) or not result.get("videoId"):
             continue  # no videoId means nothing can be added
         title_score = score_title(title, result.get("title"))
-        artist_score = score_artist(artist, result.get("artists"))
+        principal_score, artist_score = score_artist(artist, result.get("artists"))
         relation = version_relation(title, result.get("title"))
         base = TITLE_WEIGHT * title_score + ARTIST_WEIGHT * artist_score
         candidate = Candidate(
             result, title_score, artist_score,
             base * (1.0 - VERSION_PENALTY[relation]), relation,
+            principal_score=principal_score,
         )
         candidate.reasons = _shortfalls(candidate, title)
         scored.append(candidate)
@@ -611,9 +640,11 @@ def _shortfalls(candidate, want_title):
         reasons.append(
             f"title similarity {candidate.title_score:.2f} below {HIGH_TITLE:.2f}"
         )
-    if candidate.artist_score < HIGH_ARTIST:
+    # The *principal* score is what's tested, never the guest-boosted one: a
+    # guest may help this candidate win, but it can't make it certain.
+    if candidate.principal_score < HIGH_ARTIST:
         reasons.append(
-            f"artist similarity {candidate.artist_score:.2f} below {HIGH_ARTIST:.2f}"
+            f"artist similarity {candidate.principal_score:.2f} below {HIGH_ARTIST:.2f}"
             f" (found {artists_label(candidate.result) or 'no artist'})"
         )
     if candidate.relation != "same":
@@ -631,7 +662,7 @@ def _classify(winner, reasons):
     """
     if not reasons:
         return "high"
-    if winner.title_score < WEAK_TITLE or winner.artist_score < WEAK_ARTIST:
+    if winner.title_score < WEAK_TITLE or winner.principal_score < WEAK_ARTIST:
         return "weak"
     return "ambiguous"
 

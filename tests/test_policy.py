@@ -91,7 +91,7 @@ class TestMigrateSettings:
 
     def test_a_stale_add_becomes_ask(self, settings):
         settings.write_text(json.dumps({"ambiguous_match_policy": "add"}), encoding="utf-8")
-        assert policy.migrate_settings() is True
+        assert policy.migrate_settings() == (True, True)
         assert policy.load_policy() == "ask"
 
     def test_it_records_the_version_so_it_only_happens_once(self, settings):
@@ -99,25 +99,34 @@ class TestMigrateSettings:
         policy.migrate_settings()
         assert json.loads(settings.read_text(encoding="utf-8"))["settings_version"] == \
             policy.SETTINGS_VERSION
-        assert policy.migrate_settings() is False
+        assert policy.migrate_settings() == (False, True)
 
     @pytest.mark.parametrize("value", ["ask", "skip"])
     def test_other_policies_are_left_alone(self, settings, value):
         settings.write_text(json.dumps({"ambiguous_match_policy": value}), encoding="utf-8")
-        assert policy.migrate_settings() is False
+        assert policy.migrate_settings() == (False, True)
         assert policy.load_policy() == value
 
     def test_an_add_saved_by_this_version_survives(self, settings):
         policy.save_policy("add")
-        assert policy.migrate_settings() is False
+        assert policy.migrate_settings() == (False, True)
         assert policy.load_policy() == "add"
 
     def test_no_file_is_nothing_to_migrate(self, settings):
-        assert policy.migrate_settings() is False
+        assert policy.migrate_settings() == (False, True)
 
     def test_a_corrupt_file_is_nothing_to_migrate(self, settings):
         settings.write_text("{ not json", encoding="utf-8")
-        assert policy.migrate_settings() is False
+        assert policy.migrate_settings() == (False, True)
+
+    def test_a_failed_write_is_reported_separately(self, settings, monkeypatch):
+        """On a read-only config dir the reset is still *required*, it just can't
+        be persisted. Reporting only "reset happened" let the app announce the
+        reset while the file — and load_policy() — still said "add"."""
+        settings.write_text(json.dumps({"ambiguous_match_policy": "add"}), encoding="utf-8")
+        monkeypatch.setattr(policy, "write_json_atomic", lambda *a: False)
+        assert policy.migrate_settings() == (True, False)
+        assert policy.load_policy() == "add", "the file is genuinely unchanged"
 
 
 class TestActionForMatch:

@@ -70,9 +70,10 @@ class ReviewStub:
     def _start_work(self, maximum=None):
         self.work_started.append(maximum)
 
-    def set_ambiguous_policy(self, value):
+    def set_ambiguous_policy(self, value, persist=True):
         self.ambiguous_policy = value
-        self.saved.append(value)
+        if persist:
+            self.saved.append(value)
 
     def _ask_about_match(self, artist, title, decision):
         """Stands in for the modal: pops the next queued answer.

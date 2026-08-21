@@ -58,24 +58,28 @@ def save_policy(value):
 
 
 def migrate_settings():
-    """Reset a stale "add" to "ask". Returns True if it changed anything.
+    """Reset a stale "add" to "ask". Returns `(reset, saved)`.
 
     "Always add" is a standing instruction to skip review, so it should only ever
     apply to rules the user actually agreed to. This release widened what counts
     as ambiguous — wrong artists and different recordings are now offered rather
     than refused — so an "add" saved before that reverts to asking once, and the
     user can opt in again knowing what it now covers.
+
+    The two return values are separate because they can disagree: on a read-only
+    config directory the reset is still *required* but cannot be persisted.
+    Reporting only "reset happened" let the caller announce a reset while
+    `load_policy()` still returned "add" from the unchanged file — the app would
+    say it was asking and go on adding silently. Callers must apply `reset` to
+    their in-memory policy regardless of `saved`.
     """
     data = read_json(SETTINGS_FILE)
-    if not isinstance(data, dict):
-        return False
-    if data.get(VERSION_KEY) == SETTINGS_VERSION:
-        return False
-    changed = data.get(SETTINGS_KEY) == ADD
-    data[SETTINGS_KEY] = ASK if changed else data.get(SETTINGS_KEY, DEFAULT_POLICY)
+    if not isinstance(data, dict) or data.get(VERSION_KEY) == SETTINGS_VERSION:
+        return False, True  # nothing to do, so nothing to fail
+    reset = data.get(SETTINGS_KEY) == ADD
+    data[SETTINGS_KEY] = ASK if reset else data.get(SETTINGS_KEY, DEFAULT_POLICY)
     data[VERSION_KEY] = SETTINGS_VERSION
-    write_json_atomic(SETTINGS_FILE, data)
-    return changed
+    return reset, write_json_atomic(SETTINGS_FILE, data)
 
 
 def action_for_match(decision, ambiguous_policy):

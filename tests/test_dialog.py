@@ -1,4 +1,5 @@
-"""Tests for AmbiguousMatchDialog. Needs a Tk display, so it skips without one."""
+"""UI-level tests that construct real widgets — the review dialog and the parts
+of app startup that touch them. Needs a Tk display, so it skips without one."""
 
 import pytest
 
@@ -168,3 +169,36 @@ class TestWeakMatches:
         dialog = open_dialog(root, self.weak())
         assert dialog.title() == "Weak match"
         dialog.destroy()
+
+
+class TestStartupPolicyMigration:
+    """Exercises CratefillApp's real startup path: the migration runs before
+    anything else, so getting it wrong means adding unreviewed all session."""
+
+    def launch(self, root, monkeypatch, migrate_result):
+        from cratefill.app import CratefillApp
+        monkeypatch.setattr(policy, "migrate_settings", lambda: migrate_result)
+        monkeypatch.setattr(policy, "load_policy", lambda: "add")
+        monkeypatch.setattr(policy, "save_policy", lambda value: True)
+        app = CratefillApp(root)
+        root.update()
+        return app
+
+    def test_a_successful_reset_takes_effect(self, root, monkeypatch):
+        app = self.launch(root, monkeypatch, (True, True))
+        assert app.ambiguous_policy == "ask"
+        assert app.policy_combo.get() == "Always ask"
+
+    def test_a_reset_that_could_not_be_saved_still_takes_effect(self, root, monkeypatch):
+        """The bug this guards: the app announced the reset, then re-read the
+        unchanged file and kept "add" in memory — adding silently all session."""
+        app = self.launch(root, monkeypatch, (True, False))
+        assert app.ambiguous_policy == "ask", "must not keep adding unreviewed"
+        assert app.policy_combo.get() == "Always ask"
+        assert any("Could not save" in line
+                   for line in app.log_text.get("1.0", "end").splitlines())
+
+    def test_nothing_to_migrate_leaves_the_saved_policy_alone(self, root, monkeypatch):
+        app = self.launch(root, monkeypatch, (False, True))
+        assert app.ambiguous_policy == "add"
+        assert app.policy_combo.get() == "Always add"

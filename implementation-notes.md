@@ -68,7 +68,7 @@ cratefill/
 
 run_cratefill.py   PyInstaller entry script (see PyInstaller section)
 tests/             test_matching.py, test_policy.py, test_storage.py,
-                   test_workers.py, test_review.py, test_dialog.py
+                   test_workers.py, test_review.py, test_dialog.py (needs a display)
 ```
 
 Dependency direction is one-way:
@@ -214,12 +214,19 @@ The stages, all in `matching.py`:
    sides are single-token and at least one is in such a script, with a high
    `SPACELESS_MIN` cutoff — script-gated precisely so it can't revive substring
    matching for Latin titles.
-6. **Score the artist** — `score_artist()` scores the **principal** artist and
-   adds `GUEST_BONUS` per matched guest, capped at 1.0. Taking a plain `max()`
-   over principal and guests was a bug: a perfect featured-artist match hid a
-   completely absent principal, so `Jay-Z feat. Alicia Keys` matched a result
-   credited to Alicia Keys alone at 1.00 and went straight to `high`. It now
-   scores ~0.05. A leading "the" is ignored (`The Beatles ≡ Beatles`), nameless
+6. **Score the artist** — `score_artist()` returns `(principal, combined)`:
+   `principal` is how well the requested principal artist is represented,
+   `combined` adds `GUEST_BONUS` per matched guest (capped at 1.0). **Only
+   `principal` may decide confidence**; `combined` is for ranking. Both halves of
+   that were bugs. First, a plain `max()` over principal and guests let a perfect
+   featured-artist match hide a completely absent principal — `Jay-Z feat. Alicia
+   Keys` matched a result credited to Alicia Keys alone at 1.00 and went straight
+   to `high` (now ~0.05). Then, comparing the *combined* score against
+   `HIGH_ARTIST` let one matching guest lift a near-miss principal over the bar:
+   `Nick Cave and the Bad Seeds` vs `Nick Cave & The Bad Seeds` scores 0.833, plus
+   0.05 made 0.883, clearing the 0.88 gate the principal itself had failed.
+   `Candidate.principal_score` exists so `_shortfalls()` and `_classify()` test
+   the right number. A leading "the" is ignored (`The Beatles ≡ Beatles`), nameless
    and malformed entries are skipped, and extra artists on the result never
    penalise it. `with` counts as a featured separator **here only** — in a title
    it's an ordinary word.
@@ -276,6 +283,14 @@ matcher is not reviewed by a human:
   covers** — a standing instruction to skip review should only ever apply to
   rules the user actually agreed to. `CratefillApp.__init__` calls it beside
   `migrate_legacy_auth_file()` and logs a line when it fires.
+
+  It returns `(reset, saved)`, and the two can disagree: on a read-only config
+  directory the reset is still *required*, it just can't be persisted. The caller
+  must apply `reset` to its in-memory policy regardless of `saved` — hence
+  `set_ambiguous_policy(policy.ASK, persist=saved)`. Returning only "a reset
+  happened" was a bug: the app announced the reset, then took the new value from
+  `load_policy()`, which re-read the unchanged file and handed back `add`. It
+  logged that it would ask and went on adding silently for the whole session.
 
 The setting is stored as `{"ambiguous_match_policy": "ask", "settings_version": 2}`
 in `settings.json` in `storage.user_data_dir()` — beside `browser.json`, never
