@@ -109,15 +109,22 @@ def apply_dark_theme(root):
     root.option_add("*TCombobox*Listbox.selectForeground", "#ffffff")
     root.option_add("*TCombobox*Listbox.borderWidth", 0)
 
-    # Radiobutton/Checkbutton indicators are drawn from these, not from ".".
+    # Indicators: clam's element takes indicator*background*/*foreground*, not the
+    # default theme's "indicatorcolor" — set that and it is silently ignored,
+    # leaving a light circle that reads as *filled* when it isn't selected.
     for widget in ("TRadiobutton", "TCheckbutton"):
-        style.configure(widget, background=BG, foreground=FG, indicatorcolor=FIELD,
-                        focuscolor=BORDER)
+        style.configure(
+            widget,
+            background=BG, foreground=FG, focuscolor=BORDER,
+            indicatorbackground=FIELD, indicatorforeground=ACCENT_BAR,
+            upperbordercolor=BORDER, lowerbordercolor=BORDER,
+        )
         style.map(
             widget,
             background=[("active", BG)],
             foreground=[("disabled", FG_DIM)],
-            indicatorcolor=[("selected", ACCENT_BAR), ("pressed", BTN_ACTIVE)],
+            indicatorbackground=[("disabled", BG), ("pressed", BTN_ACTIVE)],
+            indicatorforeground=[("disabled", FG_DIM)],
         )
 
     style.configure("Treeview", background=FIELD, fieldbackground=FIELD, rowheight=24)

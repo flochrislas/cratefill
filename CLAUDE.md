@@ -82,4 +82,14 @@ To inspect the dists before tagging: `py -m build` then `py -m twine check dist/
 - **Workers must always emit `("done", …)`.** `_worker`/`_add_worker`/`_export_worker`/`_connect_worker`/`_refresh_worker` are wrappers whose `finally` puts it; the real work lives in `youtube.py`. Without that, one unexpected exception leaves Add/Export disabled until restart. `_poll_worker` reschedules itself in a `finally` for the same reason. In `_add_worker` the playlist refetch is nested inside its own `try/finally` so it can't preempt the `done`.
 - The UI is dark-only and must stay cross-platform (Windows + Linux): the theme is hand-rolled in `apply_dark_theme()` on top of the built-in `clam` theme — do not switch to platform themes (`vista`, `winnative`) or to sv-ttk (tried; it applies empty styles on this Python 3.14/Tk 8.6.15 build). When adding plain tk widgets (Text, Listbox), style them with `DARK_TEXT_STYLE`/`DARK_LIST_STYLE`; Listbox rejects `insertbackground` (that's why two dicts exist).
 - `_screenshot_preview.py` renders the app with fake data and saves `ui_preview.png` (requires `pillow`) — use it to verify UI changes visually.
+- **To screenshot the UI, run it under Xvfb, not the real desktop.** On a Wayland session, `import`/`xwd` grabs of XWayland windows work only intermittently and eventually fail with `BadMatch (X_GetImage)` or report no windows at all, with the app still running. A private X server has no compositor in the way and is fully scriptable:
+
+  ```bash
+  export DISPLAY=:77 && Xvfb :77 -screen 0 1200x800x24 & sleep 1.5
+  .venv/bin/python -m cratefill & sleep 4
+  import -window "$(xdotool search --name '^Cratefill' | tail -1)" /tmp/shot.png
+  ```
+
+  With no window manager, avoid `wait_visibility()` (it blocks forever) and call `grab_release()` on modal dialogs; keep the root window mapped rather than `withdraw()`n, then `update()` a few times before grabbing. Pillow's `ImageGrab` needs a real X display and can't grab the root window under Wayland at all.
+- ttk indicator styling differs by theme: clam's `Radiobutton.indicator`/`Checkbutton.indicator` take **`indicatorbackground`/`indicatorforeground`**, not the default theme's `indicatorcolor`. Setting the wrong one is silently ignored and leaves a light circle that reads as *selected* when it isn't. Check with `style.element_options("Radiobutton.indicator")` before styling a new widget class.
 - Drag-and-drop needs `tkinterdnd2` *and* a `TkinterDnD.Tk()` root (created in `main()`). Both are optional everywhere else: the import is guarded, and `_build_ui` swallows the `TclError` from `drop_target_register` when the root is a plain `tk.Tk()` (tests, previews). Keep new code working without tkinterdnd2 installed.
