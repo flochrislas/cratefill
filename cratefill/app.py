@@ -109,6 +109,17 @@ def apply_dark_theme(root):
     root.option_add("*TCombobox*Listbox.selectForeground", "#ffffff")
     root.option_add("*TCombobox*Listbox.borderWidth", 0)
 
+    # Radiobutton/Checkbutton indicators are drawn from these, not from ".".
+    for widget in ("TRadiobutton", "TCheckbutton"):
+        style.configure(widget, background=BG, foreground=FG, indicatorcolor=FIELD,
+                        focuscolor=BORDER)
+        style.map(
+            widget,
+            background=[("active", BG)],
+            foreground=[("disabled", FG_DIM)],
+            indicatorcolor=[("selected", ACCENT_BAR), ("pressed", BTN_ACTIVE)],
+        )
+
     style.configure("Treeview", background=FIELD, fieldbackground=FIELD, rowheight=24)
     style.map(
         "Treeview",
@@ -283,41 +294,75 @@ class LoginDialog(tk.Toplevel):
 
 
 class AmbiguousMatchDialog(tk.Toplevel):
-    """Asks what to do about one credible-but-uncertain match.
+    """Asks what to do about one match that isn't certain.
 
     Sets `action` to "add" or "skip", or leaves it None if the user dismissed the
     window — which the caller treats as "cancel the whole import", so no playlist
-    is touched. `remember` reports whether the choice should become the policy.
+    is touched. `chosen` is the candidate to add: the top proposal by default, or
+    whichever alternative the user picked. `remember` reports whether the choice
+    should become the policy.
     """
 
     def __init__(self, parent, artist, title, decision):
         super().__init__(parent)
-        self.title("Ambiguous match")
+        self.title("Weak match" if decision.status == "weak" else "Ambiguous match")
         self.configure(bg=BG)
         self.transient(parent)
         self.grab_set()
         enable_dark_title_bar(self)
         self.action = None
         self.remember = False
+        self.choices = decision.choices
+        self.chosen = decision.candidate
 
         body = ttk.Frame(self, padding=12)
         body.pack(fill="both", expand=True)
-        for caption, value in (
-            ("Requested:", f"{artist} — {title}"),
-            ("Proposed:", decision.label),
-            ("Reason:", decision.reason),
-        ):
-            ttk.Label(body, text=caption, foreground=FG_DIM).pack(anchor="w")
-            ttk.Label(body, text=value, wraplength=460, justify="left").pack(
-                anchor="w", padx=(12, 0), pady=(0, 8)
+        ttk.Label(body, text="Requested:", foreground=FG_DIM).pack(anchor="w")
+        ttk.Label(body, text=f"{artist} — {title}", wraplength=520).pack(
+            anchor="w", padx=(12, 0), pady=(0, 8)
+        )
+        # The decision-level reason, which includes why we're asking at all — the
+        # near-tie note lives here rather than on any single candidate.
+        ttk.Label(body, text="Reason:", foreground=FG_DIM).pack(anchor="w")
+        ttk.Label(body, text=decision.reason, wraplength=520, justify="left").pack(
+            anchor="w", padx=(12, 0), pady=(0, 8)
+        )
+        if decision.status == "weak":
+            ttk.Label(
+                body,
+                text="Weak match — asking whatever your policy says.",
+                foreground=READY,
+                wraplength=520,
+            ).pack(anchor="w", pady=(0, 8))
+
+        # The proposal plus its near-scoring rivals: the top-ranked candidate is
+        # not always the one the user wants, and the reason text says as much.
+        caption = "Proposed:" if len(self.choices) == 1 else "Proposed (pick one):"
+        ttk.Label(body, text=caption, foreground=FG_DIM).pack(anchor="w")
+        self.choice_var = tk.IntVar(value=0)
+        for index, candidate in enumerate(self.choices):
+            row = ttk.Frame(body)
+            row.pack(fill="x", anchor="w", padx=(12, 0))
+            ttk.Radiobutton(
+                row,
+                text=f"{candidate.label}   ({candidate.overall_score:.2f})",
+                value=index,
+                variable=self.choice_var,
+                command=self._select,
+            ).pack(anchor="w")
+            detail = candidate.reason or "matches exactly"
+            ttk.Label(row, text=detail, foreground=FG_DIM, wraplength=480).pack(
+                anchor="w", padx=(24, 0), pady=(0, 6)
             )
 
         self.remember_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
+        self.remember_check = ttk.Checkbutton(
             body,
             text="Use this choice for future ambiguous matches",
             variable=self.remember_var,
-        ).pack(anchor="w", pady=(4, 0))
+        )
+        if decision.status != "weak":
+            self.remember_check.pack(anchor="w", pady=(4, 0))
 
         buttons = ttk.Frame(body)
         buttons.pack(fill="x", pady=(12, 0))
@@ -329,7 +374,11 @@ class AmbiguousMatchDialog(tk.Toplevel):
         add.focus_set()
         self.bind("<Escape>", lambda _e: self.destroy())  # dismiss = cancel the import
 
+    def _select(self):
+        self.chosen = self.choices[self.choice_var.get()]
+
     def _choose(self, action):
+        self._select()
         self.action = action
         self.remember = bool(self.remember_var.get())
         self.destroy()
@@ -354,6 +403,13 @@ class CratefillApp:
         self._build_ui()
         self.show_help()
         self.root.after(100, self._poll_worker)
+        if policy.migrate_settings():
+            self.ambiguous_policy = policy.load_policy()
+            self.policy_combo.set(policy.POLICY_LABELS[self.ambiguous_policy])
+            self.log(
+                "'Always add' has been reset to 'Always ask': this version offers "
+                "matches it used to refuse, so re-select it if you still want it."
+            )
         if migrate_legacy_auth_file():
             self.log(f"Moved your saved session to {AUTH_FILE.parent}")
         secure_auth_file()  # tighten a file written by an older version
@@ -474,7 +530,20 @@ class CratefillApp:
     # ---------- Ambiguous-match policy ----------
 
     def _on_policy_selected(self, _event=None):
-        self.set_ambiguous_policy(policy.LABEL_POLICIES[self.policy_combo.get()])
+        chosen = policy.LABEL_POLICIES[self.policy_combo.get()]
+        # "Always add" is a standing instruction to skip review, so spell out
+        # what it now accepts before taking it. Weak matches still always ask.
+        if chosen == policy.ADD and not messagebox.askokcancel(
+            "Cratefill — Always add",
+            "Uncertain matches will be added without asking.\n\n"
+            "That includes a different recording (a live version, a remix) and a "
+            "song credited to a different artist, as long as the title clearly "
+            "matches. Only the weakest matches will still ask.\n\n"
+            "Add uncertain matches automatically?",
+        ):
+            self.policy_combo.set(policy.POLICY_LABELS[self.ambiguous_policy])
+            return
+        self.set_ambiguous_policy(chosen)
 
     def set_ambiguous_policy(self, value):
         """Adopt a policy and persist it immediately, keeping the dropdown in sync.
@@ -700,18 +769,20 @@ class CratefillApp:
         approved, counts = [], {"add": 0, "skip": 0}
         for song, decision in evaluated:
             artist, title = song[0], song[1]
+            video_id = decision.video_id
             action = policy.action_for_match(decision, self.ambiguous_policy)
             if action == policy.ASK:
-                choice = self._ask_about_match(artist, title, decision)
+                choice, chosen = self._ask_about_match(artist, title, decision)
                 if choice is None:  # dialog dismissed → abandon the whole import
                     self.log("--- Cancelled. No playlist was changed. ---")
                     return
                 action = choice
+                video_id = chosen.video_id if chosen else None
             elif decision.status == "ambiguous":
                 verb = "added" if action == policy.ADD else "skipped"
                 self.log(f"    → ambiguous match {verb} by policy")
-            if action == policy.ADD and decision.video_id:
-                approved.append(decision.video_id)
+            if action == policy.ADD and video_id:
+                approved.append(video_id)
                 counts["add"] += 1
             else:
                 counts["skip"] += 1
@@ -726,15 +797,21 @@ class CratefillApp:
         ).start()
 
     def _ask_about_match(self, artist, title, decision):
-        """Show the review dialog. Returns "add", "skip", or None to cancel."""
+        """Show the review dialog.
+
+        Returns (action, chosen candidate): "add"/"skip" and which candidate the
+        user picked, or (None, None) to cancel the whole import.
+        """
         dialog = AmbiguousMatchDialog(self.root, artist, title, decision)
         self.root.wait_window(dialog)
         if dialog.action:
             self.log(f"    → {dialog.action} (your choice)")
+            if dialog.chosen and dialog.chosen is not decision.candidate:
+                self.log(f"    → you picked: {dialog.chosen.label}")
         if dialog.remember and dialog.action:
             self.set_ambiguous_policy(dialog.action)
             self.log(f"    → remembering '{policy.POLICY_LABELS[dialog.action]}'")
-        return dialog.action
+        return dialog.action, dialog.chosen
 
     def export_playlists(self):
         """Save each selected playlist as an Artist/Title/Album CSV file."""

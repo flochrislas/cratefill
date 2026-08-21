@@ -30,6 +30,7 @@ policy.action_for_match.
 
 import re
 import unicodedata
+from collections import Counter
 
 from rapidfuzz import fuzz
 
@@ -43,6 +44,11 @@ TITLE_WEIGHT = 0.65     # base = 0.65 * title + 0.35 * artist
 ARTIST_WEIGHT = 0.35
 WINNER_MARGIN = 0.05    # a near-tied runner-up makes the winner ambiguous
 SEARCH_LIMIT = 10       # candidates to ask YouTube Music for
+
+# Below either of these the evidence is too thin to hand to an "Always add"
+# policy: the match is still offered, but it always asks. See _classify().
+WEAK_TITLE = 0.80
+WEAK_ARTIST = 0.50
 
 # How much a recording-version difference costs a candidate when ranking. Folded
 # into the score rather than used to exclude, so a version difference can be
@@ -92,8 +98,25 @@ SOFT_VERSION_MARKERS = (
     r"\bvisuali[sz]er\b",
 )
 
-# "feat." / "featuring" / "ft." / "with", plus the ampersand-free remainder.
-FEATURED_RE = re.compile(r"\b(?:feat|featuring|ft|with)\b\.?", re.IGNORECASE)
+# Featured-artist separators. "with" only counts in *artist* names ("Ella
+# Fitzgerald with Louis Armstrong") — in a title it is an ordinary word, and
+# treating it as a separator turned "With or Without You" into an empty string.
+TITLE_FEATURED_RE = re.compile(r"\b(?:feat|featuring|ft)\b\.?", re.IGNORECASE)
+ARTIST_FEATURED_RE = re.compile(r"\b(?:feat|featuring|ft|with)\b\.?", re.IGNORECASE)
+
+# Words too common to establish that two titles are about the same song. Without
+# this, "The End" and "The Beginning" share a word and count as related.
+STOP_WORDS = frozenset("""
+a an and as at be by de del di do e el en et for from i in is it its la le les
+me my no not of on or the to un une up us we with you your
+""".split())
+
+# Guest artists can only ever nudge a score; the principal artist has to be
+# there. Small enough that guests alone stay far below HIGH_ARTIST.
+GUEST_BONUS = 0.05
+
+# Character-similarity floor for scripts that don't put spaces between words.
+SPACELESS_MIN = 0.80
 
 # Interior !/$ stand in for letters in stylised names (P!nk, Ke$ha). Handled
 # before punctuation becomes whitespace, or "P!nk" would split into "p nk".
@@ -153,13 +176,18 @@ def strip_leading_the(word_list):
     return word_list[1:] if len(word_list) > 1 and word_list[0] == "the" else word_list
 
 
-def split_featured(text):
+def split_featured(text, allow_with=False):
     """Split "Artist feat. Guest" into ("Artist", ["Guest"]).
 
     Featured artists are parsed out rather than treated as ordinary words, so
     they neither dilute the title score nor mask the principal artist.
+
+    `allow_with` treats "with" as a separator too. Only pass it for artist
+    names: in a title "with" is an ordinary word, and splitting on it reduced
+    "With or Without You" to nothing at all.
     """
-    parts = FEATURED_RE.split(text or "")
+    pattern = ARTIST_FEATURED_RE if allow_with else TITLE_FEATURED_RE
+    parts = pattern.split(text or "")
     main = parts[0].strip(" -–—(),")
     guests = []
     for chunk in parts[1:]:
@@ -170,19 +198,36 @@ def split_featured(text):
     return main, guests
 
 
-def version_markers(text):
-    """Return (hard, soft) marker names found anywhere in `text`.
+# A trailing " - Live at Wembley" is metadata; YouTube Music uses both that and
+# the bracketed form.
+BRACKETED_RE = re.compile(r"[\(\[\{][^\)\]\}]*[\)\]\}]")
+TRAILING_METADATA_RE = re.compile(r"\s[-–—]\s.*$")
 
-    Parenthesised text is *not* stripped first: "(Live at Wembley)" is exactly
-    the information that must not be thrown away.
+
+def metadata_segments(text):
+    """The parts of a title that describe the *recording* rather than the song.
+
+    Only bracketed groups and a trailing dash-separated segment count. Scanning
+    the whole title instead meant a song actually called "Clean", "Stereo" or
+    "Live and Let Die" was read as version metadata and erased.
     """
-    normalized = normalize(text)
+    text = text or ""
+    segments = BRACKETED_RE.findall(text)
+    trailing = TRAILING_METADATA_RE.search(BRACKETED_RE.sub(" ", text))
+    if trailing:
+        segments.append(trailing.group(0))
+    return segments
+
+
+def version_markers(text):
+    """Return (hard, soft) marker names, read from metadata positions only."""
+    scanned = normalize(" ".join(metadata_segments(text)))
     hard = {
         name
         for name, patterns in HARD_VERSION_MARKERS.items()
-        if any(re.search(p, normalized) for p in patterns)
+        if any(re.search(p, scanned) for p in patterns)
     }
-    soft = {p for p in SOFT_VERSION_MARKERS if re.search(p, normalized)}
+    soft = {p for p in SOFT_VERSION_MARKERS if re.search(p, scanned)}
     return hard, soft
 
 
@@ -200,6 +245,8 @@ def version_relation(want_title, got_title):
               the album version beats getting nothing.
     "same"    the markers agree.
     """
+    if normalize(want_title) == normalize(got_title):
+        return "same"  # literally the same string; nothing to compare
     want, got = version_markers(want_title)[0], version_markers(got_title)[0]
     if got - want:
         return "extra"
@@ -213,72 +260,128 @@ def has_version_conflict(want_title, got_title):
     return version_relation(want_title, got_title) != "same"
 
 
-BRACKETED_RE = re.compile(r"[\(\[\{][^\)\]\}]*[\)\]\}]")
-
-
 def core_title(text):
     """The title with everything that isn't the song's identity removed.
 
-    A bracketed group naming a version is dropped *whole*, not word by word:
-    "(Live at Wembley)" is one piece of version metadata, and keeping "at
-    wembley" would make the live take look like a different song and drag its
-    score below a tribute band's studio cut. Bare marker words outside brackets
-    go too, along with "feat. X".
+    Only metadata *positions* are stripped — bracketed groups naming a version,
+    and a trailing dash-separated segment — and a bracketed group goes whole
+    rather than word by word: "(Live at Wembley)" is one piece of metadata, and
+    keeping "at wembley" would make the live take look like a different song.
+    Words outside those positions are part of the title, however marker-ish they
+    look; "Clean", "Stereo" and "Live and Let Die" are songs.
+
+    Never returns "" for a non-empty title: if stripping would empty it, the
+    metadata *was* the title, so the whole normalized title is kept. That
+    backstop is what stops a future addition to the marker lists from making a
+    song unmatchable.
 
     Version markers are compared separately by version_relation(), so removing
     them here is what lets a legitimately matching live version score 1.00.
     """
-    kept = [
-        group for group in BRACKETED_RE.findall(text or "")
-        if not any(version_markers(group))
-    ]
-    stripped = BRACKETED_RE.sub(" ", text or "")
-    main, _guests = split_featured(" ".join([stripped, *kept]))
-    normalized = normalize(main)
-    for pattern in (*SOFT_VERSION_MARKERS,
-                    *(p for ps in HARD_VERSION_MARKERS.values() for p in ps)):
-        normalized = re.sub(pattern, " ", normalized)
-    return " ".join(normalized.split())
+    remainder = text or ""
+    for segment in metadata_segments(remainder):
+        if any(version_markers(segment)):
+            remainder = remainder.replace(segment, " ")
+    main, _guests = split_featured(remainder)
+    core = " ".join(normalize(main).split())
+    return core or normalize(text)
 
 
 def _ratio(want, got):
-    """Fuzzy similarity in 0.0–1.0, tolerant of word order."""
-    return max(fuzz.token_set_ratio(want, got), fuzz.WRatio(want, got)) / 100.0
+    """Fuzzy similarity in 0.0–1.0, tolerant of word order.
+
+    Deliberately *not* token_set_ratio or WRatio: both deduplicate tokens, which
+    scored "Run Run Run" and "Run" as identical. token_sort_ratio keeps
+    multiplicity while still ignoring order.
+    """
+    return max(fuzz.token_sort_ratio(want, got), fuzz.ratio(want, got)) / 100.0
+
+
+def _is_spaceless_script(text):
+    """True for scripts that don't separate words with spaces (CJK, Thai…).
+
+    The whole-token gate below can't work on those: the entire title is one
+    token, so any spelling variation shares nothing.
+    """
+    return any(
+        "぀" <= c <= "ヿ"      # hiragana, katakana
+        or "㐀" <= c <= "鿿"   # CJK ideographs
+        or "豈" <= c <= "﫿"   # CJK compatibility ideographs
+        or "가" <= c <= "힯"   # hangul syllables
+        or "฀" <= c <= "๿"   # thai
+        for c in text or ""
+    )
 
 
 def score_text(want, got):
     """Score two pieces of text 0.0–1.0 on whole tokens.
 
-    Exact token equality scores 1.0. Otherwise the tokens must genuinely overlap
-    before any fuzzy score is trusted — that gate is what stops "one" matching
-    "someone" and "cher" matching "cherub", where character similarity is high
-    but no whole word is shared. Overlap is measured against the *longer* side,
-    so "hello" cannot pass as "hello world goodbye" either.
+    Equal token *multisets* score 1.0 — order is irrelevant, repetition is not.
+    Otherwise the tokens must genuinely overlap before any fuzzy score is
+    trusted: that gate is what stops "one" matching "someone" and "cher"
+    matching "cherub", where character similarity is high but no whole word is
+    shared. Overlap is measured against the *longer* side, so "hello" cannot
+    pass as "hello world goodbye" either.
     """
     want_tokens, got_tokens = tokens(want), tokens(got)
     if not want_tokens or not got_tokens:
         return 0.0
-    want_set, got_set = set(want_tokens), set(got_tokens)
-    if want_tokens == got_tokens or want_set == got_set:  # same words, any order
+    want_counts, got_counts = Counter(want_tokens), Counter(got_tokens)
+    if want_counts == got_counts:  # same words the same number of times
         return 1.0
 
-    shared = want_set & got_set
+    want_text, got_text = " ".join(want_tokens), " ".join(got_tokens)
+    shared = sum((want_counts & got_counts).values())
     if not shared:
-        return 0.0
+        return _score_spaceless(want_text, got_text)
     # Very short values get no fuzzy credit at all: three or four characters are
-    # too few for a similarity ratio to mean anything.
-    if min(len(" ".join(want_tokens)), len(" ".join(got_tokens))) <= SHORT_TEXT_LEN:
+    # too few for a similarity ratio to mean anything. Only when *both* sides are
+    # a single word, though — "Run Run Run" against "Run" shares a whole word and
+    # deserves a partial score, whereas "cher"/"cherub" share nothing.
+    if (len(want_tokens) == 1 and len(got_tokens) == 1
+            and min(len(want_text), len(got_text)) <= SHORT_TEXT_LEN):
         return 0.0
-    coverage = len(shared) / max(len(want_set), len(got_set))
-    return min(_ratio(" ".join(want_tokens), " ".join(got_tokens)), coverage)
+    coverage = shared / max(sum(want_counts.values()), sum(got_counts.values()))
+    return min(_ratio(want_text, got_text), coverage)
+
+
+def _score_spaceless(want_text, got_text):
+    """Character-similarity fallback for scripts without word boundaries.
+
+    Gated on script and on both sides being a single token, so it cannot revive
+    the substring behaviour this module exists to prevent — "one"/"someone" are
+    Latin and multi-character-similar, and stay at 0.0.
+    """
+    if " " in want_text or " " in got_text:
+        return 0.0
+    if not (_is_spaceless_script(want_text) or _is_spaceless_script(got_text)):
+        return 0.0
+    if min(len(want_text), len(got_text)) < 3:
+        return 0.0
+    ratio = fuzz.ratio(want_text, got_text) / 100.0
+    return ratio if ratio >= SPACELESS_MIN else 0.0
+
+
+def score_title(want, got):
+    """Score two titles 0.0–1.0.
+
+    Identical normalized titles score 1.0 before any metadata stripping happens
+    — otherwise a song whose title *is* metadata ("Clean") could be reduced to
+    nothing and fail to match itself.
+    """
+    if normalize(want) == normalize(got):
+        return 1.0
+    return score_text(core_title(want), core_title(got))
 
 
 def score_artist(want_artist, result_artists):
-    """Best score for the requested artist against a result's artist list.
+    """Score the requested artist against a result's artist list, 0.0–1.0.
 
-    The requested principal artist must be represented; extra artists on the
-    result (featured guests, collaborators) don't penalise it. Requested guests
-    can match any of the returned artists. Malformed entries are ignored.
+    The **principal** artist carries the requirement. Guests can only add
+    GUEST_BONUS each, so a perfect guest match can never stand in for a missing
+    principal: "Jay-Z feat. Alicia Keys" against a result credited to Alicia
+    Keys alone scores ~0.05, not 1.00. Extra artists on the result (guests,
+    collaborators) never penalise it. Malformed entries are ignored.
     """
     names = [
         a.get("name")
@@ -288,23 +391,20 @@ def score_artist(want_artist, result_artists):
     if not names:
         return 0.0
 
-    principal, guests = split_featured(want_artist)
-    wanted = [w for w in [principal, *guests] if tokens(w)]
-    if not wanted:
+    principal, guests = split_featured(want_artist, allow_with=True)
+    if not tokens(principal):
         return 0.0
 
     def best(one):
-        one_tokens = strip_leading_the(tokens(one))
-        scores = [0.0]
-        for name in names:
-            name_tokens = strip_leading_the(tokens(name))
-            scores.append(score_text(" ".join(one_tokens), " ".join(name_tokens)))
+        one_text = " ".join(strip_leading_the(tokens(one)))
+        scores = [score_text(one_text, " ".join(strip_leading_the(tokens(name))))
+                  for name in names]
         # The result may bundle every artist into one string ("Air, Phoenix").
-        scores.append(score_text(" ".join(one_tokens), " ".join(names)))
-        return max(scores)
+        scores.append(score_text(one_text, " ".join(names)))
+        return max(scores, default=0.0)
 
-    # The principal artist carries the requirement; guests can only help.
-    return max(best(w) for w in wanted) if len(wanted) > 1 else best(principal)
+    found_guests = sum(1 for guest in guests if tokens(guest) and best(guest) >= HIGH_ARTIST)
+    return min(1.0, best(principal) + GUEST_BONUS * found_guests)
 
 
 def artists_label(result):
@@ -329,6 +429,60 @@ def validate_request(artist, title):
     return reasons
 
 
+def has_content_overlap(want_title, got_title):
+    """True when the titles share a word that actually says something.
+
+    "The End" and "The Beginning" share "the", which is no evidence at all —
+    and under an "Always add" policy that word alone could authorise a
+    completely different song. Titles built entirely from stop words ("You and
+    Me") fall back to any shared token, or they could never match anything.
+    """
+    want, got = Counter(tokens(core_title(want_title))), Counter(tokens(core_title(got_title)))
+    shared = set((want & got).elements())
+    if shared - STOP_WORDS:
+        return True
+    if shared:  # only stop words in common — evidence only if that's all there is
+        return not (set(want) - STOP_WORDS)
+    # No shared token at all is normally decisive, but scripts without word
+    # boundaries have only one token to begin with; there score_text falls back
+    # to character similarity, and that score is the evidence.
+    return _score_spaceless(" ".join(want.elements()), " ".join(got.elements())) > 0.0
+
+
+class Candidate:
+    """One scored search result, with the reasons it isn't a perfect answer.
+
+    Scoring lives here rather than in the UI so the review dialog can list
+    alternatives without recomputing anything.
+    """
+
+    __slots__ = ("result", "title_score", "artist_score", "overall_score", "relation", "reasons")
+
+    def __init__(self, result, title_score, artist_score, overall_score, relation, reasons=None):
+        self.result = result
+        self.title_score = title_score
+        self.artist_score = artist_score
+        self.overall_score = overall_score
+        self.relation = relation
+        self.reasons = reasons or []
+
+    @property
+    def video_id(self):
+        return (self.result or {}).get("videoId")
+
+    @property
+    def label(self):
+        """"Artist — Title", for logs and the review dialog."""
+        return f"{artists_label(self.result)} — {self.result.get('title') or ''}"
+
+    @property
+    def reason(self):
+        return "; ".join(self.reasons)
+
+    def __repr__(self):
+        return f"Candidate({self.label!r}, overall={self.overall_score:.2f})"
+
+
 class MatchDecision:
     """What the evidence says about a requested song. Carries no policy."""
 
@@ -339,8 +493,8 @@ class MatchDecision:
 
     def __init__(self, status, candidate=None, title_score=0.0, artist_score=0.0,
                  overall_score=0.0, runner_up_score=None, reasons=None, alternatives=None):
-        self.status = status                  # "high" | "ambiguous" | "rejected"
-        self.candidate = candidate            # the winning search result, or None
+        self.status = status         # "high" | "ambiguous" | "weak" | "rejected"
+        self.candidate = candidate  # the winning Candidate, or None
         self.title_score = title_score
         self.artist_score = artist_score
         self.overall_score = overall_score
@@ -362,14 +516,17 @@ class MatchDecision:
 
     @property
     def video_id(self):
-        return (self.candidate or {}).get("videoId")
+        return self.candidate.video_id if self.candidate else None
 
     @property
     def label(self):
         """"Artist — Title" of the proposed match, or "" when there is none."""
-        if not self.candidate:
-            return ""
-        return f"{artists_label(self.candidate)} — {self.candidate.get('title') or ''}"
+        return self.candidate.label if self.candidate else ""
+
+    @property
+    def choices(self):
+        """The proposal followed by its alternatives, for the review dialog."""
+        return ([self.candidate] if self.candidate else []) + list(self.alternatives)
 
 
 def choose_match(artist, title, results):
@@ -390,67 +547,93 @@ def choose_match(artist, title, results):
     for result in results or []:
         if not isinstance(result, dict) or not result.get("videoId"):
             continue  # no videoId means nothing can be added
-        title_score = score_text(core_title(title), core_title(result.get("title")))
+        title_score = score_title(title, result.get("title"))
         artist_score = score_artist(artist, result.get("artists"))
         relation = version_relation(title, result.get("title"))
         base = TITLE_WEIGHT * title_score + ARTIST_WEIGHT * artist_score
-        overall = base * (1.0 - VERSION_PENALTY[relation])
-        scored.append((overall, title_score, artist_score, relation, result))
+        candidate = Candidate(
+            result, title_score, artist_score,
+            base * (1.0 - VERSION_PENALTY[relation]), relation,
+        )
+        candidate.reasons = _shortfalls(candidate, title)
+        scored.append(candidate)
 
     if not scored:
         return MatchDecision("rejected", reasons=["no usable search results"])
 
-    # The only reason to refuse outright: nothing here is recognisably the same
-    # song. score_text yields exactly 0.0 when the titles share no whole word, so
-    # this rejects "One" → "Someone" and "Lisztomania" → "1901" while still
-    # offering a remix, a live take or another artist's cover of the right song.
-    related = [s for s in scored if s[1] > TITLE_FLOOR]
-    scored.sort(key=lambda s: s[0], reverse=True)
+    scored.sort(key=lambda c: c.overall_score, reverse=True)
 
+    # The only reason to refuse outright: nothing here is recognisably the same
+    # song. A shared *content* word is required — matching on "the" alone is no
+    # evidence at all, and under an "Always add" policy it would authorise a
+    # different song unreviewed. This rejects "One" → "Someone" and
+    # "Lisztomania" → "1901" while still offering a remix, a live take or
+    # another artist's cover of the right song.
+    related = [
+        c for c in scored
+        if c.title_score > TITLE_FLOOR and has_content_overlap(title, c.result.get("title"))
+    ]
     if not related:
-        _overall, title_score, artist_score, _relation, _result = scored[0]
         return MatchDecision(
             "rejected",
-            candidate=None,          # deliberately not offered: it's a different song
-            title_score=title_score,
-            artist_score=artist_score,
+            candidate=None,  # deliberately not offered: it's a different song
+            title_score=scored[0].title_score,
+            artist_score=scored[0].artist_score,
             reasons=["no result with a related title"],
-            alternatives=[s[4] for s in scored[:3]],
+            alternatives=scored[:3],
         )
 
-    related.sort(key=lambda s: s[0], reverse=True)
-    overall, title_score, artist_score, relation, result = related[0]
-    runner_up = related[1][0] if len(related) > 1 else None
-
-    # Confidence has to be earned: near-identical title *and* artist, the
-    # recording actually requested, and a clear win over the runner-up. Anything
-    # short of that is still offered — as ambiguous, with the shortfall named so
-    # the user can judge it.
-    reasons = []
-    if title_score < HIGH_TITLE:
-        reasons.append(f"title similarity {title_score:.2f} below {HIGH_TITLE:.2f}")
-    if artist_score < HIGH_ARTIST:
+    winner, *rest = related
+    runner_up = rest[0].overall_score if rest else None
+    reasons = list(winner.reasons)
+    if runner_up is not None and winner.overall_score - runner_up < WINNER_MARGIN:
         reasons.append(
-            f"artist similarity {artist_score:.2f} below {HIGH_ARTIST:.2f}"
-            f" (found {artists_label(result) or 'no artist'})"
-        )
-    if relation != "same":
-        reasons.append(_version_reason(relation, title, result))
-    if runner_up is not None and overall - runner_up < WINNER_MARGIN:
-        reasons.append(
-            f"another candidate scores almost the same ({runner_up:.2f} vs {overall:.2f})"
+            f"another candidate scores almost the same "
+            f"({runner_up:.2f} vs {winner.overall_score:.2f})"
         )
 
     return MatchDecision(
-        "ambiguous" if reasons else "high",
-        candidate=result,
-        title_score=title_score,
-        artist_score=artist_score,
-        overall_score=overall,
+        _classify(winner, reasons),
+        candidate=winner,
+        title_score=winner.title_score,
+        artist_score=winner.artist_score,
+        overall_score=winner.overall_score,
         runner_up_score=runner_up,
         reasons=reasons,
-        alternatives=[s[4] for s in related[1:4]],
+        alternatives=rest[:3],
     )
+
+
+def _shortfalls(candidate, want_title):
+    """Every way this candidate falls short of being the obvious answer."""
+    reasons = []
+    if candidate.title_score < HIGH_TITLE:
+        reasons.append(
+            f"title similarity {candidate.title_score:.2f} below {HIGH_TITLE:.2f}"
+        )
+    if candidate.artist_score < HIGH_ARTIST:
+        reasons.append(
+            f"artist similarity {candidate.artist_score:.2f} below {HIGH_ARTIST:.2f}"
+            f" (found {artists_label(candidate.result) or 'no artist'})"
+        )
+    if candidate.relation != "same":
+        reasons.append(_version_reason(candidate.relation, want_title, candidate.result))
+    return reasons
+
+
+def _classify(winner, reasons):
+    """high / ambiguous / weak for a candidate that cleared the relatedness bar.
+
+    `weak` exists because "offer it and let the user glance at it" only holds
+    when the user is actually asked. A loose title overlap or a wholly different
+    performer is too thin to hand to an "Always add" policy, so it is pinned to
+    the ask path — see policy.action_for_match.
+    """
+    if not reasons:
+        return "high"
+    if winner.title_score < WEAK_TITLE or winner.artist_score < WEAK_ARTIST:
+        return "weak"
+    return "ambiguous"
 
 
 def _version_reason(relation, want_title, result):

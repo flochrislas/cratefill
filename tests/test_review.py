@@ -10,24 +10,34 @@ import pytest
 from cratefill import app as app_module
 from cratefill import policy
 from cratefill.app import CratefillApp
-from cratefill.matching import MatchDecision
+from cratefill.matching import Candidate, MatchDecision
 
 PLAYLIST = {"playlistId": "PL1", "title": "Road trip"}
 
 
+def candidate(vid, title="T", artist="A", score=0.9):
+    return Candidate({"videoId": vid, "title": title, "artists": [{"name": artist}]},
+                     title_score=score, artist_score=score, overall_score=score,
+                     relation="same")
+
+
 def high(vid="v-high"):
-    return MatchDecision("high", candidate={"videoId": vid, "title": "T",
-                                            "artists": [{"name": "A"}]})
+    return MatchDecision("high", candidate=candidate(vid))
 
 
-def ambiguous(vid="v-amb"):
-    return MatchDecision("ambiguous", candidate={"videoId": vid, "title": "T",
-                                                 "artists": [{"name": "A"}]},
-                         reasons=["another candidate scores almost the same"])
+def ambiguous(vid="v-amb", alternatives=()):
+    return MatchDecision("ambiguous", candidate=candidate(vid),
+                         reasons=["another candidate scores almost the same"],
+                         alternatives=list(alternatives))
+
+
+def weak(vid="v-weak"):
+    return MatchDecision("weak", candidate=candidate(vid, score=0.4),
+                         reasons=["title similarity 0.33 below 0.90"])
 
 
 def rejected():
-    return MatchDecision("rejected", reasons=["artist similarity 0.10 below 0.80"])
+    return MatchDecision("rejected", reasons=["no result with a related title"])
 
 
 class FakeThread:
@@ -65,12 +75,18 @@ class ReviewStub:
         self.saved.append(value)
 
     def _ask_about_match(self, artist, title, decision):
-        """Stands in for the modal: pops the next queued answer."""
+        """Stands in for the modal: pops the next queued answer.
+
+        Answers may be (action, remember) or (action, remember, chosen_index) to
+        pick one of the alternatives, mirroring the dialog's radio list.
+        """
         self.asked.append((artist, title))
-        action, remember = self.answers.pop(0)
+        answer = self.answers.pop(0)
+        action, remember = answer[0], answer[1]
+        chosen = decision.choices[answer[2]] if len(answer) > 2 else decision.candidate
         if remember and action:
             self.set_ambiguous_policy(action)
-        return action
+        return action, chosen
 
     def _add_worker(self, *args):
         raise AssertionError("the add worker must only run via a thread")
@@ -167,6 +183,45 @@ class TestAlwaysAsk:
         assert started == []
         assert len(stub.asked) == 1
         assert stub.ambiguous_policy == "skip"
+
+
+class TestWeakMatches:
+    """A weak match is offered but never automated, whatever the policy says."""
+
+    @pytest.mark.parametrize("saved", ["ask", "skip", "add"])
+    def test_always_prompts(self, saved):
+        stub = ReviewStub(saved, answers=[(policy.ADD, False)])
+        started = review(stub, [weak()])
+        assert stub.asked == [("A", "T0")], f"policy {saved} must not decide this"
+        assert approved_ids(started) == ["v-weak"]
+
+    def test_always_add_does_not_silently_take_it(self):
+        """The case the review flagged: one shared word authorising a song."""
+        stub = ReviewStub("add", answers=[(policy.SKIP, False)])
+        assert review(stub, [weak()]) == []
+        assert len(stub.asked) == 1
+
+    def test_a_remembered_add_still_does_not_skip_weak_prompts(self):
+        stub = ReviewStub("ask", answers=[(policy.ADD, True), (policy.ADD, False)])
+        review(stub, [ambiguous("amb"), weak("wk")])
+        assert stub.ambiguous_policy == "add"
+        assert len(stub.asked) == 2, "the weak one must still be asked about"
+
+
+class TestChoosingAnAlternative:
+    def test_the_picked_candidate_is_what_gets_added(self):
+        """The dialog lists near-scoring rivals; whichever is picked is the one
+        that must reach the playlist."""
+        alt = candidate("v-alt", title="Other")
+        stub = ReviewStub("ask", answers=[(policy.ADD, False, 1)])
+        started = review(stub, [ambiguous("v-winner", alternatives=[alt])])
+        assert approved_ids(started) == ["v-alt"]
+
+    def test_the_winner_is_used_when_nothing_is_picked(self):
+        alt = candidate("v-alt", title="Other")
+        stub = ReviewStub("ask", answers=[(policy.ADD, False)])
+        started = review(stub, [ambiguous("v-winner", alternatives=[alt])])
+        assert approved_ids(started) == ["v-winner"]
 
 
 class TestCancelling:

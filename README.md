@@ -14,7 +14,8 @@ and your YouTube Music playlists.
   each song is searched on YouTube Music and added to every selected playlist.
 - Cratefill won't *silently* add a song it isn't sure about. Every match is either
   **confident** (`✓`, added), **uncertain** (`?`, your choice) or **no match**
-  (`✗`, skipped, with the reason given).
+  (`✗`, skipped, with the reason given). When an uncertain match has close
+  rivals, you can pick among them before adding.
 - It also tries hard not to come back empty-handed. If the exact recording isn't
   on YouTube Music but another version of the same song is — a live take, a
   remix, an acoustic version, even another band's cover — you're offered that
@@ -27,7 +28,9 @@ and your YouTube Music playlists.
 - The **On ambiguous match** dropdown next to the Add button decides what happens
   to the uncertain ones: **Always ask** (the default — you get a Requested /
   Proposed / Reason prompt with Skip and Add), **Always skip**, or **Always add**.
-  Your choice is remembered between runs. It never applies to `✗` results.
+  Your choice is remembered between runs. It never applies to `✗` results, and
+  the *weakest* matches — a title that only loosely overlaps, or a song credited
+  to a completely different artist — always ask, even on **Always add**.
 - Nothing is written to a playlist until every decision is made, so closing the
   prompt cancels the whole import and leaves your playlists untouched.
 - The reverse works too: select playlists and click **Export CSV…** to save each

@@ -134,12 +134,15 @@ class TestEvaluateSongs:
         assert kinds(out, "log")[0].startswith("✗ Phoenix — Lisztomania")
 
     def test_logs_a_wrong_artist_as_uncertain_rather_than_no_match(self):
-        """The right song by the wrong artist is offered, not discarded."""
+        """The right song by the wrong artist is offered, not discarded — but as
+        a weak match, so it is reviewed rather than automated."""
         out = []
         results = [{"videoId": "v1", "title": "Lisztomania", "artists": [{"name": "Nobody"}]}]
         evaluated = youtube.evaluate_songs(FakeYT(search_results=results), [SONG], out.append)
-        assert evaluated[0][1].status == "ambiguous"
-        assert kinds(out, "log")[0].startswith("? Phoenix — Lisztomania")
+        assert evaluated[0][1].status == "weak"
+        line = kinds(out, "log")[0]
+        assert line.startswith("? Phoenix — Lisztomania")
+        assert "weak match, will ask" in line
 
     def test_ambiguous_log_shows_the_proposal(self):
         out = []

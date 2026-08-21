@@ -50,7 +50,8 @@ class TestSavePolicy:
     def test_round_trip(self, settings, value):
         assert policy.save_policy(value) is True
         assert json.loads(settings.read_text(encoding="utf-8")) == {
-            "ambiguous_match_policy": value
+            "ambiguous_match_policy": value,
+            "settings_version": policy.SETTINGS_VERSION,
         }
         assert policy.load_policy() == value
 
@@ -75,12 +76,48 @@ class TestSavePolicy:
         settings.write_text(json.dumps({"future_setting": 42}), encoding="utf-8")
         policy.save_policy("skip")
         data = json.loads(settings.read_text(encoding="utf-8"))
-        assert data == {"future_setting": 42, "ambiguous_match_policy": "skip"}
+        assert data == {"future_setting": 42, "ambiguous_match_policy": "skip",
+                        "settings_version": policy.SETTINGS_VERSION}
 
     def test_reports_failure_instead_of_raising(self, tmp_path, monkeypatch):
         monkeypatch.setattr(policy, "SETTINGS_FILE", tmp_path / "settings.json")
         monkeypatch.setattr(policy, "write_json_atomic", lambda *a: False)
         assert policy.save_policy("add") is False
+
+
+class TestMigrateSettings:
+    """"Always add" is a standing instruction to skip review, so it should only
+    ever apply to rules the user agreed to."""
+
+    def test_a_stale_add_becomes_ask(self, settings):
+        settings.write_text(json.dumps({"ambiguous_match_policy": "add"}), encoding="utf-8")
+        assert policy.migrate_settings() is True
+        assert policy.load_policy() == "ask"
+
+    def test_it_records_the_version_so_it_only_happens_once(self, settings):
+        settings.write_text(json.dumps({"ambiguous_match_policy": "add"}), encoding="utf-8")
+        policy.migrate_settings()
+        assert json.loads(settings.read_text(encoding="utf-8"))["settings_version"] == \
+            policy.SETTINGS_VERSION
+        assert policy.migrate_settings() is False
+
+    @pytest.mark.parametrize("value", ["ask", "skip"])
+    def test_other_policies_are_left_alone(self, settings, value):
+        settings.write_text(json.dumps({"ambiguous_match_policy": value}), encoding="utf-8")
+        assert policy.migrate_settings() is False
+        assert policy.load_policy() == value
+
+    def test_an_add_saved_by_this_version_survives(self, settings):
+        policy.save_policy("add")
+        assert policy.migrate_settings() is False
+        assert policy.load_policy() == "add"
+
+    def test_no_file_is_nothing_to_migrate(self, settings):
+        assert policy.migrate_settings() is False
+
+    def test_a_corrupt_file_is_nothing_to_migrate(self, settings):
+        settings.write_text("{ not json", encoding="utf-8")
+        assert policy.migrate_settings() is False
 
 
 class TestActionForMatch:
@@ -90,8 +127,17 @@ class TestActionForMatch:
     def ambiguous(self):
         return MatchDecision("ambiguous", candidate={"videoId": "v1"})
 
+    def weak(self):
+        return MatchDecision("weak", candidate={"videoId": "v1"})
+
     def rejected(self):
         return MatchDecision("rejected")
+
+    @pytest.mark.parametrize("saved", ["ask", "skip", "add"])
+    def test_weak_always_asks(self, saved):
+        """The "the user can glance at the proposal" rationale only holds if the
+        user is actually asked, so the thinnest matches ignore the policy."""
+        assert policy.action_for_match(self.weak(), saved) == "ask"
 
     @pytest.mark.parametrize("saved", ["ask", "skip", "add"])
     def test_high_confidence_ignores_the_policy(self, saved):

@@ -5,7 +5,7 @@ the app does from a user's point of view; this file explains how it's built and
 why. `RESEARCH.md` documents the alternatives that were considered before
 settling on this approach.
 
-*Last updated: 2026-08-19 — matches the `cratefill/` package as of that date (v0.1.1).*
+*Last updated: 2026-08-21 — matches the `cratefill/` package as of that date (v0.1.1).*
 
 ## Stack and key decisions
 
@@ -15,9 +15,9 @@ settling on this approach.
 | YouTube Music access | [ytmusicapi](https://github.com/sigma67/ytmusicapi) (unofficial) | No API quota; searches the actual YT Music song catalog. The official YouTube Data API v3 costs ~150 quota units per track (≈65 tracks/day on the default 10k quota) and searches all of YouTube, not just music — see `RESEARCH.md` |
 | GUI | Tkinter (`ttk` widgets) | Ships with Python — no packaging issues on Windows |
 | Theme | Hand-rolled dark theme on built-in `clam` (`apply_dark_theme()`) | `clam` is the one built-in ttk theme that renders identically on Windows and Linux, so the dark UI is cross-platform with zero dependencies. sv-ttk was tried first and abandoned: on this Python 3.14 / Tk 8.6.15 build it registered its theme name but applied empty style settings (half-light UI). Palette lives in module constants (`BG`, `FIELD`, `BTN`, `FG`, `ACCENT`…); plain tk widgets (Text, Listbox) aren't covered by ttk themes and take `DARK_LIST_STYLE`/`DARK_TEXT_STYLE` directly. The title bar is darkened via `enable_dark_title_bar()` (Windows DWM attribute, best-effort no-op elsewhere; Linux title bars follow the desktop's window manager theme) |
-| Architecture | Small package, `cratefill/` (`app`, `matching`, `storage`, `youtube`) | Started as one file; split at ~1100 lines because UI layout, matching rules, local file handling and YouTube Music communication change for unrelated reasons, and the improved matching system needs a pure, testable core. Kept deliberately modest — no `utils.py`, no module-per-class |
-| Song matching | Token-aware scoring on top of `rapidfuzz`, with independent artist/title thresholds and version-marker checks | Substring matching accepted `one → someone` and `cher → cherub`, and the old first-result fallback added unrelated songs silently. `rapidfuzz` gives order-tolerant scorers (`token_set_ratio`, `WRatio`) far better than `difflib` and is fast enough to be irrelevant at these sizes; the fuzzy call is isolated in `_ratio()` so it can be swapped |
-| Ambiguous matches | User policy in `settings.json` (`ask`/`skip`/`add`, default `ask`), applied by `policy.py` | Matching can only say how credible a candidate is; what to do about "credible but uncertain" is a user preference. Kept out of `matching.py` so the rules stay pure and testable, and out of `browser.json` so a preference never shares a file with session cookies |
+| Architecture | Small package, `cratefill/` (`app`, `matching`, `policy`, `storage`, `youtube`) | Started as one file; split at ~1100 lines because UI layout, matching rules, local file handling and YouTube Music communication change for unrelated reasons, and the improved matching system needs a pure, testable core. Kept deliberately modest — no `utils.py`, no module-per-class |
+| Song matching | Token-aware scoring on top of `rapidfuzz`, four confidence tiers, version-marker checks | Substring matching accepted `one → someone` and `cher → cherub`, and the old first-result fallback added unrelated songs silently. `rapidfuzz` gives order-tolerant scorers far better than `difflib` and is fast enough to be irrelevant at these sizes; the fuzzy call is isolated in `_ratio()` so it can be swapped. Use `token_sort_ratio`, **not** `token_set_ratio`/`WRatio`: those deduplicate tokens, which made `Run Run Run` and `Run` score identically |
+| Ambiguous matches | User policy in `settings.json` (`ask`/`skip`/`add`, default `ask`), applied by `policy.py`; the `weak` tier ignores it | Matching can only say how credible a candidate is; what to do about "credible but uncertain" is a user preference — but the *thinnest* evidence is always reviewed, because "Always add" shouldn't accept what a user would reject on sight. Kept out of `matching.py` so the rules stay pure and testable, and out of `browser.json` so a preference never shares a file with session cookies |
 | Auth persistence | `browser.json` in the per-user data dir (`user_data_dir()`) | ytmusicapi's standard browser-auth file format. Kept out of the app directory: that can be read-only for system-wide installs, is wiped on every launch under PyInstaller `--onefile`, and invites copying session cookies around with the executable. Created `0600` in a `0700` directory on POSIX, since ytmusicapi writes it with the process umask |
 
 There is no database. For day-to-day dev, `pip install -e ".[dev]"` and run
@@ -34,10 +34,13 @@ cratefill/
 ├── __init__.py    __version__ only — the single source of the version, and kept
 │                  import-light because setuptools reads the attribute
 ├── __main__.py    python -m cratefill → app.main()
-├── matching.py    normalize/tokens/core_title, version_markers,
-│                  score_text/score_artist, choose_match → MatchDecision
-│                  pure: re + unicodedata + rapidfuzz, no I/O, deterministic
+├── matching.py    normalize/tokens, metadata_segments/core_title/score_title,
+│                  version_markers/version_relation, score_text/score_artist,
+│                  has_content_overlap, Candidate,
+│                  choose_match → MatchDecision (high/ambiguous/weak/rejected)
+│                  pure: re + unicodedata + collections + rapidfuzz, no I/O
 ├── policy.py      POLICIES ("ask"/"skip"/"add"), load_policy/save_policy,
+│                  migrate_settings(), SETTINGS_VERSION,
 │                  action_for_match(decision, policy) → "add"/"skip"/"ask"
 ├── storage.py     user_data_dir()            per-user data directory
 │                  read_json/write_json_atomic  settings file mechanics
@@ -59,7 +62,7 @@ cratefill/
 └── app.py         palette + apply_dark_theme(), enable_dark_title_bar()
                    SONG_COLUMNS, LOGIN_INSTRUCTIONS, HELP_TEXT
                    class LoginDialog(Toplevel)           paste-headers auth dialog
-                   class AmbiguousMatchDialog(Toplevel)  Skip/Add + remember
+                   class AmbiguousMatchDialog(Toplevel)  pick a candidate, Skip/Add
                    class CratefillApp           window, selections, threads, queue
                    main()
 
@@ -70,7 +73,7 @@ tests/             test_matching.py, test_policy.py, test_storage.py,
 
 Dependency direction is one-way:
 `__main__ → app → {youtube → {matching, storage}, policy → storage}`. Nothing
-imports `app`. `matching.py` imports only `re`, `unicodedata` and `rapidfuzz`;
+imports `app`. `matching.py` imports only `re`, `unicodedata`, `collections` and `rapidfuzz`;
 `storage.py`, `policy.py` and `youtube.py` never import Tkinter; `app.py` makes
 no `yt.*` call of its own; and `matching.py` knows nothing about the ambiguous
 policy. Those properties are what keep the test suite free of Tk and network, and
@@ -106,7 +109,14 @@ Returns a `MatchDecision` whose `status` is one of:
 |---|---|---|
 | `high` | near-identical artist and title, the recording asked for, clear winner | added |
 | `ambiguous` | recognisably the same song, but something is off | the user's policy decides |
-| `rejected` | a *different* song — no result shared a whole title word | always skipped |
+| `weak` | plausibly the same song, on thin evidence | **always asks**, whatever the policy |
+| `rejected` | a *different* song — no result shared a content word in the title | always skipped |
+
+`weak` exists because "offer it and let the user glance at it" is only true when
+the user is actually asked. A loose title overlap (`Hello` → `Hello World
+Goodbye`) or a wholly different performer is too thin to hand to a saved
+"Always add", so `_classify()` pins it to the ask path via
+`WEAK_TITLE` / `WEAK_ARTIST`.
 
 **Two opposite failures are being avoided here, and the balance between them is
 the whole design.**
@@ -123,16 +133,17 @@ remix, or another band's cover produced **nothing at all**. Coming back
 empty-handed is the worse failure — a proposal the user can glance at and accept
 beats a silent miss. So:
 
-* **`rejected` is reserved for a different song.** The only bar is a shared whole
-  word in the title (`title_score > TITLE_FLOOR`; `score_text` returns exactly
-  0.0 when nothing is shared). That still rejects `One → Someone`,
-  `Cher → Cherub`, and `Lisztomania → 1901`.
+* **`rejected` is reserved for a different song.** The bar is a shared *content*
+  word in the title — `has_content_overlap()` discounts `STOP_WORDS`, so
+  `The End` and `The Beginning` don't qualify on "the". That still rejects
+  `One → Someone`, `Cher → Cherub`, and `Lisztomania → 1901`.
 * **A wrong artist or wrong recording costs points and blocks `high`** — it never
   excludes. Every shortfall is named in `reasons`, so an offer is explicit rather
   than silent. This is the sense in which a high title score still can't
   compensate for the wrong artist: it can't make the match *confident*.
 * **`high` is deliberately hard to earn**, so everything doubtful reaches the
-  user rather than being assumed.
+  user rather than being assumed — and the thinnest evidence is pinned to `weak`,
+  which reaches the user even under "Always add".
 
 The stages, all in `matching.py`:
 
@@ -146,17 +157,29 @@ The stages, all in `matching.py`:
    collapsing, plus two special cases: a `_LIGATURES` table for letters NFKD
    won't split (`Cœur → coeur`, `ß → ss`) and interior `!`/`$` → `i`/`s` for
    stylised names (`P!nk → pink`, `Ke$ha → kesha`).
-4. **Keep version information** — `version_markers()` reads the *whole* title,
-   brackets included. Hard markers are live, remix, acoustic, instrumental,
-   karaoke, cover, demo, radio edit, extended, sped up, slowed, clean, explicit.
-   `core_title()` removes it all before scoring: a bracketed group naming a
-   version is dropped **whole**, not word by word, because `(Live at Wembley)` is
-   one piece of metadata — keeping `at wembley` made the live take look like a
+4. **Keep version information — but only where it lives.** Hard markers are live,
+   remix, acoustic, instrumental, karaoke, cover, demo, radio edit, extended,
+   sped up, slowed, clean, explicit. `version_markers()` looks for them **only in
+   metadata positions** (`metadata_segments()`: bracketed groups, and a trailing
+   `- …` segment — YouTube Music uses both forms). Scanning the whole title
+   instead was a real bug: songs actually called *Clean*, *Stereo* and *Live and
+   Let Die* were reduced to empty strings and then **rejected as no match**. The
+   cost of the fix is that a request typed as `Wonderwall Live`, with no brackets
+   or dash, no longer reads as asking for the live take.
+
+   `core_title()` strips those segments before scoring, dropping a bracketed
+   group **whole** rather than word by word, because `(Live at Wembley)` is one
+   piece of metadata — keeping `at wembley` made the live take look like a
    different song and dragged it below an unrelated band's studio cut. Soft
-   markers (remastered, deluxe, anniversary, album version, official video…),
-   bare marker words and `feat. X` go the same way, which is why `Wonderwall`
-   scores 1.00 against both `Wonderwall (Remastered)` and
-   `Wonderwall (Live at Wembley)`.
+   markers (remastered, deluxe, anniversary, album version, official video…) and
+   `feat. X` go the same way, which is why `Wonderwall` scores 1.00 against both
+   `Wonderwall (Remastered)` and `Wonderwall (Live at Wembley)`.
+
+   Two backstops guard the identity of the song: `core_title()` **never returns
+   `""`** for a non-empty title (if the metadata was the title, the title wins),
+   and `score_title()` short-circuits to 1.0 on exact normalized equality before
+   any stripping happens. `TestExactMatchInvariant` runs every marker word as a
+   whole title to keep it that way.
 
    `version_relation()` then compares hard markers **asymmetrically**, because
    the two directions aren't equally disappointing:
@@ -172,23 +195,47 @@ The stages, all in `matching.py`:
    exact studio version outranked the real artist's live take. Scaling the score
    instead lets being the right performer outweigh being the right recording,
    while still preferring the exact version when it exists.
-5. **Compare whole tokens** — `score_text()` scores 1.0 for equal token sets;
-   otherwise the token sets must genuinely intersect before any fuzzy score is
-   trusted. That gate is what kills `one → someone` and `cher → cherub`, where
-   character similarity is high but no whole word is shared. Overlap is divided
-   by the **longer** side, so `hello` can't pass as `hello world goodbye` either.
-   Values of four characters or fewer get no fuzzy credit at all. The fuzzy part
-   is `max(rapidfuzz.fuzz.token_set_ratio, WRatio) / 100`, isolated in `_ratio()`.
-6. **Score the artist** — `score_artist()` takes the best score across every
-   returned artist, ignoring nameless/malformed entries, strips a leading "the"
-   (`The Beatles ≡ Beatles`), and lets requested `feat.` guests match any
-   returned artist. Extra artists on the result never penalise it.
-7. **Rank and classify** — everything with a related title is ranked by
-   `base × (1 − version penalty)`, where `base = 0.65·title + 0.35·artist`. Only
-   candidates sharing no title word are dropped. `high` needs `HIGH_TITLE` /
-   `HIGH_ARTIST`, `relation == "same"`, *and* a `WINNER_MARGIN` lead over the
-   runner-up; anything else is `ambiguous` with `reasons` naming each shortfall
-   (including which artist was actually found, so the dialog can show it).
+5. **Compare whole tokens, counting repeats** — `score_text()` scores 1.0 for
+   equal token **multisets** (`collections.Counter`): order is irrelevant,
+   repetition is not, because comparing *sets* made `Run Run Run` and `Run`
+   identical. Otherwise the tokens must genuinely intersect before any fuzzy
+   score is trusted — the gate that kills `one → someone` and `cher → cherub`,
+   where character similarity is high but no whole word is shared. Overlap is
+   divided by the **longer** side, so `hello` can't pass as `hello world
+   goodbye`. Values of four characters or fewer get no fuzzy credit, but only
+   when *both* sides are a single word. The fuzzy part is
+   `max(token_sort_ratio, ratio) / 100` in `_ratio()` — **not** `token_set_ratio`
+   or `WRatio`, both of which deduplicate tokens and reintroduce the `Run Run
+   Run` bug.
+
+   `_score_spaceless()` is the fallback for scripts that don't separate words
+   (CJK, Thai): there the whole title is one token, so any spelling variation
+   shares nothing and the gate above can never fire. It applies only when both
+   sides are single-token and at least one is in such a script, with a high
+   `SPACELESS_MIN` cutoff — script-gated precisely so it can't revive substring
+   matching for Latin titles.
+6. **Score the artist** — `score_artist()` scores the **principal** artist and
+   adds `GUEST_BONUS` per matched guest, capped at 1.0. Taking a plain `max()`
+   over principal and guests was a bug: a perfect featured-artist match hid a
+   completely absent principal, so `Jay-Z feat. Alicia Keys` matched a result
+   credited to Alicia Keys alone at 1.00 and went straight to `high`. It now
+   scores ~0.05. A leading "the" is ignored (`The Beatles ≡ Beatles`), nameless
+   and malformed entries are skipped, and extra artists on the result never
+   penalise it. `with` counts as a featured separator **here only** — in a title
+   it's an ordinary word.
+7. **Rank and classify** — every candidate becomes a `Candidate` carrying its own
+   scores, `relation` and `reasons`, ranked by `base × (1 − version penalty)`
+   where `base = 0.65·title + 0.35·artist`. Only candidates with no shared
+   content word are dropped. `high` needs `HIGH_TITLE` / `HIGH_ARTIST`,
+   `relation == "same"`, *and* a `WINNER_MARGIN` lead over the runner-up.
+   Otherwise `_classify()` returns `weak` when the winner is below `WEAK_TITLE`
+   or `WEAK_ARTIST`, else `ambiguous` — with `reasons` naming each shortfall,
+   including which artist was actually found.
+
+   `MatchDecision.alternatives` holds the runners-up as `Candidate`s, and
+   `.choices` is the winner followed by them — that's what the review dialog
+   renders as a radio list. Keeping the scores and reasons on the candidate is
+   what lets the UI list rivals without recomputing anything.
 
 All thresholds are module constants at the top of the file. They encode one
 trade-off: being *confident* is hard to earn, but being *offered* is easy — a
@@ -210,19 +257,34 @@ to*. `policy.action_for_match(decision, saved)` makes that call and returns
 ```python
 high     → "add"    whatever the setting says
 rejected → "skip"   whatever the setting says
+weak     → "ask"    whatever the setting says
 ambiguous→ the saved policy ("ask" | "skip" | "add")
 ```
 
 The asymmetry is the safety property: **"Always add" means "accept credible but
-uncertain candidates", never "add the first unrelated search result"**.
+uncertain candidates", never "add the first unrelated search result"** — and
+never "accept something I'd have rejected on sight", which is what `weak` is for.
 
-The setting is stored as `{"ambiguous_match_policy": "ask"}` in `settings.json`
-in `storage.user_data_dir()` — beside `browser.json`, never inside it: a
-preference has no business sharing a file with session cookies. Writes go through
-`storage.write_json_atomic()` (staged sibling + `os.replace`, same reasoning as
-`save_credentials`) and preserve unrelated keys, so a future version's settings
-survive an older version writing. Anything wrong with the file — absent,
-unreadable, malformed, not an object, unknown value — falls back to `ask`.
+Three things guard that setting, because it is the one place where the permissive
+matcher is not reviewed by a human:
+
+* Selecting **Always add** raises a confirmation spelling out what it now accepts
+  (a different recording, a different artist); cancelling reverts the dropdown.
+* `weak` decisions ignore it entirely.
+* `migrate_settings()` resets a saved `add` to `ask` when `SETTINGS_VERSION`
+  moves. **Bump `SETTINGS_VERSION` whenever a release changes what `ambiguous`
+  covers** — a standing instruction to skip review should only ever apply to
+  rules the user actually agreed to. `CratefillApp.__init__` calls it beside
+  `migrate_legacy_auth_file()` and logs a line when it fires.
+
+The setting is stored as `{"ambiguous_match_policy": "ask", "settings_version": 2}`
+in `settings.json` in `storage.user_data_dir()` — beside `browser.json`, never
+inside it: a preference has no business sharing a file with session cookies.
+Writes go through `storage.write_json_atomic()` (staged sibling + `os.replace`,
+same reasoning as `save_credentials`) and preserve unrelated keys, so a future
+version's settings survive an older version writing. Anything wrong with the
+file — absent, unreadable, malformed, not an object, unknown value — falls back
+to `ask`.
 
 ### Authentication flow
 
@@ -358,11 +420,18 @@ anything.
    processed, because `_end_work()` has to clear `self.working` before phase three
    can call `_start_work()` again. Each decision goes through
    `policy.action_for_match()`; `"ask"` results open `AmbiguousMatchDialog`
-   sequentially. Ticking "use this choice for future ambiguous matches" calls
-   `set_ambiguous_policy()`, which saves the setting, updates the dropdown, and
-   therefore governs the *remaining* songs in the same run. Dismissing the dialog
-   (Escape or the window close button) leaves `action` as `None`, which abandons
-   the entire import — including high-confidence matches already approved.
+   sequentially. The dialog shows the request, the decision-level reason, and
+   `decision.choices` as a **radio list** — the proposal plus its near-scoring
+   rivals, each with its own score and shortfall. Whichever is selected becomes
+   `dialog.chosen`, and that is the videoId `_review_and_add` approves: the
+   top-ranked candidate is not always the one the user wants, which is exactly
+   what "another candidate scores almost the same" is telling them. Ticking "use
+   this choice for future ambiguous matches" calls `set_ambiguous_policy()`,
+   which saves the setting, updates the dropdown, and therefore governs the
+   *remaining* songs in the same run (the checkbox is hidden for `weak`
+   decisions, which can't be automated anyway). Dismissing the dialog (Escape or
+   the window close button) leaves `action` as `None`, which abandons the entire
+   import — including high-confidence matches already approved.
 3. **Add phase** — `_add_worker` → `youtube.add_video_ids_to_playlists()`. One
    `yt.add_playlist_items(playlistId, video_ids, duplicates=False)` call **per
    playlist** with all approved IDs batched — not one call per song, which would
@@ -483,30 +552,40 @@ the package split, so keep it.
 
 - **`tests/test_matching.py`** — every stage directly: `normalize()` (casefolding,
   accents, ligatures, stylised names, punctuation), `split_featured()`,
-  `version_markers()`/`has_version_conflict()` in both directions,
-  `score_text()`, and `choose_match()` across a fixture set of harmless variants
-  that must be accepted (accents, leading "The", featured artists, remasters,
-  album versions), false positives that must be refused (`One`/`Someone`,
-  `Cher`/`Cherub`, same title by another artist, right artist wrong song),
-  recording variants that must be refused (live, remix, instrumental, cover,
-  sped up, explicit), and the ambiguity margin. Plus a parametrised sweep of
-  malformed ytmusicapi shapes (`artists=None`, missing keys, nameless artists,
-  non-dict entries, `results=None`) — regression tests: a result with
-  `artists=None` used to raise and take the worker thread down with it.
+  `version_markers()`/`version_relation()` in both directions, `core_title()`,
+  `score_text()`, and `choose_match()` across harmless variants that must be
+  accepted (accents, leading "The", featured artists, remasters, album versions),
+  different songs that must be refused (`One`/`Someone`, `Cher`/`Cherub`, right
+  artist wrong song), and recording variants that must be *offered* rather than
+  refused. Plus a parametrised sweep of malformed ytmusicapi shapes
+  (`artists=None`, missing keys, nameless artists, non-dict entries,
+  `results=None`) — a result with `artists=None` used to raise and take the worker
+  thread down with it.
+
+  Four classes exist because a review found real bugs in exactly those places,
+  and they are the regression net for them: `TestExactMatchInvariant` (an exact
+  artist+title result must always be `high` — every marker word is tried as a
+  whole title, plus titles containing "with"), `TestPrincipalArtist` (a guest can
+  never stand in for the principal), `TestRepeatedWords` (`Run Run Run` ≠ `Run`),
+  and `TestStopWordFloor` / `TestWeakTier` / `TestSpacelessScripts`.
 - **`tests/test_policy.py`** — the default and every fallback (absent,
   truncated, non-object, unknown value, unreadable), the save/load round trip,
-  atomic writes leaving no partial file, unrelated keys surviving, and the
-  `action_for_match` matrix — including that `high` ignores the policy and that
-  `rejected` survives "Always add".
+  atomic writes leaving no partial file, unrelated keys surviving,
+  `migrate_settings()` (a stale `add` becomes `ask`, exactly once), and the
+  `action_for_match` matrix — including that `high` ignores the policy, that
+  `rejected` survives "Always add", and that `weak` always asks.
 - **`tests/test_review.py`** — `CratefillApp._review_and_add` on a stub, with
   threading patched out: high-confidence added without prompting under every
   policy, rejected never added under any policy, skip/add policies applied
-  without a prompt, remembering a choice governing the rest of the run, and a
-  cancelled review mutating nothing at all.
+  without a prompt, remembering a choice governing the rest of the run, weak
+  matches prompting even with `add` saved, picking an alternative changing what
+  gets added, and a cancelled review mutating nothing at all.
 - **`tests/test_dialog.py`** — `AmbiguousMatchDialog` itself: what it displays,
-  Skip/Add, the remember checkbox, and that Escape or closing the window leaves
-  `action` as `None` (which the caller reads as "cancel the import"). Skips
-  automatically when there's no display.
+  the alternatives radio list (every candidate listed with its own shortfall,
+  the winner selected by default, picking another changing `chosen`), Skip/Add,
+  the remember checkbox, the weak-match caption and its hidden checkbox, and
+  that Escape or closing the window leaves `action` as `None` (which the caller
+  reads as "cancel the import"). Skips automatically when there's no display.
 - **`tests/test_storage.py`** — CSV encodings (BOM, cp1252), delimiters
   (`,` `;` tab), English/French headers, headerless files, station-by-header-name
   only, quoted fields; `read_songs_folder` including its deliberate
@@ -554,14 +633,17 @@ the package split, so keep it.
 - **No matching report.** An optional CSV of requested/proposed/scores/action/
   reason would make threshold tuning far easier than reading the Messages pane.
 - **Thresholds are guesses.** The constants at the top of `matching.py` were
-  validated against a hand-written corpus, not real imports. Two things to watch:
-  `explicit`/`clean` are treated as version markers even though ytmusicapi
-  exposes a separate `isExplicit` field the matcher ignores, so an
-  explicit-tagged track may prompt when it shouldn't; and the relaxed
-  `TITLE_FLOOR` means a loose title overlap (`Hello` vs `Hello World Goodbye`)
-  now reaches the user as a proposal rather than being dropped. Both are
-  deliberate — a prompt beats a silent miss — but both are worth revisiting once
-  there's real data on how noisy they are.
+  validated against a hand-written corpus, not real imports — a code review
+  found several false-confidence cases that all 239 tests of the day missed, so
+  treat the corpus as a floor, not proof. Things to watch: `explicit`/`clean` are
+  treated as version markers even though ytmusicapi exposes a separate
+  `isExplicit` field the matcher ignores, so an explicit-tagged track may prompt
+  when it shouldn't; version markers are only read from brackets or a trailing
+  `- …`, so `Wonderwall Live` typed without punctuation reads as a plain title;
+  and a loose title overlap reaches the user as a `weak` proposal rather than
+  being dropped. All deliberate — a prompt beats a silent miss — but worth
+  revisiting with real data. **A matching-report CSV is the tool that would
+  actually calibrate these**, which is why it stays high on the list below.
 - **No playlist creation** from the app — users must create the playlist on
   YT Music first. `yt.create_playlist(title, description)` makes this a small
   feature (button + name prompt + refresh).

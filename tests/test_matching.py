@@ -229,6 +229,179 @@ class TestHighConfidence:
         assert d.title_score >= HIGH_TITLE and d.artist_score >= HIGH_ARTIST
 
 
+class TestExactMatchInvariant:
+    """The one property that must never break: an exact result is a match.
+
+    Title preprocessing once reduced "With or Without You" and "Clean" to empty
+    strings, so songs whose titles *are* metadata words were rejected outright.
+    Every marker word is tried as a whole title here, so a future addition to the
+    marker lists can't quietly resurrect that.
+    """
+
+    MARKER_TITLES = [
+        "Clean", "Explicit", "Live", "Live and Let Die", "Cover Me", "Karaoke",
+        "Demo", "Acoustic", "Instrumental", "Radio", "Remix", "Mono", "Stereo",
+        "Deluxe", "Remaster", "Anniversary", "Extended", "Slowed", "Reverb",
+        "Sped Up", "Nightcore", "Tribute", "Unplugged", "Audio", "Visualizer",
+        "The Cover", "Album", "Single", "Bonus Track", "Original Version",
+    ]
+    TRICKY_TITLES = [
+        "With or Without You", "Dancing with Myself", "Live with Me",
+        "Feat. Nobody", "Sitting with the Devil", "Mono No Aware",
+    ]
+
+    @pytest.mark.parametrize("title", MARKER_TITLES + TRICKY_TITLES)
+    def test_an_exact_result_is_always_high(self, title):
+        d = decide("Some Artist", title, result(title, "Some Artist"))
+        assert d.status == "high", f"{title!r} → {d} (core {core_title(title)!r})"
+        assert d.title_score == 1.0
+
+    @pytest.mark.parametrize("title", MARKER_TITLES + TRICKY_TITLES)
+    def test_the_core_title_is_never_empty(self, title):
+        """The backstop: if stripping metadata would empty the title, the
+        metadata *was* the title."""
+        assert core_title(title) != ""
+
+    @pytest.mark.parametrize("title, got", [
+        ("Dancing with Myself", "Dancing"),
+        ("With or Without You", "You"),
+        ("Live and Let Die", "Live"),
+        ("Sitting with the Devil", "Sitting"),
+    ])
+    def test_dropping_a_real_word_cannot_be_confident(self, title, got):
+        """Preprocessing that erased a meaningful word made two different songs
+        look identical. Whatever survives stripping, this must never be `high`."""
+        d = decide("Some Artist", title, result(got, "Some Artist"))
+        assert d.status != "high", f"{title!r} vs {got!r} → {d}"
+
+
+class TestPrincipalArtist:
+    """A featured guest can help, never stand in for the principal artist."""
+
+    def test_all_credited_artists_present(self):
+        d = decide("Jay-Z feat. Alicia Keys", "Empire State of Mind",
+                   result("Empire State of Mind", "Jay-Z", "Alicia Keys"))
+        assert d.status == "high"
+
+    def test_principal_alone_is_enough(self):
+        """A result that omits the guest is still the right recording."""
+        d = decide("Jay-Z feat. Alicia Keys", "Empire State of Mind",
+                   result("Empire State of Mind", "Jay-Z"))
+        assert d.status == "high"
+
+    def test_a_guest_only_result_is_not_confident(self):
+        """The guest matching perfectly used to score 1.00 and hide the fact that
+        the principal artist wasn't there at all."""
+        d = decide("Jay-Z feat. Alicia Keys", "Empire State of Mind",
+                   result("Empire State of Mind", "Alicia Keys"))
+        assert d.status != "high"
+        assert d.artist_score < HIGH_ARTIST
+        assert "Alicia Keys" in d.reason
+
+    def test_a_guest_cannot_lift_a_wrong_principal_over_the_bar(self):
+        d = decide("Jay-Z feat. Alicia Keys", "Empire State of Mind",
+                   result("Empire State of Mind", "Alicia Keys", "Someone Else"))
+        assert d.artist_score < HIGH_ARTIST
+
+    def test_with_is_a_separator_in_artists(self):
+        """Unlike titles, artist credits really do use "with"."""
+        d = decide("Ella Fitzgerald with Louis Armstrong", "Cheek to Cheek",
+                   result("Cheek to Cheek", "Ella Fitzgerald", "Louis Armstrong"))
+        assert d.status == "high"
+
+
+class TestRepeatedWords:
+    def test_multiplicity_matters(self):
+        """Token *sets* made "Run Run Run" and "Run" identical."""
+        assert score_text("run run run", "run") < 1.0
+
+    def test_a_shortened_repetition_is_not_confident(self):
+        d = decide("Jo Jo Gunne", "Run Run Run", result("Run", "Jo Jo Gunne"))
+        assert d.status != "high"
+
+    def test_it_is_still_offered(self):
+        """Not confident, but plausibly the same song — don't refuse it."""
+        d = decide("Jo Jo Gunne", "Run Run Run", result("Run", "Jo Jo Gunne"))
+        assert d.status in OFFERED
+
+    def test_reordering_with_equal_counts_is_still_exact(self):
+        assert score_text("hello world hello", "hello hello world") == 1.0
+
+
+class TestWeakTier:
+    """Offered, but never automated: `weak` always asks, whatever the policy."""
+
+    @pytest.mark.parametrize("label, artist, title, res", [
+        ("loose title overlap", "Adele", "Hello", result("Hello World Goodbye", "Adele")),
+        ("different song, shared words", "Simon", "The Sound of Silence",
+         result("The Sound of Music", "Simon")),
+        ("another band entirely", "Oasis", "Wonderwall", result("Wonderwall", "Tribute Players")),
+        ("no artist data", "Oasis", "Wonderwall",
+         {"videoId": "v1", "title": "Wonderwall", "artists": None}),
+    ])
+    def test_thin_evidence_is_weak(self, label, artist, title, res):
+        d = decide(artist, title, res)
+        assert d.status == "weak", f"{label}: {d}"
+        assert d.video_id, "still offered — just never without asking"
+
+    def test_a_solid_shortfall_stays_merely_ambiguous(self):
+        """A near-tie between two good candidates is uncertain, not thin."""
+        d = decide("Oasis", "Wonderwall",
+                   result("Wonderwall", "Oasis", vid="a"),
+                   result("Wonderwall (Deluxe)", "Oasis", vid="b"))
+        assert d.status == "ambiguous"
+
+
+class TestStopWordFloor:
+    @pytest.mark.parametrize("title, got", [
+        ("The End", "The Beginning"),
+        ("A Day in the Life", "A Night at the Opera"),
+        ("Sound of Silence", "Taste of Water"),
+    ])
+    def test_sharing_only_common_words_is_not_a_match(self, title, got):
+        """Under an "Always add" policy, matching on "the" or "of" alone could
+        authorise a completely different song without review."""
+        d = decide("Some Artist", title, result(got, "Some Artist"))
+        assert d.status == "rejected", f"{title!r} vs {got!r} → {d}"
+
+    def test_a_title_made_only_of_common_words_still_matches_itself(self):
+        d = decide("Some Artist", "You and Me", result("You and Me", "Some Artist"))
+        assert d.status == "high"
+
+    def test_an_all_common_word_title_falls_back_to_any_shared_word(self):
+        """"You and Me" has no content word to require, so the floor relaxes —
+        but the result is weak, so it still can't be added without asking."""
+        d = decide("Some Artist", "You and Me", result("You and Her", "Some Artist"))
+        assert d.status == "weak"
+
+
+class TestSpacelessScripts:
+    """Scripts without word boundaries have one token, so the whole-token gate
+    can never find an overlap — a character fallback covers them."""
+
+    def test_a_kana_variant_is_offered(self):
+        d = decide("Angela Aki", "愛をこめて花束を", result("愛を込めて花束を", "Angela Aki"))
+        assert d.status in OFFERED
+        assert d.title_score >= 0.80
+
+    def test_an_exact_japanese_title_is_confident(self):
+        d = decide("宇多田ヒカル", "初恋", result("初恋", "宇多田ヒカル"))
+        assert d.status == "high"
+
+    def test_a_genuinely_different_japanese_title_is_refused(self):
+        d = decide("Angela Aki", "愛をこめて花束を", result("手紙", "Angela Aki"))
+        assert d.status == "rejected"
+
+    @pytest.mark.parametrize("want, got", [
+        ("one", "someone"),
+        ("cher", "cherub"),
+        ("hello", "hellos"),
+    ])
+    def test_latin_titles_do_not_get_the_fallback(self, want, got):
+        """The gate is script-based precisely so this can't come back."""
+        assert score_text(want, got) == 0.0
+
+
 class TestRejected:
     """Rejection is reserved for a *different song*. Coming back empty-handed is
     the worst outcome, so anything recognisably the same song is offered instead
@@ -260,10 +433,13 @@ class TestRejected:
         assert "imported row" in d.reason
 
 
+OFFERED = ("ambiguous", "weak")  # both reach the user; neither is added silently
+
+
 class TestOfferedRatherThanNothing:
     """The whole point: a remix, a live take or another band's cover of the right
-    song beats a silent miss. None of these may be *confident*, so they land in
-    the ambiguous bucket where the user's policy decides."""
+    song beats a silent miss. None of these may be *confident* — they land in the
+    ambiguous or weak bucket, where the user sees them."""
 
     @pytest.mark.parametrize("title, got, expected_in_reason", [
         ("Wonderwall", "Wonderwall (Live at Wembley)", "live version"),
@@ -276,26 +452,26 @@ class TestOfferedRatherThanNothing:
     ])
     def test_a_different_recording_is_offered_not_refused(self, title, got, expected_in_reason):
         d = decide("Oasis", title, result(got, "Oasis"))
-        assert d.status == "ambiguous"
+        assert d.status in OFFERED
         assert d.video_id == "v1", "the user should get the chance to take it"
         assert expected_in_reason in d.reason
 
     def test_another_artists_cover_is_offered(self):
         """A cover is by definition someone else, so a wrong artist can't be a
-        hard refusal — it just can't be confident."""
+        hard refusal — it just can't be confident, and it can't be automated."""
         d = decide("Oasis", "Wonderwall", result("Wonderwall", "Tribute Players"))
-        assert d.status == "ambiguous"
+        assert d.status == "weak"
         assert d.video_id == "v1"
         assert "Tribute Players" in d.reason
 
     def test_a_partial_title_overlap_is_offered(self):
         d = decide("Adele", "Hello", result("Hello World Goodbye", "Adele"))
-        assert d.status == "ambiguous"
+        assert d.status in OFFERED
 
     def test_missing_artist_data_is_offered_but_never_confident(self):
         d = decide("Phoenix", "Lisztomania",
                    {"videoId": "v1", "title": "Lisztomania", "artists": None})
-        assert d.status == "ambiguous"
+        assert d.status in OFFERED
         assert "no artist" in d.reason
 
     def test_the_real_artist_beats_another_bands_exact_version(self):
@@ -308,7 +484,7 @@ class TestOfferedRatherThanNothing:
 
     def test_every_shortfall_is_named(self):
         d = decide("Oasis", "Wonderwall", result("Wonderwall (Live)", "Tribute Players"))
-        assert d.status == "ambiguous"
+        assert d.status in OFFERED
         assert "artist similarity" in d.reason and "live version" in d.reason
 
 
@@ -346,7 +522,7 @@ class TestVersionFallback:
         d = decide("Oasis", "Wonderwall (Live)",
                    result("Wonderwall (Live)", "Oasis", vid="live"),
                    result("Wonderwall", "Oasis", vid="album"))
-        assert [a["videoId"] for a in d.alternatives] == ["album"]
+        assert [a.video_id for a in d.alternatives] == ["album"]
 
     def test_a_partial_marker_match_is_still_a_fallback(self):
         d = decide("Oasis", "Wonderwall (Live Acoustic)",
@@ -394,19 +570,22 @@ class TestAmbiguity:
         assert d.runner_up_score is not None
         assert "almost the same" in d.reason
 
-    def test_conflicting_versions_are_filtered_before_ranking(self):
-        """A live result alongside the studio one must not make it ambiguous —
-        it isn't a credible candidate at all."""
+    def test_the_version_penalty_keeps_a_variant_from_looking_like_a_tie(self):
+        """A live result alongside the studio one is still a candidate — nothing
+        is filtered — but VERSION_PENALTY drops it far enough that the studio
+        version stays a clear winner rather than a near tie."""
         d = decide("Oasis", "Wonderwall",
                    result("Wonderwall (Live)", "Oasis", vid="a"),
                    result("Wonderwall", "Oasis", vid="b"))
         assert d.status == "high" and d.video_id == "b"
+        assert d.runner_up_score is not None, "the live take is ranked, not discarded"
+        assert d.alternatives[0].video_id == "a"
 
     def test_alternatives_are_offered_for_review(self):
         d = decide("Oasis", "Wonderwall",
                    result("Wonderwall", "Oasis", vid="a"),
                    result("Wonderwall (Deluxe)", "Oasis", vid="b"))
-        assert [a["videoId"] for a in d.alternatives] == ["b"]
+        assert [a.video_id for a in d.alternatives] == ["b"]
 
 
 class TestMalformedApiData:
@@ -425,5 +604,5 @@ class TestMalformedApiData:
         """ytmusicapi is unofficial: every field is optional. An exception here
         used to kill the whole worker thread."""
         d = choose_match("Phoenix", "Lisztomania", results)
-        assert d.status in ("high", "ambiguous", "rejected"), label
-        assert d.candidate is None or isinstance(d.candidate, dict), label
+        assert d.status in ("high", "ambiguous", "weak", "rejected"), label
+        assert d.candidate is None or d.candidate.video_id, label

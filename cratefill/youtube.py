@@ -212,8 +212,10 @@ def _decision_line(artist, title, decision):
     """One Messages-pane line describing what matching concluded."""
     if decision.status == "high":
         return f"✓ {artist} — {title}"
-    if decision.status == "ambiguous":
-        return f"? {artist} — {title}: uncertain — {decision.reason}\n    Proposed: {decision.label}"
+    if decision.status in ("ambiguous", "weak"):
+        qualifier = "uncertain" if decision.status == "ambiguous" else "weak match, will ask"
+        return (f"? {artist} — {title}: {qualifier} — {decision.reason}"
+                f"\n    Proposed: {decision.label}")
     return f"✗ {artist} — {title}: no credible match — {decision.reason}"
 
 

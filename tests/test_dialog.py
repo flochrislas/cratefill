@@ -6,7 +6,7 @@ tk = pytest.importorskip("tkinter")
 
 from cratefill import policy                     # noqa: E402
 from cratefill.app import AmbiguousMatchDialog, apply_dark_theme   # noqa: E402
-from cratefill.matching import MatchDecision     # noqa: E402
+from cratefill.matching import Candidate, MatchDecision     # noqa: E402
 
 
 @pytest.fixture
@@ -21,13 +21,31 @@ def root():
     r.destroy()
 
 
+def candidate(vid, title, artist="Oasis", score=0.9, reasons=()):
+    return Candidate({"videoId": vid, "title": title, "artists": [{"name": artist}]},
+                     title_score=score, artist_score=score, overall_score=score,
+                     relation="same", reasons=list(reasons))
+
+
 @pytest.fixture
 def decision():
     return MatchDecision(
         "ambiguous",
-        candidate={"videoId": "v1", "title": "Wonderwall (Deluxe)",
-                   "artists": [{"name": "Oasis"}]},
+        candidate=candidate("v1", "Wonderwall (Deluxe)"),
         reasons=["another candidate scores almost the same"],
+    )
+
+
+@pytest.fixture
+def decision_with_alternatives():
+    return MatchDecision(
+        "ambiguous",
+        candidate=candidate("v1", "Wonderwall (Deluxe)", score=0.95),
+        reasons=["another candidate scores almost the same"],
+        alternatives=[
+            candidate("v2", "Wonderwall", score=0.94, reasons=["a close second"]),
+            candidate("v3", "Wonderwall (Live)", score=0.80, reasons=["live version"]),
+        ],
     )
 
 
@@ -37,12 +55,19 @@ def open_dialog(root, decision):
     return dialog
 
 
+def shown_text(widget):
+    """Every label and radio caption in the dialog, flattened."""
+    out = []
+    for child in widget.winfo_children():
+        if child.winfo_class() in ("TLabel", "TRadiobutton", "TCheckbutton"):
+            out.append(str(child.cget("text")))
+        out.extend(shown_text(child))
+    return out
+
+
 def test_shows_the_request_the_proposal_and_the_reason(root, decision):
     dialog = open_dialog(root, decision)
-    shown = " | ".join(
-        str(w.cget("text")) for w in dialog.winfo_children()[0].winfo_children()
-        if w.winfo_class() == "TLabel"
-    )
+    shown = " | ".join(shown_text(dialog))
     assert "Oasis — Wonderwall" in shown          # requested
     assert "Wonderwall (Deluxe)" in shown         # proposed
     assert "almost the same" in shown             # reason
@@ -88,3 +113,58 @@ def test_defaults_before_any_choice(root, decision):
     dialog = open_dialog(root, decision)
     assert dialog.action is None and dialog.remember is False
     dialog.destroy()
+
+
+class TestAlternatives:
+    """The top-ranked candidate isn't always the one the user wants, and the
+    reason text says as much — so the rivals have to be selectable."""
+
+    def test_every_candidate_is_listed(self, root, decision_with_alternatives):
+        dialog = open_dialog(root, decision_with_alternatives)
+        shown = " | ".join(shown_text(dialog))
+        for title in ("Wonderwall (Deluxe)", "Wonderwall", "Wonderwall (Live)"):
+            assert title in shown
+        assert "a close second" in shown, "each candidate shows its own shortfall"
+        dialog.destroy()
+
+    def test_the_winner_is_chosen_by_default(self, root, decision_with_alternatives):
+        dialog = open_dialog(root, decision_with_alternatives)
+        assert dialog.chosen is decision_with_alternatives.candidate
+        dialog._choose(policy.ADD)
+        assert dialog.chosen.video_id == "v1"
+
+    def test_picking_an_alternative_changes_what_is_added(self, root,
+                                                          decision_with_alternatives):
+        dialog = open_dialog(root, decision_with_alternatives)
+        dialog.choice_var.set(1)          # the radio list's second entry
+        dialog._choose(policy.ADD)
+        assert dialog.chosen.video_id == "v2"
+        assert dialog.action == "add"
+
+    def test_a_single_candidate_still_works(self, root, decision):
+        dialog = open_dialog(root, decision)
+        dialog._choose(policy.ADD)
+        assert dialog.chosen.video_id == "v1"
+
+
+class TestWeakMatches:
+    def weak(self):
+        return MatchDecision("weak", candidate=candidate("v1", "Hello World Goodbye"),
+                             reasons=["title similarity 0.33 below 0.90"])
+
+    def test_says_it_will_always_ask(self, root):
+        dialog = open_dialog(root, self.weak())
+        assert "asking whatever your policy says" in " | ".join(shown_text(dialog))
+        dialog.destroy()
+
+    def test_hides_the_remember_checkbox(self, root):
+        """Remembering only governs ambiguous matches, so offering it here would
+        imply weak ones could be automated too."""
+        dialog = open_dialog(root, self.weak())
+        assert not dialog.remember_check.winfo_ismapped()
+        dialog.destroy()
+
+    def test_titled_distinctly(self, root):
+        dialog = open_dialog(root, self.weak())
+        assert dialog.title() == "Weak match"
+        dialog.destroy()
