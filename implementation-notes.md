@@ -42,6 +42,7 @@ cratefill/
 ├── policy.py      POLICIES ("ask"/"skip"/"add"), load_policy/save_policy,
 │                  migrate_settings(), SETTINGS_VERSION,
 │                  action_for_match(decision, policy) → "add"/"skip"/"ask"
+├── selftest.py    run() → does this build have everything? (--selftest)
 ├── storage.py     user_data_dir()            per-user data directory
 │                  read_json/write_json_atomic  settings file mechanics
 │                  read_songs_csv(path)       CSV → list[(artist, title, station)]
@@ -67,8 +68,9 @@ cratefill/
                    main()
 
 run_cratefill.py   PyInstaller entry script (see PyInstaller section)
-tests/             test_matching.py, test_policy.py, test_storage.py,
-                   test_workers.py, test_review.py, test_dialog.py (needs a display)
+tests/             test_matching.py, test_policy.py, test_selftest.py,
+                   test_storage.py, test_workers.py, test_review.py,
+                   test_dialog.py (needs a display)
 ```
 
 Dependency direction is one-way:
@@ -563,7 +565,15 @@ Two deliverables per release:
 
 `py -m pytest` (pytest is the `[dev]` extra). The suite needs no Tk window, no
 network and no `browser.json` — that independence is the main practical payoff of
-the package split, so keep it.
+the package split, so keep it. `tests/test_dialog.py` is the exception and skips
+itself when there is no display.
+
+Separately, **`py -m cratefill --selftest`** answers a different question: not
+"is the logic right" but "does *this build* have everything it needs". It exists
+for the frozen exe, where both known failure modes (a missing `rapidfuzz`, missing
+ytmusicapi gettext catalogues) happen at import time and a `--windowed` build
+shows nothing at all — it just doesn't open. Exit code 0/1, so it works from a
+script or CI. See `cratefill/selftest.py` and the **Releasing** section.
 
 - **`tests/test_matching.py`** — every stage directly: `normalize()` (casefolding,
   accents, ligatures, stylised names, punctuation), `split_featured()`,
@@ -583,6 +593,11 @@ the package split, so keep it.
   whole title, plus titles containing "with"), `TestPrincipalArtist` (a guest can
   never stand in for the principal), `TestRepeatedWords` (`Run Run Run` ≠ `Run`),
   and `TestStopWordFloor` / `TestWeakTier` / `TestSpacelessScripts`.
+- **`tests/test_selftest.py`** — the build self-check. Mostly proves it *fails*:
+  a self-test that always passes is worse than none, so each required check is
+  broken in turn and the run must go non-zero, with the two real frozen-build
+  failures (missing `rapidfuzz`, missing ytmusicapi locales) named explicitly.
+  Also that an absent `tkinterdnd2` only warns and a missing display only skips.
 - **`tests/test_policy.py`** — the default and every fallback (absent,
   truncated, non-object, unknown value, unreadable), the save/load round trip,
   atomic writes leaving no partial file, unrelated keys surviving,

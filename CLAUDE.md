@@ -14,6 +14,7 @@ On this machine the bare `python` command is a broken Windows Store shim — **a
 py -m pip install -r requirements.txt   # ytmusicapi + tkinterdnd2 (optional, drag-and-drop)
 py -m pip install -e ".[dev]"           # + pytest, for the test suite
 py -m cratefill                         # run the app
+py -m cratefill --selftest              # check the install/bundle, no GUI (exit 0 = fine)
 py -m pytest                            # run the tests
 ```
 
@@ -38,7 +39,16 @@ Cratefill ships to **PyPI** (`pip install cratefill`) and as a **GitHub release*
 
    Pushing a `v*` tag triggers `.github/workflows/publish.yml`, which builds the sdist + wheel and publishes to PyPI over OIDC **trusted publishing** — no token is stored. (The one-time PyPI publisher config is already done: owner `flochrislas`, repo `cratefill`, workflow `publish.yml`, environment `pypi`.) Watch the run under the repo's Actions tab.
 
-2. The Windows `.exe` is **not** built by CI (it needs a Windows runner) — build and attach it manually:
+2. The Windows `.exe` is **not** built by CI (it needs a Windows runner) — build and attach it manually.
+
+   **Build a console version first and run its self-check.** `--windowed` sends startup errors nowhere, and every way a bundle breaks here is an *import-time* failure, so a `--windowed` exe with a missing module simply fails to open with no message at all:
+
+   ```powershell
+   py -m PyInstaller --onefile --name CratefillTest --collect-all tkinterdnd2 --collect-all ytmusicapi run_cratefill.py
+   dist\CratefillTest.exe --selftest        # exit 0 = the bundle has everything
+   ```
+
+   `--selftest` (see `cratefill/selftest.py`) checks rapidfuzz actually *scores*, the matching pipeline classifies both ways, the per-user data dir is writable, the settings file is readable, and ytmusicapi loads its gettext catalogues — no GUI and no login. Then build the real thing:
 
    ```powershell
    py -m PyInstaller --onefile --windowed --name Cratefill --collect-all tkinterdnd2 --collect-all ytmusicapi run_cratefill.py
@@ -48,16 +58,18 @@ Cratefill ships to **PyPI** (`pip install cratefill`) and as a **GitHub release*
    Build from `run_cratefill.py`, **not** from `cratefill/__main__.py`: bundlers run `__main__.py` as a plain script, which breaks its relative imports.
 
    Both `--collect-all` flags are required:
-   - `tkinterdnd2` bundles the native tkdnd binaries — without it the frozen app crashes at `TkinterDnD.Tk()`.
-   - `ytmusicapi` bundles its `locales/*.mo` gettext files — without them the first ytmusicapi call in the exe (typically `ytmusicapi.setup()` during login) dies with the misleading `[Errno 2] No translation file found for domain: 'base'`, masking the real error.
+   - `tkinterdnd2` bundles the native tkdnd binaries — without it the frozen app crashes at `TkinterDnD.Tk()`. The self-check reports its absence as a warning, not a failure, since the app runs without it.
+   - `ytmusicapi` bundles its `locales/*.mo` gettext files — without them the first ytmusicapi call in the exe (typically `ytmusicapi.setup()` during login) dies with the misleading `[Errno 2] No translation file found for domain: 'base'`, masking the real error. `--selftest` triggers that path deliberately via `YTMusic(language="en")`, which needs no auth and no network.
 
-   `rapidfuzz` ships compiled extension modules. PyInstaller normally picks those up on its own, but **this has not been verified on Windows yet** — if the frozen app fails to import `rapidfuzz`, add `--collect-all rapidfuzz` as well. Check this before the next release.
+   `rapidfuzz` ships compiled extension modules, loaded at *import* time. PyInstaller normally picks those up on its own, but **this has not been verified on Windows yet** — if `--selftest` reports `rapidfuzz`, add `--collect-all rapidfuzz` and update this command.
+
+   Also worth confirming on Windows, since the paths are platform-specific and have only ever run on Linux: `%APPDATA%\Cratefill\browser.json` after logging in, `settings.json` beside it after changing the dropdown, and that a `browser.json` left next to the exe gets migrated on launch.
 
 To inspect the dists before tagging: `py -m build` then `py -m twine check dist/*`. Manual PyPI upload fallback (needs a `pypi-…` token and an **interactive** terminal — it can't be backgrounded, twine prompts for the token): `py -m twine upload dist/cratefill-<ver>*`. Build artifacts (`build/`, `dist/`, `*.spec`) are gitignored.
 
 ## Architecture essentials
 
-- **Module boundaries** (`cratefill/`): `app.py` owns Tk — window, theme, dialogs, threads, queue polling. `matching.py` is pure matching (only `re`, `unicodedata`, `collections`, `rapidfuzz`). `policy.py` is what an ambiguous match *means* plus settings persistence. `storage.py` is local files (CSV, folders, filenames, the per-user data dir, atomic JSON); no Tk, no ytmusicapi. `youtube.py` owns credentials and every network call; no Tk. `__init__.py` holds only `__version__` and must stay import-light. Dependencies run one way: `__main__ → app → {youtube → {matching, storage}, policy → storage}`. Respect these: a Tk import outside `app.py`, a `yt.*` call in `app.py`, or `matching.py` learning about policy is a regression. Don't add `dialogs.py`/`models.py`/`workers.py`/`utils.py` until a boundary actually demands it.
+- **Module boundaries** (`cratefill/`): `app.py` owns Tk — window, theme, dialogs, threads, queue polling. `matching.py` is pure matching (only `re`, `unicodedata`, `collections`, `rapidfuzz`). `policy.py` is what an ambiguous match *means* plus settings persistence. `selftest.py` verifies a build has its dependencies (the one place allowed to import Tk outside `app.py`, and only inside a function). `storage.py` is local files (CSV, folders, filenames, the per-user data dir, atomic JSON); no Tk, no ytmusicapi. `youtube.py` owns credentials and every network call; no Tk. `__init__.py` holds only `__version__` and must stay import-light. Dependencies run one way: `__main__ → app → {youtube → {matching, storage}, policy → storage}`. Respect these: a Tk import outside `app.py`, a `yt.*` call in `app.py`, or `matching.py` learning about policy is a regression. Don't add `dialogs.py`/`models.py`/`workers.py`/`utils.py` until a boundary actually demands it.
 - **Coming back empty-handed is the worst outcome.** `matching.choose_match` returns a `MatchDecision` with status `high` / `ambiguous` / `weak` / `rejected`. `rejected` means **a different song**: no result shared a *content* word with the requested title (stop words don't count — see `STOP_WORDS`/`has_content_overlap`). A remix, a live take, a karaoke version or another band's cover of the right song is *offered*, because a reviewable proposal beats a silent miss. There is still no first-result fallback: `one → someone` and `cher → cherub` share no whole word and stay rejected, and so does another track by the right artist.
 - **A wrong artist or wrong version costs points, it doesn't exclude.** Both block `high` and are named in `reasons`; the version difference is folded into the score through `VERSION_PENALTY` (`same` 0, `missing` 0.10, `extra` 0.20) rather than filtering. That ranking matters: the real artist's live take must beat a tribute band's studio cut, which a hard version filter got backwards. `version_relation` is asymmetric — `extra` (a marker you didn't ask for) is penalised harder than `missing` (only the standard recording exists).
 - **The principal artist carries the requirement.** `score_artist` returns `(principal, combined)` and they are **not** interchangeable: `principal` alone decides whether `high` is allowed, `combined` (principal + `GUEST_BONUS` per matched guest) is for ranking only. Collapsing them let a guest bonus lift a 0.833 principal to 0.883 and clear the 0.88 gate — `Candidate.principal_score` is what `_shortfalls`/`_classify` test. A perfect featured-artist match also can't stand in for a missing principal (`Jay-Z feat. Alicia Keys` credited to Alicia Keys alone scores ~0.05). `with` is a separator in *artist* names only — in a title it's an ordinary word, and splitting on it reduced `With or Without You` to nothing.
