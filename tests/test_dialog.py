@@ -421,3 +421,60 @@ class TestEmptyListHint:
     def test_register_drop_target_reports_failure_rather_than_raising(self, root):
         app = self.app(root)
         assert app._register_drop_target(app.song_tree) is False
+
+
+class TestEmptyListHintWithRealDragAndDrop:
+    """The advertised path. Everything above runs on a plain tk.Tk(), where
+    tkinterdnd2 can't register a drop target — so without this the "Drag a CSV
+    file…" text and both registrations were asserted by nothing at all.
+    """
+
+    @pytest.fixture
+    def dnd_root(self):
+        dnd2 = pytest.importorskip("tkinterdnd2")
+        try:
+            r = dnd2.TkinterDnD.Tk()
+        except tk.TclError as exc:            # no display, or no tkdnd binaries
+            pytest.skip(f"no TkinterDnD root: {exc}")
+        r.withdraw()
+        apply_dark_theme(r)
+        yield r
+        r.destroy()
+
+    def app(self, dnd_root):
+        from cratefill.app import CratefillApp
+        app = CratefillApp(dnd_root)
+        dnd_root.update()
+        return app
+
+    def test_it_advertises_dropping(self, dnd_root):
+        app = self.app(dnd_root)
+        assert "Drag a CSV file or a folder of music here" in app.empty_hint.cget("text")
+
+    def test_both_the_tree_and_the_hint_accept_drops(self, dnd_root):
+        """tkdnd exposes registration as a <<Drop>> binding. The hint needs its
+        own: it covers the middle of the region the text tells you to aim at."""
+        app = self.app(dnd_root)
+        assert "<<Drop>>" in app.song_tree.bind()
+        assert "<<Drop>>" in app.empty_hint.bind()
+
+    def test_registration_reports_success(self, dnd_root):
+        app = self.app(dnd_root)
+        assert app._register_drop_target(app.song_tree) is True
+
+    def test_a_hint_that_cannot_accept_drops_is_not_advertised(self, dnd_root, monkeypatch):
+        """The gap this closes: if the label's registration failed while the
+        tree's succeeded, the old code still said "drag here" over a dead zone."""
+        from cratefill.app import CratefillApp
+        real = CratefillApp._register_drop_target
+        calls = []
+
+        def fail_on_the_label(self, widget):
+            calls.append(widget)
+            return False if len(calls) > 1 else real(self, widget)
+
+        monkeypatch.setattr(CratefillApp, "_register_drop_target", fail_on_the_label)
+        app = CratefillApp(dnd_root)
+        dnd_root.update()
+        assert "Drag" not in app.empty_hint.cget("text")
+        assert "Load CSV" in app.empty_hint.cget("text")

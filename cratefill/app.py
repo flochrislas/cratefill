@@ -552,7 +552,7 @@ class CratefillApp:
         self.song_tree.pack(side="left", fill="both", expand=True)
         song_scroll.pack(side="right", fill="y")
 
-        dnd = self._register_drop_target(self.song_tree)
+        tree_accepts_drops = self._register_drop_target(self.song_tree)
 
         # An empty song list looks broken rather than ready, and drag-and-drop is
         # invisible until you know it's there. This says so, in the space it's
@@ -560,17 +560,19 @@ class CratefillApp:
         # Placed over the tree rather than inserted as a row: a placeholder row
         # would land in self.songs' index mapping and in "Select all".
         self.empty_hint = ttk.Label(
-            self.song_tree,
-            justify="center",
-            foreground=FG_DIM,
-            background=FIELD,
+            self.song_tree, justify="center", foreground=FG_DIM, background=FIELD,
+        )
+        # The hint covers the middle of the area it points at, so it has to accept
+        # drops itself — and only advertise dropping if *both* targets took. A
+        # registered tree behind an unregistered label would invite drops onto a
+        # dead zone in the very spot the text says to aim for.
+        hint_accepts_drops = self._register_drop_target(self.empty_hint)
+        self.empty_hint.configure(
             text="Drag a CSV file or a folder of music here\n\n"
                  "or use Load CSV… / Load folder… above"
-            if dnd else "Use Load CSV… or Load folder… above to get started",
+            if tree_accepts_drops and hint_accepts_drops
+            else "Use Load CSV… or Load folder… above to get started",
         )
-        # Dropping onto the hint itself must work — it covers the middle of the
-        # target it is advertising.
-        self._register_drop_target(self.empty_hint)
         self._refresh_empty_hint()
 
         # Right pane: account + playlists
