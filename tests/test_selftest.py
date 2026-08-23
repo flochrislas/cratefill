@@ -86,9 +86,19 @@ class TestOptionalPieces:
 
     def test_no_display_skips_tkinter_without_failing(self, monkeypatch):
         """A headless machine is not a broken build — this has to stay usable in
-        CI, where there is no display at all."""
-        monkeypatch.delenv("DISPLAY", raising=False)
-        monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+        CI, where there may be no display at all.
+
+        Simulated by making Tk() raise, rather than by unsetting DISPLAY: that
+        variable is an X11 concept, so on Windows deleting it changes nothing and
+        Tk opens a window regardless. Patching the failure itself tests the
+        branch that matters on every platform.
+        """
+        import tkinter as tk
+
+        def no_display(*_a, **_k):
+            raise tk.TclError("no display name and no $DISPLAY environment variable")
+
+        monkeypatch.setattr(tk, "Tk", no_display)
         detail = selftest._check_tkinter()
         assert "skipped" in detail
         passed, _text = report()
