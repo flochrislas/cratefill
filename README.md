@@ -1,7 +1,12 @@
 # Cratefill
 
-A small desktop app that moves songs between CSV files, folders of music files,
-and your YouTube Music playlists.
+A small desktop app that feeds your YouTube Music playlists from a plain list of
+songs — a CSV file, or a folder of music files. It works the other way too, and
+exports a playlist back to CSV.
+
+Finding the right track is the hard part, so Cratefill fuzzy-matches artist and
+title instead of trusting YouTube Music's first search result. When the best
+candidate isn't clear, it asks rather than guessing.
 
 ![Cratefill screenshot](https://raw.githubusercontent.com/flochrislas/cratefill/main/docs/screenshot.png)
 
