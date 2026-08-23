@@ -120,6 +120,12 @@ def apply_dark_theme(root):
             background=BG, foreground=FG, focuscolor=BORDER,
             indicatorbackground=FIELD, indicatorforeground=ACCENT_BAR,
             upperbordercolor=BORDER, lowerbordercolor=BORDER,
+            # Bigger than clam's default, which is a ~6px dot. In the review
+            # dialog this is the only thing showing *which* candidate is armed,
+            # and it sits at the top of the window while the Add button is at the
+            # bottom — at this size it fills the ring, so selected vs not reads as
+            # blue vs empty rather than as a speck.
+            indicatorsize=16,
         )
         style.map(
             widget,
