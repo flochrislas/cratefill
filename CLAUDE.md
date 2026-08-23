@@ -30,40 +30,35 @@ py -c "import tkinter as tk; from cratefill.app import CratefillApp; r = tk.Tk()
 
 Cratefill ships to **PyPI** (`pip install cratefill`) and as a **GitHub release** carrying a standalone Windows `.exe`. The version lives in **one** place: `__version__` in `cratefill/__init__.py`. `pyproject.toml` reads it via `[tool.setuptools.dynamic]`, which is why `__init__.py` must stay import-light — setuptools reads the attribute without executing the GUI.
 
-1. Bump `__version__` in `cratefill/__init__.py`, commit, then tag and push:
+**The whole release is automated.** `.github/workflows/publish.yml` runs on any pushed `v*` tag and does everything: tests on Linux and Windows, sdist + wheel, the Windows `.exe`, PyPI, and the GitHub release with the exe attached.
+
+1. Bump `__version__` in `cratefill/__init__.py`, commit, push.
+2. Optional but recommended: run the workflow manually first (Actions → Release → **Run workflow**). With no tag it builds and verifies everything and skips both publish steps, so you can confirm the exe still builds before committing to a version.
+3. Tag and push:
 
    ```powershell
    git tag v0.2.0
    git push origin v0.2.0
    ```
 
-   Pushing a `v*` tag triggers `.github/workflows/publish.yml`, which builds the sdist + wheel and publishes to PyPI over OIDC **trusted publishing** — no token is stored. (The one-time PyPI publisher config is already done: owner `flochrislas`, repo `cratefill`, workflow `publish.yml`, environment `pypi`.) Watch the run under the repo's Actions tab.
+Publishing is **gated** on the tests passing, the tag matching `__version__`, and the frozen exe passing its own `--selftest`. That gate is deliberate: a PyPI version can never be replaced or reused, so a few CI minutes are cheap insurance. If the tag and `__version__` disagree, the run fails before anything is published — fix the version, delete the tag, re-tag.
 
-2. The Windows `.exe` is **not** built by CI (it needs a Windows runner) — build and attach it manually.
+PyPI auth is OIDC **trusted publishing**; no token is stored. **Do not rename `publish.yml`** — the PyPI publisher is bound to the filename (owner `flochrislas`, repo `cratefill`, workflow `publish.yml`, environment `pypi`), so renaming it silently breaks publishing with nothing to fall back on.
 
-   **Build a console version first and run its self-check.** `--windowed` sends startup errors nowhere, and every way a bundle breaks here is an *import-time* failure, so a `--windowed` exe with a missing module simply fails to open with no message at all:
+The exe is built twice on purpose: a console build whose `--selftest` output is visible in the CI log (that's what tells you *which* piece is missing), then the `--windowed` release build, whose `--selftest` can only report an exit code because a windowed binary has no stdout.
+
+To build the exe locally instead — for debugging a bundling problem, say:
 
    ```powershell
    py -m PyInstaller --onefile --name CratefillTest --collect-all tkinterdnd2 --collect-all ytmusicapi run_cratefill.py
-   dist\CratefillTest.exe --selftest        # exit 0 = the bundle has everything
+   dist\CratefillTest.exe --selftest
    ```
-
-   `--selftest` (see `cratefill/selftest.py`) checks rapidfuzz actually *scores*, the matching pipeline classifies both ways, the per-user data dir is writable, the settings file is readable, and ytmusicapi loads its gettext catalogues — no GUI and no login. Then build the real thing:
-
-   ```powershell
-   py -m PyInstaller --onefile --windowed --name Cratefill --collect-all tkinterdnd2 --collect-all ytmusicapi run_cratefill.py
-   gh release create v0.2.0 dist/Cratefill.exe --title "Cratefill v0.2.0" --notes "..."
-   ```
-
-   Build from `run_cratefill.py`, **not** from `cratefill/__main__.py`: bundlers run `__main__.py` as a plain script, which breaks its relative imports.
 
    Both `--collect-all` flags are required:
    - `tkinterdnd2` bundles the native tkdnd binaries — without it the frozen app crashes at `TkinterDnD.Tk()`. The self-check reports its absence as a warning, not a failure, since the app runs without it.
-   - `ytmusicapi` bundles its `locales/*.mo` gettext files — without them the first ytmusicapi call in the exe (typically `ytmusicapi.setup()` during login) dies with the misleading `[Errno 2] No translation file found for domain: 'base'`, masking the real error. `--selftest` triggers that path deliberately via `YTMusic(language="en")`, which needs no auth and no network.
+   - `ytmusicapi` bundles its `locales/*.mo` gettext files — without them the first ytmusicapi call in the exe dies with the misleading `[Errno 2] No translation file found for domain: 'base'`. `--selftest` triggers that path deliberately via `YTMusic(language="en")`, which needs no auth and no network.
 
-   `rapidfuzz` ships compiled extension modules, loaded at *import* time. PyInstaller normally picks those up on its own, but **this has not been verified on Windows yet** — if `--selftest` reports `rapidfuzz`, add `--collect-all rapidfuzz` and update this command.
-
-   Also worth confirming on Windows, since the paths are platform-specific and have only ever run on Linux: `%APPDATA%\Cratefill\browser.json` after logging in, `settings.json` beside it after changing the dropdown, and that a `browser.json` left next to the exe gets migrated on launch.
+   `rapidfuzz` ships compiled extension modules, loaded at *import* time; PyInstaller picks them up on its own (confirmed on Windows). If that ever changes, `--selftest` reports it and `--collect-all rapidfuzz` is the fix.
 
 To inspect the dists before tagging: `py -m build` then `py -m twine check dist/*`. Manual PyPI upload fallback (needs a `pypi-…` token and an **interactive** terminal — it can't be backgrounded, twine prompts for the token): `py -m twine upload dist/cratefill-<ver>*`. Build artifacts (`build/`, `dist/`, `*.spec`) are gitignored.
 

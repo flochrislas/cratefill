@@ -554,10 +554,28 @@ Two deliverables per release:
      found for domain: 'base'` — masking whatever real error would have been
      raised (bad headers, missing cookie, etc.).
 
-   This step is **not** in CI (it needs a Windows runner) — build locally
-   and `gh release create` with the exe. The README's screenshot is a
-   committed `docs/screenshot.png` referenced by absolute raw-GitHub URL so
-   it renders on the PyPI project page too.
+   This **is** in CI, on a `windows-latest` runner, and the release job
+   attaches the exe automatically. It is built twice: a console build whose
+   `--selftest` output is visible in the log, then the `--windowed` release
+   build, whose `--selftest` can only yield an exit code because a windowed
+   binary has no stdout. Building locally is now only for debugging a bundling
+   problem.
+
+   The README's screenshot is a committed `docs/screenshot.png` referenced by
+   absolute raw-GitHub URL so it renders on the PyPI project page too.
+
+**Publishing is gated.** `publish` needs the tests (Linux *and* Windows), the
+sdist/wheel build, *and* the frozen exe passing its own `--selftest`; it also
+fails if the tag disagrees with `cratefill.__version__`. A PyPI version can
+never be replaced or reused, so the gate is worth the CI minutes. The trade-off
+to know about: a PyInstaller hiccup blocks the PyPI publish too — that is
+intentional, releases are all-or-nothing.
+
+`workflow_dispatch` runs everything except the two publish jobs, so the exe
+build can be rehearsed without spending a version number.
+
+**Never rename `publish.yml`.** PyPI trusted publishing is bound to the workflow
+*filename*; renaming it breaks publishing with no stored token to fall back on.
 
 `build/`, `dist/`, and `*.spec` are gitignored.
 

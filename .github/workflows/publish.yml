@@ -1,41 +1,122 @@
-name: Publish to PyPI
+name: Release
 
-# Publishes the package to PyPI whenever a version tag (v*) is pushed.
-# Authentication is OIDC "trusted publishing" — no API token is stored.
-# One-time setup on PyPI: https://pypi.org/manage/project/cratefill/settings/publishing/
+# Pushing a version tag (v*) publishes to PyPI *and* builds, verifies and
+# attaches the standalone Windows .exe. Run it manually (workflow_dispatch) to
+# rehearse everything except publishing.
+#
+# DO NOT RENAME THIS FILE. PyPI trusted publishing is bound to the workflow
+# filename: the publisher registered at
+# https://pypi.org/manage/project/cratefill/settings/publishing/ is
 #   Owner: flochrislas | Repository: cratefill
 #   Workflow: publish.yml | Environment: pypi
+# Renaming it silently breaks publishing (no token is stored to fall back on).
+#
+# Publishing is gated on the tests, the tag matching cratefill.__version__, and
+# the frozen exe passing its own --selftest. That gate is deliberate: a PyPI
+# version can never be replaced or reused, so it is worth spending a few CI
+# minutes before committing to one.
 
 on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
 
 jobs:
-  build:
-    name: Build distributions
+  test:
+    name: Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false          # a Windows-only failure shouldn't hide a Linux one
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: python -m pip install --upgrade pip ".[dev,dnd]"
+      # tests/test_dialog.py skips itself when there is no display, so this is
+      # safe on a headless runner; Windows always has one.
+      - name: Run the test suite
+        run: python -m pytest -q
+      # Windows is where the frozen build ships and where the per-user data
+      # directory (%APPDATA%\Cratefill) actually gets exercised.
+      - name: Self-check
+        if: runner.os == 'Windows'
+        run: python -m cratefill --selftest
+
+  dists:
+    name: Build sdist and wheel
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.x"
-      - name: Build sdist and wheel
+          python-version: "3.12"
+      # The version lives only in cratefill/__init__.py. A tag that disagrees
+      # with it would publish something other than what the tag claims.
+      # No install needed: cratefill/__init__.py is import-light by design, which
+      # is the same property that lets setuptools read the version statically.
+      - name: Tag must match cratefill.__version__
+        if: startsWith(github.ref, 'refs/tags/v')
         run: |
-          python -m pip install --upgrade build
+          VERSION=$(python -c "import cratefill; print(cratefill.__version__)")
+          TAG="${GITHUB_REF_NAME#v}"
+          echo "tag=$TAG  __version__=$VERSION"
+          test "$TAG" = "$VERSION" || {
+            echo "::error::tag $GITHUB_REF_NAME does not match __version__ $VERSION"
+            exit 1
+          }
+      - name: Build
+        run: |
+          python -m pip install --upgrade build twine
           python -m build
-      - name: Check metadata
-        run: |
-          python -m pip install --upgrade twine
           python -m twine check dist/*
       - uses: actions/upload-artifact@v4
         with:
           name: dist
           path: dist/
 
+  exe:
+    name: Build and verify the Windows exe
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip pyinstaller
+          python -m pip install -r requirements.txt
+      # Two builds on purpose. A --windowed exe has no stdout, so --selftest
+      # there gives an exit code but no diagnostics; the console build is what
+      # shows *which* piece is missing in the CI log.
+      - name: Build a console exe for the self-check
+        run: >
+          python -m PyInstaller --onefile --name CratefillConsole
+          --collect-all tkinterdnd2 --collect-all ytmusicapi run_cratefill.py
+      - name: Self-check the frozen bundle
+        run: dist\CratefillConsole.exe --selftest
+      - name: Build the release exe
+        run: >
+          python -m PyInstaller --onefile --windowed --name Cratefill
+          --collect-all tkinterdnd2 --collect-all ytmusicapi run_cratefill.py
+      # No output from a windowed build, but a non-zero exit still means the
+      # bundle is missing something the console build had.
+      - name: Self-check the release exe
+        run: dist\Cratefill.exe --selftest
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Cratefill-exe
+          path: dist/Cratefill.exe
+
   publish:
     name: Publish to PyPI
-    needs: build
+    needs: [test, dists, exe]
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     environment:
       name: pypi
@@ -48,3 +129,29 @@ jobs:
           name: dist
           path: dist/
       - uses: pypa/gh-action-pypi-publish@release/v1
+
+  release:
+    name: GitHub release
+    needs: [publish]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # create the release and attach the exe
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: Cratefill-exe
+          path: dist/
+      # Create the release if it doesn't exist yet, otherwise just attach the
+      # exe — so a release drafted by hand beforehand still gets its binary.
+      - name: Publish the release with the exe attached
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/Cratefill.exe --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/Cratefill.exe \
+              --title "Cratefill $GITHUB_REF_NAME" --generate-notes
+          fi
