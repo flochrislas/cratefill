@@ -24,6 +24,8 @@ There is no linter (packaging/release commands are under **Releasing**). Headles
 py -c "import tkinter as tk; from cratefill.app import CratefillApp; r = tk.Tk(); r.withdraw(); CratefillApp(r); r.update(); r.destroy(); print('OK')"
 ```
 
+> **On a Wayland desktop, check anything visual under Xvfb — never against the real display.** XWayland reports Tk windows as unmapped and refuses screen grabs, so working code looks broken and broken code looks unverifiable. See **Gotchas** for the recipe. This has cost real time more than once; reach for Xvfb *first*, not after `DISPLAY=:0` disappoints.
+
 `tests/` covers `matching.py`, `policy.py` and `storage.py` directly, `youtube.py`'s worker functions and the review step against a fake client, and the review dialog itself (`test_dialog.py` skips without a display). No network and no `browser.json` needed. Add tests there rather than testing through the UI. Anything genuinely needing a live session (real search quality, real playlist mutation) still has to be checked manually.
 
 ## Releasing
@@ -88,8 +90,8 @@ To inspect the dists before tagging: `py -m build` then `py -m twine check dist/
 - Treat every ytmusicapi field as optional: results can have `videoId=None` (`choose_match` filters these), `artists` can be missing/`null`/hold nameless entries, `title` can be absent. Use `x.get("artists") or []`, never `x.get("artists", [])` — the latter returns `None` when the key exists with a null value and then raises.
 - **Workers must always emit `("done", …)`.** `_worker`/`_add_worker`/`_export_worker`/`_connect_worker`/`_refresh_worker` are wrappers whose `finally` puts it; the real work lives in `youtube.py`. Without that, one unexpected exception leaves Add/Export disabled until restart. `_poll_worker` reschedules itself in a `finally` for the same reason. In `_add_worker` the playlist refetch is nested inside its own `try/finally` so it can't preempt the `done`.
 - The UI is dark-only and must stay cross-platform (Windows + Linux): the theme is hand-rolled in `apply_dark_theme()` on top of the built-in `clam` theme — do not switch to platform themes (`vista`, `winnative`) or to sv-ttk (tried; it applies empty styles on this Python 3.14/Tk 8.6.15 build). When adding plain tk widgets (Text, Listbox), style them with `DARK_TEXT_STYLE`/`DARK_LIST_STYLE`; Listbox rejects `insertbackground` (that's why two dicts exist).
-- `_screenshot_preview.py` renders the app with fake data and saves `ui_preview.png` (requires `pillow`) — use it to verify UI changes visually.
-- **To screenshot the UI, run it under Xvfb, not the real desktop.** On a Wayland session, `import`/`xwd` grabs of XWayland windows work only intermittently and eventually fail with `BadMatch (X_GetImage)` or report no windows at all, with the app still running. A private X server has no compositor in the way and is fully scriptable:
+- `_screenshot_preview.py` renders the app with fake data and saves `ui_preview.png` (requires `pillow`), and is what regenerates `docs/screenshot.png` — the image the README *and* the PyPI page show. Regenerate it whenever the UI changes; it once went eleven UI commits stale. It builds its Messages pane through the real `choose_match`/`_decision_line`, so the image can't drift from actual output.
+- **Verify anything visual under Xvfb, not the real display.** On a Wayland desktop Tk runs through XWayland, which lies in both directions: `winfo_ismapped()` returns False for perfectly good windows, `import`/`xwd` grabs work intermittently then fail with `BadMatch (X_GetImage)` or report no windows at all while the app is still running, and Pillow's `ImageGrab` can't grab the root window. A private X server has no compositor in the way and is fully scriptable:
 
   ```bash
   export DISPLAY=:77 && Xvfb :77 -screen 0 1200x800x24 & sleep 1.5
@@ -97,6 +99,8 @@ To inspect the dists before tagging: `py -m build` then `py -m twine check dist/
   import -window "$(xdotool search --name '^Cratefill' | tail -1)" /tmp/shot.png
   ```
 
-  With no window manager, avoid `wait_visibility()` (it blocks forever) and call `grab_release()` on modal dialogs; keep the root window mapped rather than `withdraw()`n, then `update()` a few times before grabbing. Pillow's `ImageGrab` needs a real X display and can't grab the root window under Wayland at all.
+  Reach for this *first*. Two separate sessions were lost to it: a working `place()` overlay looked broken because XWayland said unmapped (identical code passed under Xvfb), and once grabs stopped working, a dialog "verified" by dumping its widget tree shipped with an inverted radio indicator — a widget tree cannot see a colour. **Prefer `winfo_manager()` over `winfo_ismapped()` in tests**, since it reflects `place()`/`pack()` regardless of mapping.
+
+  With no window manager, avoid `wait_visibility()` (it blocks forever) and call `grab_release()` on modal dialogs; keep the root window mapped rather than `withdraw()`n, then `update()` a few times before grabbing.
 - ttk indicator styling differs by theme: clam's `Radiobutton.indicator`/`Checkbutton.indicator` take **`indicatorbackground`/`indicatorforeground`**, not the default theme's `indicatorcolor`. Setting the wrong one is silently ignored and leaves a light circle that reads as *selected* when it isn't. Check with `style.element_options("Radiobutton.indicator")` before styling a new widget class.
 - Drag-and-drop needs `tkinterdnd2` *and* a `TkinterDnD.Tk()` root (created in `main()`). Both are optional everywhere else: the import is guarded, and `_build_ui` swallows the `TclError` from `drop_target_register` when the root is a plain `tk.Tk()` (tests, previews). Keep new code working without tkinterdnd2 installed.
