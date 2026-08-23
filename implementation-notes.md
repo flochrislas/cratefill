@@ -5,7 +5,7 @@ the app does from a user's point of view; this file explains how it's built and
 why. `RESEARCH.md` documents the alternatives that were considered before
 settling on this approach.
 
-*Last updated: 2026-08-21 — matches the `cratefill/` package as of that date (v0.1.1).*
+*Last updated: 2026-08-23 — matches the `cratefill/` package as of that date (v0.2.0).*
 
 ## Stack and key decisions
 
