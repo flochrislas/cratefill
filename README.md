@@ -15,7 +15,10 @@ and your YouTube Music playlists.
 - Cratefill won't *silently* add a song it isn't sure about. Every match is either
   **confident** (`✓`, added), **uncertain** (`?`, your choice) or **no match**
   (`✗`, skipped, with the reason given). When an uncertain match has close
-  rivals, you can pick among them before adding.
+  rivals, the prompt lists them all with their album, duration, year and explicit
+  flag — usually the only way to tell a reissue from an original — and an
+  **Open ▶** button next to each one plays it on YouTube Music so you can decide
+  by ear before adding.
 - It also tries hard not to come back empty-handed. If the exact recording isn't
   on YouTube Music but another version of the same song is — a live take, a
   remix, an acoustic version, even another band's cover — you're offered that
@@ -75,6 +78,10 @@ python3 -m cratefill
 
 Installed from PyPI (`pip install cratefill`), the `cratefill` command launches it directly.
 
+If something looks wrong — a missing dependency, an unwritable settings folder —
+`cratefill --selftest` (or `py -m cratefill --selftest`) checks each piece and
+prints what it finds, without opening the window or needing a login.
+
 ## Logging in (first time)
 
 YouTube Music has no public login API, so the app authenticates the way
@@ -126,6 +133,7 @@ See `sample.csv` for an example.
 | `cratefill/policy.py` | What to do about an uncertain match, and remembering it |
 | `cratefill/storage.py` | CSV import/export, music folders, data directory |
 | `cratefill/youtube.py` | YouTube Music calls and credential handling |
+| `cratefill/selftest.py` | `--selftest`: checks an install or a build has everything it needs |
 | `run_cratefill.py` | Entry script used to build the Windows `.exe` |
 | `tests/` | Test suite (`py -m pytest`) — no network or login needed |
 | `sample.csv` | Example CSV |
