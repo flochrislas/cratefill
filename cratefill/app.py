@@ -552,12 +552,26 @@ class CratefillApp:
         self.song_tree.pack(side="left", fill="both", expand=True)
         song_scroll.pack(side="right", fill="y")
 
-        if DND_FILES:
-            try:
-                self.song_tree.drop_target_register(DND_FILES)
-                self.song_tree.dnd_bind("<<Drop>>", self._on_drop)
-            except tk.TclError:
-                pass  # root isn't a TkinterDnD.Tk (tests/previews) — no DnD, app still works
+        dnd = self._register_drop_target(self.song_tree)
+
+        # An empty song list looks broken rather than ready, and drag-and-drop is
+        # invisible until you know it's there. This says so, in the space it's
+        # talking about, and gets out of the way the moment anything loads.
+        # Placed over the tree rather than inserted as a row: a placeholder row
+        # would land in self.songs' index mapping and in "Select all".
+        self.empty_hint = ttk.Label(
+            self.song_tree,
+            justify="center",
+            foreground=FG_DIM,
+            background=FIELD,
+            text="Drag a CSV file or a folder of music here\n\n"
+                 "or use Load CSV… / Load folder… above"
+            if dnd else "Use Load CSV… or Load folder… above to get started",
+        )
+        # Dropping onto the hint itself must work — it covers the middle of the
+        # target it is advertising.
+        self._register_drop_target(self.empty_hint)
+        self._refresh_empty_hint()
 
         # Right pane: account + playlists
         right = ttk.LabelFrame(panes, text="YouTube Music", padding=4)
@@ -654,6 +668,30 @@ class CratefillApp:
         if persist and not policy.save_policy(value):
             self.log(f"Could not save your preference to {policy.SETTINGS_FILE}")
 
+    def _register_drop_target(self, widget):
+        """Let `widget` accept dropped files. True if drag-and-drop really works.
+
+        False when tkinterdnd2 isn't installed, or when the root is a plain
+        tk.Tk() rather than a TkinterDnD.Tk() — which is the case in tests and
+        the screenshot preview. The return value decides whether the UI is
+        allowed to *advertise* dropping.
+        """
+        if not DND_FILES:
+            return False
+        try:
+            widget.drop_target_register(DND_FILES)
+            widget.dnd_bind("<<Drop>>", self._on_drop)
+        except tk.TclError:
+            return False
+        return True
+
+    def _refresh_empty_hint(self):
+        """Show the drop hint only while the song list is empty."""
+        if self.songs:
+            self.empty_hint.place_forget()
+        else:
+            self.empty_hint.place(relx=0.5, rely=0.45, anchor="center")
+
     def refresh_add_button(self):
         """Outline the Add button in green once there is something to add.
 
@@ -743,6 +781,7 @@ class CratefillApp:
         for col, label in SONG_COLUMNS:
             self.song_tree.heading(col, text=label)
         self.refresh_add_button()
+        self._refresh_empty_hint()
 
     def sort_songs(self, col):
         """Sort rows by a column; clicking the same column again reverses.

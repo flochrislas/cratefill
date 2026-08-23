@@ -371,3 +371,53 @@ class TestOpenButton:
         dialog._open(video_id)
         assert opened == [f"https://music.youtube.com/watch?v={expected}"]
         dialog.destroy()
+
+
+class TestEmptyListHint:
+    """An empty song list looks broken rather than ready, and drag-and-drop is
+    invisible until you know it's there."""
+
+    def app(self, root):
+        from cratefill.app import CratefillApp
+        app = CratefillApp(root)
+        root.update()
+        return app
+
+    def shown(self, app):
+        # winfo_ismapped() is unreliable on a compositor that won't map windows;
+        # the geometry manager reflects place()/place_forget() either way.
+        return app.empty_hint.winfo_manager() == "place"
+
+    def test_shown_while_the_list_is_empty(self, root):
+        assert self.shown(self.app(root)) is True
+
+    def test_hidden_once_songs_load(self, root):
+        app = self.app(root)
+        app.songs = [("Phoenix", "Lisztomania", "")]
+        app.populate_song_tree()
+        assert self.shown(app) is False
+
+    def test_returns_when_the_list_is_cleared(self, root):
+        app = self.app(root)
+        app.songs = [("Phoenix", "Lisztomania", "")]
+        app.populate_song_tree()
+        app.songs = []
+        app.populate_song_tree()
+        assert self.shown(app) is True
+
+    def test_it_does_not_become_a_row_in_the_song_list(self, root):
+        """A placeholder *row* would land in self.songs' index mapping and in
+        "Select all"; this is an overlay precisely to avoid that."""
+        app = self.app(root)
+        assert app.song_tree.get_children() == ()
+
+    def test_it_only_advertises_dropping_when_dropping_works(self, root):
+        """The tests use a plain tk.Tk(), where tkinterdnd2 can't register a drop
+        target — so promising drag-and-drop here would be a lie."""
+        app = self.app(root)
+        assert "Drag" not in app.empty_hint.cget("text")
+        assert "Load CSV" in app.empty_hint.cget("text")
+
+    def test_register_drop_target_reports_failure_rather_than_raising(self, root):
+        app = self.app(root)
+        assert app._register_drop_target(app.song_tree) is False
