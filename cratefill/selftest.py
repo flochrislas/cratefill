@@ -41,7 +41,7 @@ def _check_matching():
         raise AssertionError(f"an exact match came back {exact.status!r}")
     if unrelated.status != "rejected":
         raise AssertionError(f"an unrelated result came back {unrelated.status!r}")
-    return "exact match → high, unrelated → rejected"
+    return "exact match -> high, unrelated -> rejected"
 
 
 def _check_storage():
