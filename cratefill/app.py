@@ -20,6 +20,7 @@ import tkinter as tk
 import webbrowser
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
+from urllib.parse import quote
 
 from . import policy, youtube
 from .storage import read_songs_csv, read_songs_folder
@@ -127,6 +128,11 @@ def apply_dark_theme(root):
             indicatorbackground=[("disabled", BG), ("pressed", BTN_ACTIVE)],
             indicatorforeground=[("disabled", FG_DIM)],
         )
+    # Every label in the review dialog wraps except the candidate radios, which
+    # would otherwise let one long "Artist — Title (Live at …)" drag the dialog
+    # wider than the screen. ttk.Radiobutton takes no `wraplength` argument, but
+    # its label element does through a style.
+    style.configure("Choice.TRadiobutton", wraplength=430)
 
     style.configure("Treeview", background=FIELD, fieldbackground=FIELD, rowheight=24)
     style.map(
@@ -315,7 +321,7 @@ def candidate_meta(result):
     if not isinstance(result, dict):
         return ""
     parts = []
-    album = (result.get("album") or {}) if isinstance(result.get("album"), dict) else {}
+    album = result.get("album") if isinstance(result.get("album"), dict) else {}
     if album.get("name"):
         parts.append(str(album["name"]))
     if result.get("duration"):
@@ -387,6 +393,7 @@ class AmbiguousMatchDialog(tk.Toplevel):
                 value=index,
                 variable=self.choice_var,
                 command=self._select,
+                style="Choice.TRadiobutton",  # wrapped; see apply_dark_theme
             ).pack(side="left", anchor="w")
             # Only offer "Open" when there's actually something to open: a result
             # without a videoId can't be played, and can't be added either.
@@ -437,13 +444,23 @@ class AmbiguousMatchDialog(tk.Toplevel):
         """Open the candidate on music.youtube.com so the user can hear it.
 
         The dialog stays up: this is a preview aid for the pending decision, not
-        an action of its own. Guarded because a missing default browser is a
-        recoverable problem — dying here would drop the whole ambiguous match.
+        an action of its own. Failure is caught because a missing default browser
+        is recoverable — dying here would drop the whole ambiguous match — but it
+        is *told* to the user rather than swallowed: a click that does nothing at
+        all is indistinguishable from a broken button.
+
+        The id is quoted even though it comes from the API: it is interpolated
+        into a URL handed to the OS, and "trusted input" is a bad habit there.
         """
+        url = f"https://music.youtube.com/watch?v={quote(str(video_id), safe='')}"
         try:
-            webbrowser.open(f"https://music.youtube.com/watch?v={video_id}")
-        except Exception:      # noqa: BLE001 — reported through the log, not fatal
-            pass
+            webbrowser.open(url)
+        except Exception as e:      # noqa: BLE001 — a failed preview must not lose the match
+            messagebox.showwarning(
+                "Cratefill",
+                f"Could not open a browser to preview this track.\n\n{url}\n\nDetails: {e}",
+                parent=self,
+            )
 
     def _choose(self, action):
         self._select()

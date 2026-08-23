@@ -338,13 +338,36 @@ class TestOpenButton:
         assert opened == ["https://music.youtube.com/watch?v=v1"]
         dialog.destroy()
 
-    def test_open_swallows_browser_errors(self, root, monkeypatch, decision):
+    def test_open_reports_browser_errors_without_losing_the_match(self, root, monkeypatch,
+                                                                  decision):
         """A broken default browser is a recoverable annoyance, not a reason to
-        drop the whole pending match."""
+        drop the whole pending match — but it is *told* to the user, because a
+        click that silently does nothing is indistinguishable from a dead button.
+        """
         def boom(_url):
             raise OSError("no browser configured")
+        warned = []
         monkeypatch.setattr("cratefill.app.webbrowser.open", boom)
+        monkeypatch.setattr("cratefill.app.messagebox.showwarning",
+                            lambda *a, **k: warned.append(a[1]))
         dialog = open_dialog(root, decision)
         dialog._open("v1")     # must not raise
-        assert dialog.action is None
+        assert dialog.action is None, "the decision is still pending"
+        assert warned and "Could not open a browser" in warned[0]
+        dialog.destroy()
+
+    @pytest.mark.parametrize("video_id, expected", [
+        ("abc123", "abc123"),
+        ("a b&c", "a%20b%26c"),            # nothing can slip out of the query value
+        ("../evil", "..%2Fevil"),
+    ])
+    def test_the_video_id_is_url_encoded(self, root, monkeypatch, decision, video_id,
+                                         expected):
+        """The id comes from an unofficial API and ends up in a URL handed to the
+        OS, so it is quoted rather than trusted."""
+        opened = []
+        monkeypatch.setattr("cratefill.app.webbrowser.open", lambda url: opened.append(url))
+        dialog = open_dialog(root, decision)
+        dialog._open(video_id)
+        assert opened == [f"https://music.youtube.com/watch?v={expected}"]
         dialog.destroy()

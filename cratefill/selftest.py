@@ -91,7 +91,7 @@ def _check_tkinter():
     try:
         root = tk.Tk()
     except tk.TclError as exc:
-        return f"skipped — no display ({exc})"
+        return f"skipped - no display ({exc})"
     try:
         root.withdraw()
         apply_dark_theme(root)
@@ -106,7 +106,7 @@ def _check_dragdrop():
     from . import app
 
     if app.TkinterDnD is None:
-        raise AssertionError("not bundled — the app works, minus drag and drop")
+        raise AssertionError("not bundled - the app works, minus drag and drop")
     return "available"
 
 
@@ -121,12 +121,34 @@ CHECKS = (
 )
 
 
+def _emit(out, text):
+    """Print a line that cannot fail on the console's encoding.
+
+    A diagnostic must never die on its own output. Windows consoles are still
+    routinely cp1252, cp850 or cp437, and the text here isn't all ours: a data
+    directory can contain accented characters, and an exception message can
+    contain anything at all. Unencodable characters become "?" rather than a
+    UnicodeEncodeError that hides every remaining check and exits non-zero —
+    which reads as "this build is broken" when it isn't.
+    """
+    try:
+        print(text, file=out)
+    except UnicodeEncodeError:
+        encoding = getattr(out, "encoding", None) or "ascii"
+        print(text.encode(encoding, errors="replace").decode(encoding, errors="replace"),
+              file=out)
+
+
 def run(out=None):
-    """Run every check, print a report, and return True if the build is usable."""
-    out = out or sys.stdout
+    """Run every check, print a report, and return True if the build is usable.
+
+    `out=None` means sys.stdout, which is None itself in a --windowed build —
+    print() is a no-op there, so the exit code still works for a script.
+    """
+    out = out if out is not None else sys.stdout
     frozen = " (frozen)" if getattr(sys, "frozen", False) else ""
-    print(f"Cratefill self-test{frozen} — Python {sys.version.split()[0]} on {sys.platform}",
-          file=out)
+    _emit(out, f"Cratefill self-test{frozen} - Python {sys.version.split()[0]}"
+               f" on {sys.platform}")
 
     failures = 0
     for name, importance, check in CHECKS:
@@ -136,13 +158,19 @@ def run(out=None):
             detail = f"{type(exc).__name__}: {exc}" if not isinstance(exc, AssertionError) else str(exc)
             mark = "warn" if importance is OPTIONAL else "FAIL"
             failures += importance is REQUIRED
-        print(f"  [{mark:>4}] {name:<12} {detail}", file=out)
+        _emit(out, f"  [{mark:>4}] {name:<12} {detail}")
 
-    print("PASS — this build has everything it needs" if not failures
-          else f"FAIL — {failures} required check(s) failed", file=out)
+    _emit(out, "PASS - this build has everything it needs" if not failures
+               else f"FAIL - {failures} required check(s) failed")
     return not failures
 
 
 def main():
     """Entry point for `--selftest`. Returns a process exit code."""
+    # Belt and braces with _emit: on a legacy console this makes *every* write
+    # lossy-but-safe, including any a future check adds.
+    try:
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, OSError, ValueError):
+        pass  # no stdout (--windowed), or not a reconfigurable stream
     return 0 if run() else 1
