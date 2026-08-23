@@ -6,7 +6,7 @@ import pytest
 tk = pytest.importorskip("tkinter")
 
 from cratefill import policy                     # noqa: E402
-from cratefill.app import AmbiguousMatchDialog, apply_dark_theme   # noqa: E402
+from cratefill.app import AmbiguousMatchDialog, apply_dark_theme, candidate_meta   # noqa: E402
 from cratefill.matching import Candidate, MatchDecision     # noqa: E402
 
 
@@ -22,9 +22,11 @@ def root():
     r.destroy()
 
 
-def candidate(vid, title, artist="Oasis", score=0.9, reasons=()):
-    return Candidate({"videoId": vid, "title": title, "artists": [{"name": artist}]},
-                     title_score=score, artist_score=score, overall_score=score,
+def candidate(vid, title, artist="Oasis", score=0.9, reasons=(), extras=None):
+    result = {"videoId": vid, "title": title, "artists": [{"name": artist}]}
+    if extras:
+        result.update(extras)
+    return Candidate(result, title_score=score, artist_score=score, overall_score=score,
                      relation="same", reasons=list(reasons))
 
 
@@ -202,3 +204,147 @@ class TestStartupPolicyMigration:
         app = self.launch(root, monkeypatch, (False, True))
         assert app.ambiguous_policy == "add"
         assert app.policy_combo.get() == "Always add"
+
+
+class TestCandidateMeta:
+    """The per-candidate metadata line is the whole reason the dialog can now
+    tell apart two results that share exact artist and title (the reissue vs
+    original case). Every field is optional in the ytmusicapi response, so every
+    combination has to degrade gracefully."""
+
+    def result(self, **fields):
+        base = {"videoId": "v1", "title": "t", "artists": [{"name": "a"}]}
+        base.update(fields)
+        return base
+
+    def test_all_four_fields_when_all_are_present(self):
+        assert candidate_meta(self.result(
+            album={"name": "Tiki"}, duration="4:07", year=2003, isExplicit=True,
+        )) == "Tiki · 4:07 · 2003 · E"
+
+    def test_explicit_false_produces_no_badge(self):
+        """Only tracks flagged explicit get the badge — the whole point is to
+        pick them out from clean versions, so a false shouldn't be shown."""
+        assert "E" not in candidate_meta(self.result(
+            album={"name": "Tiki"}, duration="4:07", isExplicit=False,
+        ))
+
+    def test_missing_album_does_not_break_the_rest(self):
+        assert candidate_meta(self.result(duration="4:07")) == "4:07"
+
+    def test_missing_everything_returns_empty(self):
+        """The caller checks for this and skips the label entirely — an empty
+        line under the radio would just look like a UI bug."""
+        assert candidate_meta(self.result()) == ""
+
+    def test_year_shows_when_populated(self):
+        assert "2003" in candidate_meta(self.result(year=2003))
+
+    def test_survives_a_null_album_shape(self):
+        """ytmusicapi is unofficial; `album` has been seen as None or missing.
+        The helper has to eat that without an AttributeError."""
+        assert candidate_meta(self.result(album=None, duration="3:00")) == "3:00"
+
+    def test_survives_a_non_dict_result(self):
+        assert candidate_meta(None) == ""
+        assert candidate_meta("not a result") == ""
+
+
+class TestCandidateMetadataInDialog:
+    """The dialog has to actually render what candidate_meta produces — a helper
+    that works but isn't wired in wouldn't help the user pick anything."""
+
+    def decision_with_metadata(self):
+        return MatchDecision(
+            "ambiguous",
+            candidate=candidate("v1", "Manyaka O Brazil", artist="Richard Bona",
+                                score=0.78, extras={
+                                    "album": {"name": "TIKI"}, "duration": "4:08",
+                                }),
+            reasons=["another candidate scores almost the same"],
+            alternatives=[
+                candidate("v2", "Manyaka O Brazil", artist="Richard Bona", score=0.78,
+                          extras={"album": {"name": "Tiki"}, "duration": "4:07"}),
+                candidate("v3", "Manyaka O Brazil", artist="Richard Bona", score=0.78,
+                          extras={"album": {"name": "This Is Richard Bona"},
+                                  "duration": "4:07"}),
+            ],
+        )
+
+    def test_each_candidate_shows_its_own_album_and_duration(self, root):
+        """This is the real user-facing win: three otherwise-identical rows are
+        now distinguishable at a glance."""
+        dialog = open_dialog(root, self.decision_with_metadata())
+        shown = " | ".join(shown_text(dialog))
+        assert "TIKI · 4:08" in shown
+        assert "Tiki · 4:07" in shown
+        assert "This Is Richard Bona · 4:07" in shown
+        dialog.destroy()
+
+    def test_candidate_without_metadata_still_renders(self, root, decision):
+        """The Wonderwall fixtures carry no album/duration — the row must still
+        show, with the reason and radio intact, just without the meta line."""
+        dialog = open_dialog(root, decision)
+        shown = " | ".join(shown_text(dialog))
+        assert "Wonderwall (Deluxe)" in shown
+        assert "almost the same" in shown             # reason still there
+        dialog.destroy()
+
+
+def _find_widgets(widget, cls):
+    """Every descendant widget of the given ttk class name."""
+    out = []
+    for child in widget.winfo_children():
+        if child.winfo_class() == cls:
+            out.append(child)
+        out.extend(_find_widgets(child, cls))
+    return out
+
+
+class TestOpenButton:
+    """Clicking "Open" opens the candidate in music.youtube.com so the user can
+    hear it before deciding — the one field a dialog can't summarise is what the
+    track actually sounds like."""
+
+    def test_open_button_appears_per_candidate(self, root, decision_with_alternatives):
+        dialog = open_dialog(root, decision_with_alternatives)
+        buttons = [b for b in _find_widgets(dialog, "TButton")
+                   if str(b.cget("text")).startswith("Open")]
+        # One Open per candidate, plus Skip and Add at the bottom — the two
+        # bottom actions are excluded by the "Open" text filter.
+        assert len(buttons) == len(decision_with_alternatives.choices)
+        dialog.destroy()
+
+    def test_open_button_hidden_when_result_has_no_video_id(self, root):
+        """A result without a videoId can't be added *or* played, so offering
+        the button would be a lie."""
+        no_vid = Candidate({"videoId": None, "title": "t", "artists": [{"name": "a"}]},
+                           title_score=0.7, artist_score=0.7, overall_score=0.7,
+                           relation="same", reasons=["thin"])
+        d = MatchDecision("weak", candidate=no_vid, reasons=["thin"])
+        dialog = open_dialog(root, d)
+        assert not [b for b in _find_widgets(dialog, "TButton")
+                    if str(b.cget("text")).startswith("Open")]
+        dialog.destroy()
+
+    def test_clicking_open_calls_the_browser(self, root, monkeypatch, decision):
+        """Verifies the URL shape (music.youtube.com/watch?v=<vid>) and that
+        clicking one candidate's Open opens *that* candidate, not the winner."""
+        opened = []
+        monkeypatch.setattr("cratefill.app.webbrowser.open",
+                            lambda url: opened.append(url) or True)
+        dialog = open_dialog(root, decision)
+        dialog._open("v1")
+        assert opened == ["https://music.youtube.com/watch?v=v1"]
+        dialog.destroy()
+
+    def test_open_swallows_browser_errors(self, root, monkeypatch, decision):
+        """A broken default browser is a recoverable annoyance, not a reason to
+        drop the whole pending match."""
+        def boom(_url):
+            raise OSError("no browser configured")
+        monkeypatch.setattr("cratefill.app.webbrowser.open", boom)
+        dialog = open_dialog(root, decision)
+        dialog._open("v1")     # must not raise
+        assert dialog.action is None
+        dialog.destroy()

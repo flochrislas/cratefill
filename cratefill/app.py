@@ -17,6 +17,7 @@ import queue
 import sys
 import threading
 import tkinter as tk
+import webbrowser
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -300,6 +301,32 @@ class LoginDialog(tk.Toplevel):
         )
 
 
+def candidate_meta(result):
+    """One-line album/duration/year/explicit summary for a search result.
+
+    Every piece is optional — the ytmusicapi search shape is not guaranteed and
+    older or non-album tracks routinely miss `album`, `duration` or `year`. Joined
+    with " · " so the row stays readable even when only one field is present, and
+    returns "" when there is nothing to say (the caller then skips the label
+    entirely). This is what makes the dialog able to tell apart two candidates
+    that share exact artist + title — the case the reason line alone can't
+    disambiguate.
+    """
+    if not isinstance(result, dict):
+        return ""
+    parts = []
+    album = (result.get("album") or {}) if isinstance(result.get("album"), dict) else {}
+    if album.get("name"):
+        parts.append(str(album["name"]))
+    if result.get("duration"):
+        parts.append(str(result["duration"]))
+    if result.get("year"):
+        parts.append(str(result["year"]))
+    if result.get("isExplicit"):
+        parts.append("E")     # matches YouTube Music's own explicit badge
+    return " · ".join(parts)
+
+
 class AmbiguousMatchDialog(tk.Toplevel):
     """Asks what to do about one match that isn't certain.
 
@@ -350,13 +377,35 @@ class AmbiguousMatchDialog(tk.Toplevel):
         for index, candidate in enumerate(self.choices):
             row = ttk.Frame(body)
             row.pack(fill="x", anchor="w", padx=(12, 0))
+            # Radio + "Open" share the top line so the button lines up with the
+            # score, which is what the user's eye tracks along.
+            head = ttk.Frame(row)
+            head.pack(fill="x", anchor="w")
             ttk.Radiobutton(
-                row,
+                head,
                 text=f"{candidate.label}   ({candidate.overall_score:.2f})",
                 value=index,
                 variable=self.choice_var,
                 command=self._select,
-            ).pack(anchor="w")
+            ).pack(side="left", anchor="w")
+            # Only offer "Open" when there's actually something to open: a result
+            # without a videoId can't be played, and can't be added either.
+            if candidate.video_id:
+                ttk.Button(
+                    head,
+                    text="Open ▶",
+                    width=8,
+                    command=lambda vid=candidate.video_id: self._open(vid),
+                ).pack(side="right")
+            # Album · duration · year · E — the fields that let the user tell
+            # apart candidates whose artist and title are identical (reissues,
+            # compilations, clean vs explicit). Skipped entirely when the result
+            # carries none of them, rather than showing an empty line.
+            meta = candidate_meta(candidate.result)
+            if meta:
+                ttk.Label(row, text=meta, foreground=FG_DIM, wraplength=480).pack(
+                    anchor="w", padx=(24, 0)
+                )
             detail = candidate.reason or "matches exactly"
             ttk.Label(row, text=detail, foreground=FG_DIM, wraplength=480).pack(
                 anchor="w", padx=(24, 0), pady=(0, 6)
@@ -383,6 +432,18 @@ class AmbiguousMatchDialog(tk.Toplevel):
 
     def _select(self):
         self.chosen = self.choices[self.choice_var.get()]
+
+    def _open(self, video_id):
+        """Open the candidate on music.youtube.com so the user can hear it.
+
+        The dialog stays up: this is a preview aid for the pending decision, not
+        an action of its own. Guarded because a missing default browser is a
+        recoverable problem — dying here would drop the whole ambiguous match.
+        """
+        try:
+            webbrowser.open(f"https://music.youtube.com/watch?v={video_id}")
+        except Exception:      # noqa: BLE001 — reported through the log, not fatal
+            pass
 
     def _choose(self, action):
         self._select()
