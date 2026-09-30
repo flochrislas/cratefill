@@ -222,6 +222,50 @@ class Stub:
         return out
 
 
+def track(title, like_status):
+    return {"videoId": "v-" + title, "title": title,
+            "artists": [{"name": "Phoenix"}], "likeStatus": like_status}
+
+
+class TestExportPlaylistsToCsv:
+    TRACKS = [track("Lisztomania", "LIKE"), track("1901", "INDIFFERENT"),
+              track("Fences", "DISLIKE"), track("Rome", None), track("Armistice", "LIKE")]
+
+    @staticmethod
+    def exported_titles(dest):
+        (path,) = dest.glob("*.csv")
+        rows = path.read_text(encoding="utf-8").splitlines()[1:]
+        return [row.split(",")[1] for row in rows]
+
+    def test_exports_every_track_by_default(self, tmp_path):
+        youtube.export_playlists_to_csv(
+            FakeYT(existing_tracks=self.TRACKS), [PLAYLIST], tmp_path, [].append
+        )
+        assert self.exported_titles(tmp_path) == [
+            "Lisztomania", "1901", "Fences", "Rome", "Armistice"
+        ]
+
+    def test_liked_only_keeps_just_the_liked_tracks(self, tmp_path):
+        """Not liked, disliked and unknown (None) are all left out."""
+        out = []
+        youtube.export_playlists_to_csv(
+            FakeYT(existing_tracks=self.TRACKS), [PLAYLIST], tmp_path, out.append,
+            liked_only=True,
+        )
+        assert self.exported_titles(tmp_path) == ["Lisztomania", "Armistice"]
+        assert any("2 liked of 5 tracks" in line for line in kinds(out, "log"))
+
+    def test_liked_only_writes_no_file_when_nothing_is_liked(self, tmp_path):
+        out = []
+        youtube.export_playlists_to_csv(
+            FakeYT(existing_tracks=[track("1901", "INDIFFERENT")]), [PLAYLIST],
+            tmp_path, out.append, liked_only=True,
+        )
+        assert list(tmp_path.glob("*.csv")) == []
+        assert any("No liked songs in 'Road trip'" in line for line in kinds(out, "log"))
+        assert kinds(out, "step") == [None], "the progress bar must still advance"
+
+
 class TestCompletionGuarantee:
     """The Add/Export buttons only come back on ("done", …); a worker that dies
     without emitting it leaves the UI disabled until restart."""
@@ -229,7 +273,7 @@ class TestCompletionGuarantee:
     @pytest.mark.parametrize("worker, args", [
         ("_worker", ("songs", "playlists")),
         ("_add_worker", (["v1"], "playlists")),
-        ("_export_worker", ("playlists", "dest")),
+        ("_export_worker", ("playlists", "dest", False)),
     ])
     def test_done_is_emitted_even_when_the_work_explodes(self, worker, args, monkeypatch):
         def boom(*a, **k):

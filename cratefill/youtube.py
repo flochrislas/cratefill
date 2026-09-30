@@ -270,13 +270,26 @@ def add_video_ids_to_playlists(yt, video_ids, playlists, put):
     put(("log", "--- Done. ---"))
 
 
-def export_playlists_to_csv(yt, playlists, dest, put):
-    """Fetch each playlist's tracks and write a CSV per playlist."""
+def export_playlists_to_csv(yt, playlists, dest, put, liked_only=False):
+    """Fetch each playlist's tracks and write a CSV per playlist.
+
+    With liked_only, keep just the tracks whose likeStatus is "LIKE". A like
+    belongs to one videoId, so liking another upload of the same song doesn't
+    count. A playlist with no liked tracks gets no file.
+    """
     for pl in playlists:
         try:
-            tracks = yt.get_playlist(pl["playlistId"], limit=None).get("tracks", [])
-            path = write_playlist_csv(pl["title"], tracks, dest)
-            put(("log", f"→ Saved '{pl['title']}' ({len(tracks)} tracks) to {path.name}"))
+            tracks = yt.get_playlist(pl["playlistId"], limit=None).get("tracks") or []
+            if not liked_only:
+                path = write_playlist_csv(pl["title"], tracks, dest)
+                put(("log", f"→ Saved '{pl['title']}' ({len(tracks)} tracks) to {path.name}"))
+            elif liked := [t for t in tracks if t.get("likeStatus") == "LIKE"]:
+                path = write_playlist_csv(pl["title"], liked, dest)
+                put(("log", f"→ Saved '{pl['title']}' ({len(liked)} liked of "
+                            f"{len(tracks)} tracks) to {path.name}"))
+            else:
+                put(("log", f"→ No liked songs in '{pl['title']}' "
+                            f"({len(tracks)} tracks), nothing saved"))
         except Exception as e:
             put(("log", f"→ Failed to export '{pl['title']}': {e}"))
         put(("step", None))

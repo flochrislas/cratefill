@@ -594,6 +594,12 @@ class CratefillApp:
         self.account_label = ttk.Label(right_top, text="Not logged in")
         self.account_label.pack(side="left", padx=8)
 
+        self.liked_only_var = tk.BooleanVar(value=False)
+        self.liked_only_check = ttk.Checkbutton(
+            right, text="Export only the songs I liked", variable=self.liked_only_var
+        )
+        self.liked_only_check.pack(anchor="w", pady=(0, 6))
+
         self.playlist_list = tk.Listbox(
             right, selectmode="extended", exportselection=False, **DARK_LIST_STYLE
         )
@@ -637,6 +643,7 @@ class CratefillApp:
         # a job by _start_work — see there for why Log in and Refresh count.
         self.busy_controls = (
             self.add_button, self.export_button, self.login_button, self.refresh_button,
+            self.liked_only_check,  # read when Export starts; changing it mid-run would do nothing
         )
 
     # ---------- Ambiguous-match policy ----------
@@ -966,10 +973,13 @@ class CratefillApp:
         dest = filedialog.askdirectory(title="Choose where to save the CSV file(s)")
         if not dest:
             return
+        liked_only = self.liked_only_var.get()
         self._start_work(maximum=len(selected))
-        self.log(f"--- Exporting {len(selected)} playlist(s) to {dest} ---")
+        what = "liked songs of " if liked_only else ""
+        self.log(f"--- Exporting {what}{len(selected)} playlist(s) to {dest} ---")
         threading.Thread(
-            target=self._export_worker, args=(self.yt, selected, dest), daemon=True
+            target=self._export_worker, args=(self.yt, selected, dest, liked_only),
+            daemon=True,
         ).start()  # snapshot self.yt — see add_songs
 
     def _start_work(self, maximum=None):
@@ -1033,13 +1043,15 @@ class CratefillApp:
             finally:                              # still off the UI thread
                 put(("done", None))
 
-    def _export_worker(self, yt, playlists, dest):
+    def _export_worker(self, yt, playlists, dest, liked_only):
         """Background thread entry point: always reports completion.
 
         See _worker for why the try/finally is not optional.
         """
         try:
-            youtube.export_playlists_to_csv(yt, playlists, dest, self.worker_queue.put)
+            youtube.export_playlists_to_csv(
+                yt, playlists, dest, self.worker_queue.put, liked_only=liked_only
+            )
         except Exception as e:
             self.worker_queue.put(
                 ("log", f"✗ Unexpected error while exporting: {type(e).__name__}: {e}")
