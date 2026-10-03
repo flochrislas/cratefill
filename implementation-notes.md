@@ -160,9 +160,9 @@ The stages, all in `matching.py`:
    won't split (`Cœur → coeur`, `ß → ss`) and interior `!`/`$` → `i`/`s` for
    stylised names (`P!nk → pink`, `Ke$ha → kesha`).
 4. **Keep version information — but only where it lives.** Hard markers are live,
-   remix, acoustic, instrumental, karaoke, cover, demo, radio edit, extended,
-   sped up, slowed, clean, explicit. `version_markers()` looks for them **only in
-   metadata positions** (`metadata_segments()`: bracketed groups, and a trailing
+   remix, acoustic, instrumental, karaoke, cover, demo, extended, sped up,
+   slowed, clean, explicit, reprise, medley. `version_markers()` looks for them
+   **only in metadata positions** (`metadata_segments()`: bracketed groups, and a trailing
    `- …` segment — YouTube Music uses both forms). Scanning the whole title
    instead was a real bug: songs actually called *Clean*, *Stereo* and *Live and
    Let Die* were reduced to empty strings and then **rejected as no match**. The
@@ -173,8 +173,8 @@ The stages, all in `matching.py`:
    group **whole** rather than word by word, because `(Live at Wembley)` is one
    piece of metadata — keeping `at wembley` made the live take look like a
    different song and dragged it below an unrelated band's studio cut. Soft
-   markers (remastered, deluxe, anniversary, album version, official video…) and
-   `feat. X` go the same way, which is why `Wonderwall` scores 1.00 against both
+   markers (remastered, deluxe, anniversary, album version, radio edit, official
+   video…) and `feat. X` go the same way, which is why `Wonderwall` scores 1.00 against both
    `Wonderwall (Remastered)` and `Wonderwall (Live at Wembley)`.
 
    Two backstops guard the identity of the song: `core_title()` **never returns
@@ -236,14 +236,23 @@ The stages, all in `matching.py`:
    scores, `relation` and `reasons`, ranked by `base × (1 − version penalty)`
    where `base = 0.65·title + 0.35·artist`. Only candidates with no shared
    content word are dropped. `high` needs `HIGH_TITLE` / `HIGH_ARTIST`,
-   `relation == "same"`, *and* a `WINNER_MARGIN` lead over the runner-up.
+   `relation == "same"`, *and* a `WINNER_MARGIN` lead over the runner-up —
+   — unless some results are *versions* of the requested song, which decide on
+   their own (`_decide_versions`). A version (`_is_same_song`) has the
+   requested artist and title once spaces and everything in brackets, of any
+   type and on either side, are ignored (`match_key`), or scores at the `high`
+   thresholds on both. One distinct version is `high` whatever its brackets
+   say — there is nothing to choose. Several are `ambiguous` ("N versions of
+   this song found") with every version listed, since the user may want more
+   than one; identical titles (album and single) count once. Score ties are broken towards the literal title, then a
+   metadata-only difference, never by YouTube Music's listing order.
    Otherwise `_classify()` returns `weak` when the winner is below `WEAK_TITLE`
    or `WEAK_ARTIST`, else `ambiguous` — with `reasons` naming each shortfall,
    including which artist was actually found.
 
    `MatchDecision.alternatives` holds the runners-up as `Candidate`s, and
    `.choices` is the winner followed by them — that's what the review dialog
-   renders as a radio list. Keeping the scores and reasons on the candidate is
+   renders as a checkbox list. Keeping the scores and reasons on the candidate is
    what lets the UI list rivals without recomputing anything.
 
 All thresholds are module constants at the top of the file. They encode one
@@ -438,11 +447,13 @@ anything.
    can call `_start_work()` again. Each decision goes through
    `policy.action_for_match()`; `"ask"` results open `AmbiguousMatchDialog`
    sequentially. The dialog shows the request, the decision-level reason, and
-   `decision.choices` as a **radio list** — the proposal plus its near-scoring
-   rivals, each with its own score and shortfall. Whichever is selected becomes
-   `dialog.chosen`, and that is the videoId `_review_and_add` approves: the
-   top-ranked candidate is not always the one the user wants, which is exactly
-   what "another candidate scores almost the same" is telling them. Ticking "use
+   `decision.choices` as a **checkbox list** — the proposal plus its near-scoring
+   rivals, each with its own score and shortfall. The proposal starts ticked;
+   whatever is ticked becomes the `dialog.chosen` list, and those are the
+   videoIds `_review_and_add` approves: the top-ranked candidate is not always
+   the one the user wants, which is exactly what "another candidate scores
+   almost the same" is telling them — and sometimes they want several. Add is
+   disabled while nothing is ticked. Ticking "use
    this choice for future ambiguous matches" calls `set_ambiguous_policy()`,
    which saves the setting, updates the dropdown, and therefore governs the
    *remaining* songs in the same run (the checkbox is hidden for `weak`
@@ -626,11 +637,12 @@ script or CI. See `cratefill/selftest.py` and the **Releasing** section.
   threading patched out: high-confidence added without prompting under every
   policy, rejected never added under any policy, skip/add policies applied
   without a prompt, remembering a choice governing the rest of the run, weak
-  matches prompting even with `add` saved, picking an alternative changing what
-  gets added, and a cancelled review mutating nothing at all.
+  matches prompting even with `add` saved, picking an alternative (or several)
+  changing what gets added, and a cancelled review mutating nothing at all.
 - **`tests/test_dialog.py`** — `AmbiguousMatchDialog` itself: what it displays,
-  the alternatives radio list (every candidate listed with its own shortfall,
-  the winner selected by default, picking another changing `chosen`), Skip/Add,
+  the alternatives checkbox list (every candidate listed with its own shortfall,
+  the winner ticked by default, ticking others changing `chosen`, Add disabled
+  with nothing ticked), Skip/Add,
   the remember checkbox, the weak-match caption and its hidden checkbox, and
   that Escape or closing the window leaves `action` as `None` (which the caller
   reads as "cancel the import"). Skips automatically when there's no display.

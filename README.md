@@ -23,12 +23,15 @@ candidate isn't clear, it asks rather than guessing.
   rivals, the prompt lists them all with their album, duration, year and explicit
   flag — usually the only way to tell a reissue from an original — and an
   **Open ▶** button next to each one plays it on YouTube Music so you can decide
-  by ear before adding.
-- It also tries hard not to come back empty-handed. If the exact recording isn't
-  on YouTube Music but another version of the same song is — a live take, a
-  remix, an acoustic version, even another band's cover — you're offered that
-  rather than nothing, with the difference spelled out ("this is the live
-  version, not the one asked for"). When the exact version *is* there, it wins.
+  by ear. Tick as many as you like: each ticked one is added.
+- Spaces and anything in brackets don't count against a match: `ArtistName` is
+  `Artist Name`, and `Song (From the Movie X)` or `Song [Live]` is `Song`. When
+  that leaves exactly one version of the song by the right artist, it's added
+  without asking. When there are several (`Song`, `Song (Live)`,
+  `Song (Remix)`…), you're asked which ones you want — and the one closest to
+  what you asked for is proposed first.
+- It also tries hard not to come back empty-handed: if the right artist isn't
+  found, another band's cover of the same song is offered rather than nothing.
 - `✗` is reserved for a genuinely different song: nothing came back that shares
   a word with the title you asked for. So `Cher — One` never becomes
   `Cherub — Someone`, and a different track by the right artist is never

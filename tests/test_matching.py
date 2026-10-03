@@ -11,6 +11,7 @@ from cratefill.matching import (
     HIGH_TITLE,
     choose_match,
     core_title,
+    match_key,
     has_version_conflict,
     normalize,
     score_artist,
@@ -151,7 +152,7 @@ class TestVersionMarkers:
         ("Hurt (Johnny Cash Cover)", "hurt"),
         ("Song (2009 Remaster) (Live)", "song"),
         # A bracketed group with no version marker is part of the title.
-        ("Song (Reprise)", "song reprise"),
+        ("Song (Pt. 2)", "song pt 2"),
     ])
     def test_core_title(self, title, core):
         assert core_title(title) == core
@@ -161,7 +162,7 @@ class TestVersionMarkers:
         version difference is reported separately."""
         d = decide("Oasis", "Wonderwall", result("Wonderwall (Live at Wembley)", "Oasis"))
         assert d.title_score == 1.0
-        assert d.reason == "this is the live version, not the one asked for"
+        assert d.candidate.reason == "this is the live version, not the one asked for"
 
 
 class TestScoreText:
@@ -219,6 +220,10 @@ class TestHighConfidence:
          result("Come Together (2009 Remaster)", "The Beatles")),
         ("album version", "Guns N' Roses", "Sweet Child o' Mine",
          result("Sweet Child O' Mine (Album Version)", "Guns N’ Roses")),
+        ("radio edit", "Daft Punk", "One More Time",
+         result("One More Time (Radio Edit)", "Daft Punk")),
+        ("radio version", "Daft Punk", "One More Time",
+         result("One More Time (Radio Version)", "Daft Punk")),
         ("comma punctuation", "Daft Punk", "Harder Better Faster Stronger",
          result("Harder, Better, Faster, Stronger", "Daft Punk")),
         ("live matches live", "Oasis", "Wonderwall (Live)", result("Wonderwall (Live)", "Oasis")),
@@ -274,6 +279,138 @@ class TestExactMatchInvariant:
         look identical. Whatever survives stripping, this must never be `high`."""
         d = decide("Some Artist", title, result(got, "Some Artist"))
         assert d.status != "high", f"{title!r} vs {got!r} → {d}"
+
+
+class TestSpacing:
+    """A missing or extra space is a spelling difference, not another name."""
+
+    @pytest.mark.parametrize("artist, got", [
+        ("ArtistName", "Artist Name"),
+        ("Artist Name", "ArtistName"),
+        ("AC/DC", "ACDC"),
+        ("Daft Punk", "DaftPunk"),
+    ])
+    def test_artist_spacing_is_high(self, artist, got):
+        d = decide(artist, "Some Song", result("Some Song", got))
+        assert d.status == "high", d
+
+    @pytest.mark.parametrize("title, got", [
+        ("Love Song", "Lovesong"),
+        ("Somebody", "Some Body"),
+        ("Love Song Forever", "Lovesong Forever"),
+    ])
+    def test_title_spacing_is_high(self, title, got):
+        d = decide("Some Artist", title, result(got, "Some Artist"))
+        assert d.status == "high", d
+
+    @pytest.mark.parametrize("want, got", [("one", "someone"), ("cher", "cherub")])
+    def test_joining_words_cannot_create_a_substring_match(self, want, got):
+        """Words are only re-joined into a word the *other* side contains."""
+        assert score_text(want, got) == 0.0
+
+
+class TestUnrequestedSuffix:
+    """A bracket or dash suffix the request didn't have costs nothing, unless it
+    names a different recording."""
+
+    @pytest.mark.parametrize("got", [
+        "Song Name (From the Movie X)",
+        'Song Name - From "Movie X"',
+        "Song Name (Pt. 2)",
+        "Song Name [Bonus]",
+        "Song Name (Original Mix)",
+    ])
+    def test_extra_suffix_is_high(self, got):
+        d = decide("Some Artist", "Song Name", result(got, "Some Artist"))
+        assert d.status == "high", d
+
+    @pytest.mark.parametrize("got", [
+        "Song Name (Live)", "Song Name (Reprise)", "Song Name (Club Mix)",
+        "Song Name (Medley)",
+    ])
+    def test_the_only_version_is_added_whatever_its_brackets_say(self, got):
+        """With nothing else to choose from, asking is just an extra click."""
+        d = decide("Some Artist", "Song Name", result(got, "Some Artist"))
+        assert d.status == "high", d
+        assert d.reasons == []
+
+    @pytest.mark.parametrize("got", [
+        "Song Name (Live)", "Song Name (Deluxe)", "Song Name (From the Movie X)",
+        "Song Name (Radio Edit)",
+    ])
+    def test_several_versions_ask(self, got):
+        """The user may want one of them, or several — whatever order YouTube
+        Music listed them in, and even when one is the plain title."""
+        for order in ([("Song Name", "a"), (got, "b")], [(got, "b"), ("Song Name", "a")]):
+            d = decide("Some Artist", "Song Name",
+                       *[result(t, "Some Artist", vid=v) for t, v in order])
+            assert d.status == "ambiguous", (order, d)
+            assert "2 versions of this song found" in d.reason
+            assert {c.video_id for c in d.choices} == {"a", "b"}
+
+    def test_identical_titles_are_one_version(self):
+        """The same song on the album and on the single is not a choice."""
+        d = decide("Some Artist", "Song Name",
+                   result("Song Name", "Some Artist", vid="album"),
+                   result("Song Name", "Some Artist", vid="single"))
+        assert d.status == "high", d
+
+    def test_every_version_is_listed(self):
+        """More versions than the usual three alternatives: all of them shown."""
+        titles = ["Song Name"] + [f"Song Name ({x})" for x in
+                                  ("Live", "Deluxe", "From X", "Radio Edit", "Demo")]
+        d = decide("Some Artist", "Song Name",
+                   *[result(t, "Some Artist", vid=t) for t in titles])
+        assert {c.video_id for c in d.choices} == set(titles)
+
+    def test_another_artists_version_is_not_a_second_version(self):
+        """A cover by someone else is a rival, not a version of *this* song."""
+        d = decide("Oasis", "Wonderwall",
+                   result("Wonderwall (Live)", "Oasis", vid="a"),
+                   result("Wonderwall", "Tribute Players", vid="b"))
+        assert d.status == "high" and d.video_id == "a"
+
+    def test_brackets_on_the_request_are_ignored_too(self):
+        d = decide("Some Artist", "Song Name (Pt. 2)", result("Song Name (Pt. 1)", "Some Artist"))
+        assert d.status == "high", d
+
+
+class TestMatchKey:
+    """Same artist and title once spaces and any bracketed text are ignored."""
+
+    @pytest.mark.parametrize("artist, title, got_artist, got_title", [
+        ("Artist (UK)", "Song", "Artist", "Song"),
+        ("Artist", "Song", "Artist [FR]", "Song"),
+        ("Artist Name", "Song", "ArtistName (Official)", "Song"),
+        ("Artist", "(I Can't Get No) Satisfaction", "Artist", "Satisfaction"),
+        ("Artist", "Song [Live] (2004 Remaster)", "Artist", "Song"),
+        ("Artist", "Song", "Artist", "Song {Bonus} <Edit>"),
+        ("Artist", "Song (feat. X (Y))", "Artist", "Song"),
+        ("アーティスト", "歌", "アーティスト", "歌【Live】"),
+        ("Air & Phoenix", "Song", "Air, Phoenix", "Song"),
+    ])
+    def test_a_lone_match_is_high(self, artist, title, got_artist, got_title):
+        d = decide(artist, title, result(got_title, *got_artist.split(", ")))
+        assert d.status == "high", d
+
+    @pytest.mark.parametrize("artist, title, got_artist, got_title", [
+        ("Artist", "Song", "Other Band", "Song"),
+        ("Artist", "Song", "Artist", "Songs"),
+        ("Artist", "One", "Artist", "Someone"),
+    ])
+    def test_a_real_difference_is_not_a_match(self, artist, title, got_artist, got_title):
+        d = decide(artist, title, result(got_title, got_artist))
+        assert d.status != "high", d
+
+    def test_a_title_that_is_all_brackets_matches_nothing_by_key(self):
+        assert match_key("(Intro)") == ""
+
+    def test_several_versions_ask(self):
+        d = decide("Artist", "Song",
+                   result("Song [Live]", "Artist (UK)", vid="a"),
+                   result("Song", "Artist", vid="b"))
+        assert d.status == "ambiguous"
+        assert {c.video_id for c in d.choices} == {"a", "b"}
 
 
 class TestPrincipalArtist:
@@ -372,8 +509,8 @@ class TestWeakTier:
     def test_a_solid_shortfall_stays_merely_ambiguous(self):
         """A near-tie between two good candidates is uncertain, not thin."""
         d = decide("Oasis", "Wonderwall",
-                   result("Wonderwall", "Oasis", vid="a"),
-                   result("Wonderwall (Deluxe)", "Oasis", vid="b"))
+                   result("Wonderwall (From the Film X)", "Oasis", vid="a"),
+                   result("Wonderwall (Pt. 2)", "Oasis", vid="b"))
         assert d.status == "ambiguous"
 
 
@@ -468,7 +605,6 @@ class TestOfferedRatherThanNothing:
 
     @pytest.mark.parametrize("title, got, expected_in_reason", [
         ("Wonderwall", "Wonderwall (Live at Wembley)", "live version"),
-        ("One More Time", "One More Time (Radio Edit)", "radio edit version"),
         ("One More Time", "One More Time (Skrillex Remix)", "remix version"),
         ("Stronger", "Stronger (Instrumental)", "instrumental version"),
         ("Wonderwall", "Wonderwall (Cover)", "cover version"),
@@ -476,10 +612,13 @@ class TestOfferedRatherThanNothing:
         ("Stan", "Stan (Explicit)", "explicit version"),
     ])
     def test_a_different_recording_is_offered_not_refused(self, title, got, expected_in_reason):
-        d = decide("Oasis", title, result(got, "Oasis"))
+        """Alone it is simply taken (see TestUnrequestedSuffix); next to the
+        plain recording it is offered as a choice, with the difference named."""
+        d = decide("Oasis", title, result(got, "Oasis", vid="v1"),
+                   result(title, "Oasis", vid="plain"))
         assert d.status in OFFERED
-        assert d.video_id == "v1", "the user should get the chance to take it"
-        assert expected_in_reason in d.reason
+        assert "v1" in {c.video_id for c in d.choices}, "the user should get the chance to take it"
+        assert expected_in_reason in [c for c in d.choices if c.video_id == "v1"][0].reason
 
     def test_another_artists_cover_is_offered(self):
         """A cover is by definition someone else, so a wrong artist can't be a
@@ -514,11 +653,12 @@ class TestOfferedRatherThanNothing:
 
 
 class TestVersionFallback:
-    """Asking for a specific recording and only finding the standard one.
+    """Asking for a specific recording when the result's brackets say otherwise.
 
-    Deliberately asymmetric: getting the album version when the live one isn't
-    on YouTube Music beats getting nothing, so it is offered rather than
-    refused — but never silently, so it can only ever be ambiguous.
+    Brackets are ignored on both sides when deciding whether a result *is* the
+    requested song, so a lone result is taken whatever version it is — but the
+    difference is still named on the candidate, and when several versions exist
+    the one actually asked for is proposed first.
     """
 
     @pytest.mark.parametrize("asked, marker", [
@@ -527,44 +667,32 @@ class TestVersionFallback:
         ("Wonderwall (Remix)", "remix"),
         ("Wonderwall (Instrumental)", "instrumental"),
     ])
-    def test_the_standard_recording_is_offered(self, asked, marker):
+    def test_the_only_recording_is_taken(self, asked, marker):
         d = decide("Oasis", asked, result("Wonderwall", "Oasis"))
-        assert d.status == "ambiguous"
+        assert d.status == "high"
         assert d.video_id == "v1"
-        assert f"no {marker} version found" in d.reason
+        assert f"no {marker} version found" in d.candidate.reason
 
-    def test_the_exact_version_wins_when_it_exists(self):
-        """A fallback must never outrank the recording that was actually asked
-        for, nor make it look like a near tie."""
+    def test_the_requested_version_is_proposed_first(self):
+        """Two versions are a choice, but the one asked for leads, whatever
+        YouTube Music's order."""
         for order in ([("Wonderwall", "album"), ("Wonderwall (Live)", "live")],
                       [("Wonderwall (Live)", "live"), ("Wonderwall", "album")]):
             d = decide("Oasis", "Wonderwall (Live)",
                        *[result(t, "Oasis", vid=v) for t, v in order])
-            assert d.status == "high", d
+            assert d.status == "ambiguous", d
             assert d.video_id == "live"
-
-    def test_the_fallback_is_still_listed_as_an_alternative(self):
-        d = decide("Oasis", "Wonderwall (Live)",
-                   result("Wonderwall (Live)", "Oasis", vid="live"),
-                   result("Wonderwall", "Oasis", vid="album"))
-        assert [a.video_id for a in d.alternatives] == ["album"]
-
-    def test_a_partial_marker_match_is_still_a_fallback(self):
-        d = decide("Oasis", "Wonderwall (Live Acoustic)",
-                   result("Wonderwall (Live)", "Oasis"))
-        assert d.status == "ambiguous"
-        assert "no acoustic version found" in d.reason
+            assert [a.video_id for a in d.alternatives] == ["album"]
 
     @pytest.mark.parametrize("asked, offered, marker", [
         ("Wonderwall (Live)", "Wonderwall (Remix)", "remix"),
         ("Wonderwall (Acoustic)", "Wonderwall (Karaoke)", "karaoke"),
+        ("Wonderwall (Live Acoustic)", "Wonderwall (Live)", "no acoustic version"),
     ])
-    def test_a_wrongly_marked_version_is_still_offered(self, asked, offered, marker):
-        """Asking for live and being handed a remix isn't what was wanted, but
-        it is the same song — so it's offered, with the mismatch named."""
+    def test_a_differently_marked_lone_version_is_taken(self, asked, offered, marker):
         d = decide("Oasis", asked, result(offered, "Oasis"))
-        assert d.status == "ambiguous"
-        assert f"this is the {marker} version" in d.reason
+        assert d.status == "high"
+        assert marker in d.candidate.reason, "the difference is still recorded"
 
     def test_the_standard_recording_outranks_a_wrongly_marked_one(self):
         """Both are imperfect, but being handed the plain recording is a milder
@@ -576,7 +704,7 @@ class TestVersionFallback:
 
     def test_the_mismatch_names_the_unwanted_marker(self):
         d = decide("Oasis", "Wonderwall", result("Wonderwall (Karaoke)", "Oasis"))
-        assert "this is the karaoke version, not the one asked for" in d.reason
+        assert "this is the karaoke version, not the one asked for" in d.candidate.reason
 
 
 class TestAmbiguity:
@@ -586,30 +714,39 @@ class TestAmbiguity:
                    result("Champagne Supernova", "Oasis", vid="b"))
         assert d.status == "high" and d.video_id == "a"
 
-    def test_a_near_tie_is_ambiguous(self):
-        """Two catalogue entries for the same song: pick neither silently."""
-        d = decide("Oasis", "Wonderwall",
-                   result("Wonderwall", "Oasis", vid="a"),
-                   result("Wonderwall (Deluxe)", "Oasis", vid="b"))
+    def test_a_near_tie_without_a_sure_artist_is_ambiguous(self):
+        """When the artist isn't a sure match these aren't versions of the
+        requested song, so the margin still decides between them."""
+        d = decide("Nick Cave & The Bad Seeds", "Red Right Hand",
+                   result("Red Right Hand", "Nick Cave and the Bad Seeds", vid="a"),
+                   result("Red Right Hand (Live)", "Nick Cave and the Bad Seeds", vid="b"),
+                   result("Red Right Hand", "Nick Cave and the Bad Seeds", vid="c"))
         assert d.status == "ambiguous"
         assert d.runner_up_score is not None
         assert "almost the same" in d.reason
 
-    def test_the_version_penalty_keeps_a_variant_from_looking_like_a_tie(self):
+    def test_the_plain_title_is_proposed_first_among_versions(self):
+        """On a tie, the literal title leads, whatever YouTube Music's order."""
+        for order in ([("Wonderwall", "a"), ("Wonderwall (Deluxe)", "b")],
+                      [("Wonderwall (Deluxe)", "b"), ("Wonderwall", "a")]):
+            d = decide("Oasis", "Wonderwall",
+                       *[result(t, "Oasis", vid=v) for t, v in order])
+            assert d.video_id == "a", order
+
+    def test_the_version_penalty_ranks_the_studio_cut_first(self):
         """A live result alongside the studio one is still a candidate — nothing
-        is filtered — but VERSION_PENALTY drops it far enough that the studio
-        version stays a clear winner rather than a near tie."""
+        is filtered — but VERSION_PENALTY ranks the studio version first."""
         d = decide("Oasis", "Wonderwall",
                    result("Wonderwall (Live)", "Oasis", vid="a"),
                    result("Wonderwall", "Oasis", vid="b"))
-        assert d.status == "high" and d.video_id == "b"
+        assert d.video_id == "b"
         assert d.runner_up_score is not None, "the live take is ranked, not discarded"
         assert d.alternatives[0].video_id == "a"
 
     def test_alternatives_are_offered_for_review(self):
         d = decide("Oasis", "Wonderwall",
-                   result("Wonderwall", "Oasis", vid="a"),
-                   result("Wonderwall (Deluxe)", "Oasis", vid="b"))
+                   result("Wonderwall (From the Film X)", "Oasis", vid="a"),
+                   result("Wonderwall (Pt. 2)", "Oasis", vid="b"))
         assert [a.video_id for a in d.alternatives] == ["b"]
 
 

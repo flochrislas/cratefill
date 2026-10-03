@@ -73,18 +73,20 @@ SHORT_TEXT_LEN = 4
 # live version, and a requested live version must not become the studio one.
 HARD_VERSION_MARKERS = {
     "live": (r"\blive\b",),
-    "remix": (r"\bremix(es|ed)?\b", r"\bmix\b"),
+    # "Original Mix" is the standard release in electronic music, not a remix.
+    "remix": (r"\bremix(es|ed)?\b", r"(?<!original )\bmix\b"),
     "acoustic": (r"\bacoustic\b", r"\bunplugged\b"),
     "instrumental": (r"\binstrumental\b",),
     "karaoke": (r"\bkaraoke\b",),
     "cover": (r"\bcover\b", r"\btribute\b"),
     "demo": (r"\bdemo\b",),
-    "radio edit": (r"\bradio edit\b",),
     "extended mix": (r"\bextended\b",),
     "sped up": (r"\bsped ?up\b", r"\bnightcore\b"),
     "slowed": (r"\bslowed\b", r"\breverb\b"),
     "clean": (r"\bclean\b",),
     "explicit": (r"\bexplicit\b",),
+    "reprise": (r"\breprise\b",),
+    "medley": (r"\bmedley\b",),
 }
 
 # Markers that describe a re-release or a packaging detail rather than a
@@ -98,7 +100,10 @@ SOFT_VERSION_MARKERS = (
     r"\bstereo\b",
     r"\balbum version\b",
     r"\bsingle version\b",
+    # A radio edit is the same recording trimmed for airplay, not another take.
+    r"\bradio (edit|version)\b",
     r"\boriginal version\b",
+    r"\boriginal mix\b",
     r"\bbonus track\b",
     r"\bofficial (video|audio|music video)\b",
     r"\blyrics? video\b",
@@ -176,6 +181,33 @@ def tokens(text):
     """Normalized whole words. Substring comparison is what let "one" match
     "someone", so everything downstream works on these instead."""
     return normalize(text).split()
+
+
+def merge_split_words(words, vocabulary):
+    """Join adjacent words that the other side writes as one.
+
+    "Artist Name" and "ArtistName", "Love Song" and "Lovesong": a missing or
+    extra space is a spelling difference, not a different name. Only joins that
+    produce a word actually present in `vocabulary` happen, so this can't turn
+    "one" into "someone" — the other side has to contain the joined word.
+    """
+    out, i = [], 0
+    while i < len(words):
+        for n in (3, 2):
+            if i + n <= len(words) and "".join(words[i:i + n]) in vocabulary:
+                out.append("".join(words[i:i + n]))
+                i += n
+                break
+        else:
+            out.append(words[i])
+            i += 1
+    return out
+
+
+def align_spacing(want_tokens, got_tokens):
+    """Both token lists, with words split on one side only re-joined."""
+    want_tokens = merge_split_words(want_tokens, set(got_tokens))
+    return want_tokens, merge_split_words(got_tokens, set(want_tokens))
 
 
 def strip_leading_the(word_list):
@@ -336,7 +368,7 @@ def score_text(want, got):
     shared. Overlap is measured against the *longer* side, so "hello" cannot
     pass as "hello world goodbye" either.
     """
-    want_tokens, got_tokens = tokens(want), tokens(got)
+    want_tokens, got_tokens = align_spacing(tokens(want), tokens(got))
     if not want_tokens or not got_tokens:
         return 0.0
     want_counts, got_counts = Counter(want_tokens), Counter(got_tokens)
@@ -384,7 +416,27 @@ def score_title(want, got):
     """
     if normalize(want) == normalize(got):
         return 1.0
-    return score_text(core_title(want), core_title(got))
+    want_core = core_title(want)
+    return max(score_text(want_core, core_title(got)),
+               score_text(want_core, bare_title(got)))
+
+
+def bare_title(text):
+    """The title with *every* metadata segment removed, marker or not.
+
+    A result often carries a bracket or dash suffix the request didn't —
+    "(From the Movie X)", "(Pt. 2)", "- Single Edit" — and those words don't make
+    it a different song. score_title compares the requested core title against
+    this, so the suffix costs nothing. It only ever helps when the *request*
+    lacks the suffix: a requested "(Pt. 2)" stays in core_title(want) and still
+    has to be matched. Recording differences (live, remix, reprise…) are judged
+    separately by version_relation, so they still block `high`.
+    """
+    remainder = text or ""
+    for segment in metadata_segments(remainder):
+        remainder = remainder.replace(segment, " ")
+    main, _guests = split_featured(remainder)
+    return normalize(main)
 
 
 def score_artist(want_artist, result_artists):
@@ -461,7 +513,8 @@ def has_content_overlap(want_title, got_title):
     completely different song. Titles built entirely from stop words ("You and
     Me") fall back to any shared token, or they could never match anything.
     """
-    want, got = Counter(tokens(core_title(want_title))), Counter(tokens(core_title(got_title)))
+    want, got = (Counter(t) for t in align_spacing(tokens(core_title(want_title)),
+                                                   tokens(core_title(got_title))))
     shared = set((want & got).elements())
     if shared - STOP_WORDS:
         return True
@@ -590,7 +643,19 @@ def choose_match(artist, title, results):
     if not scored:
         return MatchDecision("rejected", reasons=["no usable search results"])
 
-    scored.sort(key=lambda c: c.overall_score, reverse=True)
+    # On equal scores the result titled exactly as requested goes first, rather
+    # than whichever variant YouTube Music happened to list first: the literal
+    # title, then one that differs only by metadata ("(Deluxe)"), then the rest.
+    scored.sort(key=lambda c: (c.overall_score, _title_exactness(title, c.result.get("title"))),
+                reverse=True)
+
+    # Versions of the requested song by the requested artist: the same artist
+    # and title once spaces and anything in brackets are ignored. These decide
+    # on their own — one version is simply taken, several are a choice — so
+    # they are found before the relatedness filter below.
+    versions = [c for c in scored if _is_same_song(c, artist, title)]
+    if versions:
+        return _decide_versions(versions, [c for c in scored if c not in versions])
 
     # The only reason to refuse outright: nothing here is recognisably the same
     # song. A shared *content* word is required — matching on "the" alone is no
@@ -631,6 +696,95 @@ def choose_match(artist, title, results):
         reasons=reasons,
         alternatives=rest[:3],
     )
+
+
+def _decide_versions(versions, others):
+    """One version of the requested song is the answer; several are a choice.
+
+    Identical titles are one version listed twice (album and single), not a
+    choice. With several, every version is offered — the user may want more
+    than one, and the dialog lets them tick several — topped up with other
+    candidates to the usual three alternatives.
+    """
+    winner, *more = versions
+    titles = {normalize(c.result.get("title")) for c in versions}
+    if len(titles) == 1:
+        status, reasons, alternatives = "high", [], others[:3]
+    else:
+        status = "ambiguous"
+        reasons = [f"{len(titles)} versions of this song found"]
+        alternatives = more + others[:max(0, 3 - len(more))]
+    runner_up = alternatives[0].overall_score if alternatives else None
+    return MatchDecision(
+        status,
+        candidate=winner,
+        title_score=winner.title_score,
+        artist_score=winner.artist_score,
+        overall_score=winner.overall_score,
+        runner_up_score=runner_up,
+        reasons=reasons,
+        alternatives=alternatives,
+    )
+
+
+# Any bracket pair, including the full-width forms common in CJK titles.
+ANY_BRACKET_RE = re.compile(r"[(\[{<（【［「『][^)\]}>）】］」』]*[)\]}>）】］」』]")
+
+
+def match_key(text):
+    """The text with spaces and everything in brackets ignored.
+
+    "ArtistName" and "Artist Name (UK)" share a key, as do "Song [Live]" and
+    "(Pt. 2) Song". Nested brackets are peeled innermost first. Returns "" when
+    nothing is left, which never counts as a match.
+    """
+    return normalize(strip_brackets(text)).replace(" ", "")
+
+
+def strip_brackets(text):
+    """Remove every bracketed group, innermost first so nesting peels away."""
+    text = text or ""
+    while True:
+        stripped = ANY_BRACKET_RE.sub(" ", text)
+        if stripped == text:
+            return text
+        text = stripped
+
+
+def _is_same_song(candidate, want_artist, want_title):
+    """The requested song by the requested artist, whatever the brackets say.
+
+    Either the scores say so (title and principal artist both at the `high`
+    thresholds — which already forgive feat., punctuation and "The"), or the
+    match keys are equal: same artist and title once spaces and any bracketed
+    text, on either side, are ignored.
+    """
+    result = candidate.result
+    title_ok = (candidate.title_score >= HIGH_TITLE
+                or _keys_equal(want_title, result.get("title")))
+    if not title_ok:
+        return False
+    if candidate.principal_score >= HIGH_ARTIST:
+        return True
+    # Brackets go first: split_featured trims a trailing ")" and would leave
+    # "Artist (UK" behind.
+    principal, _guests = split_featured(strip_brackets(want_artist), allow_with=True)
+    names = [a.get("name") for a in (result.get("artists") or [])
+             if isinstance(a, dict) and a.get("name")]
+    # Every artist individually, and all of them as one credit ("Air, Phoenix").
+    return any(_keys_equal(principal, name) for name in names + [" ".join(names)])
+
+
+def _keys_equal(want, got):
+    key = match_key(want)
+    return bool(key) and key == match_key(got)
+
+
+def _title_exactness(want, got):
+    """2 for the literal title, 1 for the same title bar metadata, else 0."""
+    if normalize(want) == normalize(got):
+        return 2
+    return 1 if core_title(want) == core_title(got) else 0
 
 
 def _shortfalls(candidate, want_title):

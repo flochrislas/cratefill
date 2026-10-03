@@ -147,8 +147,9 @@ class TestEvaluateSongs:
     def test_ambiguous_log_shows_the_proposal(self):
         out = []
         results = [
-            {"videoId": "a", "title": "Lisztomania", "artists": [{"name": "Phoenix"}]},
-            {"videoId": "b", "title": "Lisztomania (Deluxe)", "artists": [{"name": "Phoenix"}]},
+            {"videoId": "a", "title": "Lisztomania (From the Film X)",
+             "artists": [{"name": "Phoenix"}]},
+            {"videoId": "b", "title": "Lisztomania (Pt. 2)", "artists": [{"name": "Phoenix"}]},
         ]
         evaluated = youtube.evaluate_songs(FakeYT(search_results=results), [SONG], out.append)
         assert evaluated[0][1].status == "ambiguous"

@@ -35,13 +35,15 @@ app.account_label.configure(text="Logged in")
 app.refresh_add_button()
 
 # Real decisions through the real matcher, so the Messages pane can't drift out
-# of date: one confident, one offered-but-different-recording, one no-match.
+# of date: one confident, one with several versions to choose from, one no-match.
 SEARCH_RESULTS = {
     "Harder Better Faster Stronger": [
         {"videoId": "v1", "title": "Harder, Better, Faster, Stronger",
          "artists": [{"name": "Daft Punk"}]}],
     "Lisztomania": [
         {"videoId": "v2", "title": "Lisztomania (Live at Madison Square Garden)",
+         "artists": [{"name": "Phoenix"}]},
+        {"videoId": "v4", "title": "Lisztomania (Alex Metric Remix)",
          "artists": [{"name": "Phoenix"}]}],
     "La Femme d'Argent": [
         {"videoId": "v3", "title": "Sexy Boy", "artists": [{"name": "Air"}]}],
