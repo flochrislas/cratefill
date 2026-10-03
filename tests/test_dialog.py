@@ -59,10 +59,10 @@ def open_dialog(root, decision):
 
 
 def shown_text(widget):
-    """Every label and radio caption in the dialog, flattened."""
+    """Every label and checkbox caption in the dialog, flattened."""
     out = []
     for child in widget.winfo_children():
-        if child.winfo_class() in ("TLabel", "TRadiobutton", "TCheckbutton"):
+        if child.winfo_class() in ("TLabel", "TCheckbutton"):
             out.append(str(child.cget("text")))
         out.extend(shown_text(child))
     return out
@@ -132,22 +132,39 @@ class TestAlternatives:
 
     def test_the_winner_is_chosen_by_default(self, root, decision_with_alternatives):
         dialog = open_dialog(root, decision_with_alternatives)
-        assert dialog.chosen is decision_with_alternatives.candidate
+        assert dialog.chosen == [decision_with_alternatives.candidate]
         dialog._choose(policy.ADD)
-        assert dialog.chosen.video_id == "v1"
+        assert [c.video_id for c in dialog.chosen] == ["v1"]
 
     def test_picking_an_alternative_changes_what_is_added(self, root,
                                                           decision_with_alternatives):
         dialog = open_dialog(root, decision_with_alternatives)
-        dialog.choice_var.set(1)          # the radio list's second entry
+        dialog.choice_vars[0].set(False)
+        dialog.choice_vars[1].set(True)   # the list's second entry
         dialog._choose(policy.ADD)
-        assert dialog.chosen.video_id == "v2"
+        assert [c.video_id for c in dialog.chosen] == ["v2"]
         assert dialog.action == "add"
+
+    def test_several_candidates_can_be_ticked(self, root, decision_with_alternatives):
+        dialog = open_dialog(root, decision_with_alternatives)
+        dialog.choice_vars[2].set(True)
+        dialog._choose(policy.ADD)
+        assert [c.video_id for c in dialog.chosen] == ["v1", "v3"]
+
+    def test_add_is_disabled_with_nothing_ticked(self, root, decision_with_alternatives):
+        dialog = open_dialog(root, decision_with_alternatives)
+        dialog.choice_vars[0].set(False)
+        dialog._select()
+        assert dialog.add_button.instate(["disabled"])
+        dialog.choice_vars[1].set(True)
+        dialog._select()
+        assert not dialog.add_button.instate(["disabled"])
+        dialog.destroy()
 
     def test_a_single_candidate_still_works(self, root, decision):
         dialog = open_dialog(root, decision)
         dialog._choose(policy.ADD)
-        assert dialog.chosen.video_id == "v1"
+        assert [c.video_id for c in dialog.chosen] == ["v1"]
 
 
 class TestWeakMatches:
@@ -234,7 +251,7 @@ class TestCandidateMeta:
 
     def test_missing_everything_returns_empty(self):
         """The caller checks for this and skips the label entirely — an empty
-        line under the radio would just look like a UI bug."""
+        line under the checkbox would just look like a UI bug."""
         assert candidate_meta(self.result()) == ""
 
     def test_year_shows_when_populated(self):
@@ -283,7 +300,7 @@ class TestCandidateMetadataInDialog:
 
     def test_candidate_without_metadata_still_renders(self, root, decision):
         """The Wonderwall fixtures carry no album/duration — the row must still
-        show, with the reason and radio intact, just without the meta line."""
+        show, with the reason and checkbox intact, just without the meta line."""
         dialog = open_dialog(root, decision)
         shown = " | ".join(shown_text(dialog))
         assert "Wonderwall (Deluxe)" in shown

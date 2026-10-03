@@ -78,13 +78,14 @@ class ReviewStub:
     def _ask_about_match(self, artist, title, decision):
         """Stands in for the modal: pops the next queued answer.
 
-        Answers may be (action, remember) or (action, remember, chosen_index) to
-        pick one of the alternatives, mirroring the dialog's radio list.
+        Answers may be (action, remember) or (action, remember, [indices]) to
+        tick alternatives, mirroring the dialog's checkbox list.
         """
         self.asked.append((artist, title))
         answer = self.answers.pop(0)
         action, remember = answer[0], answer[1]
-        chosen = decision.choices[answer[2]] if len(answer) > 2 else decision.candidate
+        picked = answer[2] if len(answer) > 2 else [0]
+        chosen = [decision.choices[i] for i in picked]
         if remember and action:
             self.set_ambiguous_policy(action)
         return action, chosen
@@ -214,9 +215,23 @@ class TestChoosingAnAlternative:
         """The dialog lists near-scoring rivals; whichever is picked is the one
         that must reach the playlist."""
         alt = candidate("v-alt", title="Other")
-        stub = ReviewStub("ask", answers=[(policy.ADD, False, 1)])
+        stub = ReviewStub("ask", answers=[(policy.ADD, False, [1])])
         started = review(stub, [ambiguous("v-winner", alternatives=[alt])])
         assert approved_ids(started) == ["v-alt"]
+
+    def test_several_ticked_candidates_are_all_added(self):
+        """Two rivals can both be worth keeping: every ticked one is added."""
+        alts = [candidate("v-alt", title="Other"), candidate("v-alt2", title="Third")]
+        stub = ReviewStub("ask", answers=[(policy.ADD, False, [0, 2])])
+        started = review(stub, [ambiguous("v-winner", alternatives=alts)])
+        assert approved_ids(started) == ["v-winner", "v-alt2"]
+        assert any("2 to add" in line for line in stub.logs)
+
+    def test_a_track_already_approved_is_not_added_twice(self):
+        alt = candidate("v-high", title="Other")
+        stub = ReviewStub("ask", answers=[(policy.ADD, False, [0, 1])])
+        started = review(stub, [high("v-high"), ambiguous("v-winner", alternatives=[alt])])
+        assert approved_ids(started) == ["v-high", "v-winner"]
 
     def test_the_winner_is_used_when_nothing_is_picked(self):
         alt = candidate("v-alt", title="Other")

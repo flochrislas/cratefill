@@ -134,11 +134,11 @@ def apply_dark_theme(root):
             indicatorbackground=[("disabled", BG), ("pressed", BTN_ACTIVE)],
             indicatorforeground=[("disabled", FG_DIM)],
         )
-    # Every label in the review dialog wraps except the candidate radios, which
-    # would otherwise let one long "Artist — Title (Live at …)" drag the dialog
-    # wider than the screen. ttk.Radiobutton takes no `wraplength` argument, but
-    # its label element does through a style.
-    style.configure("Choice.TRadiobutton", wraplength=430)
+    # Every label in the review dialog wraps except the candidate checkboxes,
+    # which would otherwise let one long "Artist — Title (Live at …)" drag the
+    # dialog wider than the screen. ttk.Checkbutton takes no `wraplength`
+    # argument, but its label element does through a style.
+    style.configure("Choice.TCheckbutton", wraplength=430)
 
     style.configure("Treeview", background=FIELD, fieldbackground=FIELD, rowheight=24)
     style.map(
@@ -344,9 +344,9 @@ class AmbiguousMatchDialog(tk.Toplevel):
 
     Sets `action` to "add" or "skip", or leaves it None if the user dismissed the
     window — which the caller treats as "cancel the whole import", so no playlist
-    is touched. `chosen` is the candidate to add: the top proposal by default, or
-    whichever alternative the user picked. `remember` reports whether the choice
-    should become the policy.
+    is touched. `chosen` is the list of candidates to add: the top proposal by
+    default, or whichever ones the user ticked — several rivals can be worth
+    keeping. `remember` reports whether the choice should become the policy.
     """
 
     def __init__(self, parent, artist, title, decision):
@@ -359,7 +359,7 @@ class AmbiguousMatchDialog(tk.Toplevel):
         self.action = None
         self.remember = False
         self.choices = decision.choices
-        self.chosen = decision.candidate
+        self.chosen = [decision.candidate] if decision.candidate else []
 
         body = ttk.Frame(self, padding=12)
         body.pack(fill="both", expand=True)
@@ -383,23 +383,22 @@ class AmbiguousMatchDialog(tk.Toplevel):
 
         # The proposal plus its near-scoring rivals: the top-ranked candidate is
         # not always the one the user wants, and the reason text says as much.
-        caption = "Proposed:" if len(self.choices) == 1 else "Proposed (pick one):"
+        caption = "Proposed:" if len(self.choices) == 1 else "Proposed (tick any to add):"
         ttk.Label(body, text=caption, foreground=FG_DIM).pack(anchor="w")
-        self.choice_var = tk.IntVar(value=0)
+        self.choice_vars = [tk.BooleanVar(value=index == 0) for index in range(len(self.choices))]
         for index, candidate in enumerate(self.choices):
             row = ttk.Frame(body)
             row.pack(fill="x", anchor="w", padx=(12, 0))
-            # Radio + "Open" share the top line so the button lines up with the
+            # Checkbox + "Open" share the top line so the button lines up with the
             # score, which is what the user's eye tracks along.
             head = ttk.Frame(row)
             head.pack(fill="x", anchor="w")
-            ttk.Radiobutton(
+            ttk.Checkbutton(
                 head,
                 text=f"{candidate.label}   ({candidate.overall_score:.2f})",
-                value=index,
-                variable=self.choice_var,
+                variable=self.choice_vars[index],
                 command=self._select,
-                style="Choice.TRadiobutton",  # wrapped; see apply_dark_theme
+                style="Choice.TCheckbutton",  # wrapped; see apply_dark_theme
             ).pack(side="left", anchor="w")
             # Only offer "Open" when there's actually something to open: a result
             # without a videoId can't be played, and can't be added either.
@@ -437,14 +436,19 @@ class AmbiguousMatchDialog(tk.Toplevel):
         buttons.pack(fill="x", pady=(12, 0))
         add = ttk.Button(buttons, text="Add", command=lambda: self._choose(policy.ADD))
         add.pack(side="right")
+        self.add_button = add
         ttk.Button(buttons, text="Skip", command=lambda: self._choose(policy.SKIP)).pack(
             side="right", padx=(0, 8)
         )
         add.focus_set()
         self.bind("<Escape>", lambda _e: self.destroy())  # dismiss = cancel the import
+        self._select()
 
     def _select(self):
-        self.chosen = self.choices[self.choice_var.get()]
+        """Track the ticked candidates. Add needs at least one — with none ticked
+        the only honest answers are Skip or cancelling."""
+        self.chosen = [c for c, var in zip(self.choices, self.choice_vars) if var.get()]
+        self.add_button.state(["!disabled"] if self.chosen else ["disabled"])
 
     def _open(self, video_id):
         """Open the candidate on music.youtube.com so the user can hear it.
@@ -915,7 +919,7 @@ class CratefillApp:
         approved, counts = [], {"add": 0, "skip": 0}
         for song, decision in evaluated:
             artist, title = song[0], song[1]
-            video_id = decision.video_id
+            video_ids = [decision.video_id] if decision.video_id else []
             action = policy.action_for_match(decision, self.ambiguous_policy)
             if action == policy.ASK:
                 choice, chosen = self._ask_about_match(artist, title, decision)
@@ -923,13 +927,17 @@ class CratefillApp:
                     self.log("--- Cancelled. No playlist was changed. ---")
                     return
                 action = choice
-                video_id = chosen.video_id if chosen else None
+                # The user may tick several candidates for one requested song.
+                video_ids = [c.video_id for c in chosen if c.video_id]
             elif decision.status == "ambiguous":
                 verb = "added" if action == policy.ADD else "skipped"
                 self.log(f"    → ambiguous match {verb} by policy")
-            if action == policy.ADD and video_id:
-                approved.append(video_id)
-                counts["add"] += 1
+            # Two songs can resolve to the same track; one batch must not carry
+            # it twice.
+            new_ids = [v for v in video_ids if v not in approved]
+            if action == policy.ADD and new_ids:
+                approved.extend(new_ids)
+                counts["add"] += len(new_ids)
             else:
                 counts["skip"] += 1
 
@@ -945,15 +953,16 @@ class CratefillApp:
     def _ask_about_match(self, artist, title, decision):
         """Show the review dialog.
 
-        Returns (action, chosen candidate): "add"/"skip" and which candidate the
-        user picked, or (None, None) to cancel the whole import.
+        Returns (action, chosen candidates): "add"/"skip" and the list of
+        candidates the user ticked, or (None, [...]) to cancel the whole import.
         """
         dialog = AmbiguousMatchDialog(self.root, artist, title, decision)
         self.root.wait_window(dialog)
         if dialog.action:
             self.log(f"    → {dialog.action} (your choice)")
-            if dialog.chosen and dialog.chosen is not decision.candidate:
-                self.log(f"    → you picked: {dialog.chosen.label}")
+            if dialog.action == policy.ADD and dialog.chosen != [decision.candidate]:
+                for candidate in dialog.chosen:
+                    self.log(f"    → you picked: {candidate.label}")
         if dialog.remember and dialog.action:
             self.set_ambiguous_policy(dialog.action)
             self.log(f"    → remembering '{policy.POLICY_LABELS[dialog.action]}'")
