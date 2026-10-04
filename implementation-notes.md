@@ -34,7 +34,7 @@ cratefill/
 ├── __init__.py    __version__ only — the single source of the version, and kept
 │                  import-light because setuptools reads the attribute
 ├── __main__.py    python -m cratefill → app.main()
-├── matching.py    normalize/tokens, metadata_segments/core_title/score_title,
+├── matching.py    normalize/tokens, split_metadata/core_title/score_title,
 │                  version_markers/version_relation, score_text/score_artist,
 │                  has_content_overlap, Candidate,
 │                  choose_match → MatchDecision (high/ambiguous/weak/rejected)
@@ -63,7 +63,7 @@ cratefill/
 └── app.py         palette + apply_dark_theme(), enable_dark_title_bar()
                    SONG_COLUMNS, LOGIN_INSTRUCTIONS, HELP_TEXT
                    class LoginDialog(Toplevel)           paste-headers auth dialog
-                   class AmbiguousMatchDialog(Toplevel)  pick a candidate, Skip/Add
+                   class AmbiguousMatchDialog(Toplevel)  tick candidates (scrolls), Skip/Add
                    class CratefillApp           window, selections, threads, queue
                    main()
 
@@ -117,7 +117,7 @@ Returns a `MatchDecision` whose `status` is one of:
 `weak` exists because "offer it and let the user glance at it" is only true when
 the user is actually asked. A loose title overlap (`Hello` → `Hello World
 Goodbye`) or a wholly different performer is too thin to hand to a saved
-"Always add", so `_classify()` pins it to the ask path via
+"Always add", so `choose_match()` pins it to the ask path via
 `WEAK_TITLE` / `WEAK_ARTIST`.
 
 **Two opposite failures are being avoided here, and the balance between them is
@@ -159,31 +159,37 @@ The stages, all in `matching.py`:
    collapsing, plus two special cases: a `_LIGATURES` table for letters NFKD
    won't split (`Cœur → coeur`, `ß → ss`) and interior `!`/`$` → `i`/`s` for
    stylised names (`P!nk → pink`, `Ke$ha → kesha`).
-4. **Keep version information — but only where it lives.** Hard markers are live,
-   remix, acoustic, instrumental, karaoke, cover, demo, extended, sped up,
+4. **Keep version information — but only where it lives.** Version markers are
+   live, remix, acoustic, instrumental, karaoke, cover, demo, extended, sped up,
    slowed, clean, explicit, reprise, medley. `version_markers()` looks for them
-   **only in metadata positions** (`metadata_segments()`: bracketed groups, and a trailing
-   `- …` segment — YouTube Music uses both forms). Scanning the whole title
+   **only in metadata positions** (`split_metadata()`: bracketed groups of any
+   bracket type, and a trailing `- …` segment — YouTube Music uses both forms;
+   in an imported row the dash form may be metadata — a Spotify export's
+   `Bohemian Rhapsody - Remastered 2011` — or content — a folder import's whole
+   filename, `Phoenix - Lisztomania` — so `user_title_cores()` reads the
+   requested title both ways and the better score wins). Scanning the whole title
    instead was a real bug: songs actually called *Clean*, *Stereo* and *Live and
    Let Die* were reduced to empty strings and then **rejected as no match**. The
    cost of the fix is that a request typed as `Wonderwall Live`, with no brackets
    or dash, no longer reads as asking for the live take.
 
-   `core_title()` strips those segments before scoring, dropping a bracketed
-   group **whole** rather than word by word, because `(Live at Wembley)` is one
-   piece of metadata — keeping `at wembley` made the live take look like a
-   different song and dragged it below an unrelated band's studio cut. Soft
-   markers (remastered, deluxe, anniversary, album version, radio edit, official
-   video…) and `feat. X` go the same way, which is why `Wonderwall` scores 1.00 against both
-   `Wonderwall (Remastered)` and `Wonderwall (Live at Wembley)`.
+   `core_title()` strips **every** metadata segment before scoring, marker or
+   not, dropping a bracketed group **whole** rather than word by word, because
+   `(Live at Wembley)` is one piece of metadata — keeping `at wembley` made the
+   live take look like a different song and dragged it below an unrelated
+   band's studio cut. `feat. X` goes the same way, which is why `Wonderwall`
+   scores 1.00 against `Wonderwall (Remastered)`, `Wonderwall (From the Movie X)`
+   and `Wonderwall (Live at Wembley)` alike. Artist names get the same
+   treatment (`Artist (UK)`, `Artist - Topic`). Packaging details — remastered,
+   deluxe, radio edit, original mix — are not version markers at all.
 
-   Two backstops guard the identity of the song: `core_title()` **never returns
-   `""`** for a non-empty title (if the metadata was the title, the title wins),
+   Two backstops guard the identity of the song: `strip_metadata()` **never
+   empties** a non-empty title (if the metadata was the title, the title wins),
    and `score_title()` short-circuits to 1.0 on exact normalized equality before
    any stripping happens. `TestExactMatchInvariant` runs every marker word as a
    whole title to keep it that way.
 
-   `version_relation()` then compares hard markers **asymmetrically**, because
+   `version_relation()` then compares version markers **asymmetrically**, because
    the two directions aren't equally disappointing:
 
    | relation | example | penalty |
@@ -227,28 +233,31 @@ The stages, all in `matching.py`:
    `HIGH_ARTIST` let one matching guest lift a near-miss principal over the bar:
    `Nick Cave and the Bad Seeds` vs `Nick Cave & The Bad Seeds` scores 0.833, plus
    0.05 made 0.883, clearing the 0.88 gate the principal itself had failed.
-   `Candidate.principal_score` exists so `_shortfalls()` and `_classify()` test
+   `Candidate.principal_score` exists so `_shortfalls()` and `_is_version()` test
    the right number. A leading "the" is ignored (`The Beatles ≡ Beatles`), nameless
    and malformed entries are skipped, and extra artists on the result never
    penalise it. `with` counts as a featured separator **here only** — in a title
    it's an ordinary word.
 7. **Rank and classify** — every candidate becomes a `Candidate` carrying its own
    scores, `relation` and `reasons`, ranked by `base × (1 − version penalty)`
-   where `base = 0.65·title + 0.35·artist`. Only candidates with no shared
-   content word are dropped. `high` needs `HIGH_TITLE` / `HIGH_ARTIST`,
-   `relation == "same"`, *and* a `WINNER_MARGIN` lead over the runner-up —
-   — unless some results are *versions* of the requested song, which decide on
-   their own (`_decide_versions`). A version (`_is_same_song`) has the
-   requested artist and title once spaces and everything in brackets, of any
-   type and on either side, are ignored (`match_key`), or scores at the `high`
-   thresholds on both. One distinct version is `high` whatever its brackets
-   say — there is nothing to choose. Several are `ambiguous` ("N versions of
-   this song found") with every version listed, since the user may want more
-   than one; identical titles (album and single) count once. Score ties are broken towards the literal title, then a
-   metadata-only difference, never by YouTube Music's listing order.
-   Otherwise `_classify()` returns `weak` when the winner is below `WEAK_TITLE`
-   or `WEAK_ARTIST`, else `ambiguous` — with `reasons` naming each shortfall,
-   including which artist was actually found.
+   where `base = 0.65·title + 0.35·artist`; on a tie the literal requested title
+   leads, never YouTube Music's listing order. Then, in `choose_match()`:
+   - **Versions decide first.** A version (`_is_version`) reaches both
+     `HIGH_TITLE` and `HIGH_ARTIST` — the scores have already discounted
+     spacing, metadata and featured artists. One distinct version is `high`
+     whatever its brackets say: there is nothing to choose. Several are
+     `ambiguous` ("N versions of this song found") with every version listed,
+     since the user may want more than one. Identical titles are one
+     recording (album and single) unless `_distinct_recordings()` sees a visible
+     difference — the explicit flag, or lengths spanning more than
+     `SAME_RECORDING_SECONDS`; known lengths are grouped by sorting them, so
+     3:00/3:10/3:20 can't chain into one recording whatever the result order. A missing length is no difference,
+     but it can't bridge two known lengths: those are grouped first, then an
+     unknown joins one group, so result order can't change the outcome.
+   - **Otherwise the best related song is offered**, never confidently: `weak`
+     below `WEAK_TITLE` or `WEAK_ARTIST`, else `ambiguous`, with `reasons`
+     naming each shortfall, including which artist was actually found.
+   - **Nothing related** — no shared content word — is `rejected`.
 
    `MatchDecision.alternatives` holds the runners-up as `Candidate`s, and
    `.choices` is the winner followed by them — that's what the review dialog
@@ -451,9 +460,12 @@ anything.
    rivals, each with its own score and shortfall. The proposal starts ticked;
    whatever is ticked becomes the `dialog.chosen` list, and those are the
    videoIds `_review_and_add` approves: the top-ranked candidate is not always
-   the one the user wants, which is exactly what "another candidate scores
-   almost the same" is telling them — and sometimes they want several. Add is
-   disabled while nothing is ticked. Ticking "use
+   the one the user wants, which is exactly what "2 versions of this song
+   found" is telling them — and sometimes they want several. Add is
+   disabled while nothing is ticked. Every version is listed, up to the ten
+   search results, so the list scrolls when it would push the dialog past the
+   screen (`_fit_list`); Skip/Add and the checkbox are packed first, at the
+   bottom, so they always keep their space. Ticking "use
    this choice for future ambiguous matches" calls `set_ambiguous_policy()`,
    which saves the setting, updates the dropdown, and therefore governs the
    *remaining* songs in the same run (the checkbox is hidden for `weak`
@@ -469,11 +481,12 @@ anything.
 playlist — it makes the whole batch fail atomically (nothing added) if even
 one song is a duplicate, and ytmusicapi's `duplicates=True` would add the
 duplicates. So on a failed status, `add_video_ids_to_playlists` fetches the
-playlist's current videoIds, filters them out of the batch, and retries once with the rest
+playlist's current videoIds, filters them out of the batch, and retries with the rest
 (logging "N already there, skipped"); matched videoIds are also deduped
 within the batch. If the retry still fails (playlist not editable, or YT
-considers a song a duplicate under a *different* videoId), a soft warning is
-logged. Adding to a playlist the user doesn't own fails per-playlist and is
+considers a song a duplicate under a *different* videoId), the remaining songs
+are added one at a time and the log says how many were refused — one bad
+song must not cost the others. Adding to a playlist the user doesn't own fails per-playlist and is
 logged without affecting the others.
 
 After completion, `refresh_playlists()` runs so track counts update.

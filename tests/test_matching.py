@@ -4,6 +4,8 @@ The whole point of this module is refusing to guess, so most of these tests are
 about what must *not* be accepted.
 """
 
+import itertools
+
 import pytest
 
 from cratefill.matching import (
@@ -11,8 +13,7 @@ from cratefill.matching import (
     HIGH_TITLE,
     choose_match,
     core_title,
-    match_key,
-    has_version_conflict,
+    strip_metadata,
     normalize,
     score_artist,
     score_text,
@@ -98,7 +99,7 @@ class TestVersionMarkers:
         ("Stan (Clean)", "clean"),
     ])
     def test_finds_hard_markers(self, title, marker):
-        assert marker in version_markers(title)[0]
+        assert marker in version_markers(title)
 
     @pytest.mark.parametrize("title", [
         "Wonderwall (Remastered)",
@@ -107,27 +108,17 @@ class TestVersionMarkers:
         "Song (Album Version)",
         "Song (Official Video)",
     ])
-    def test_soft_markers_are_not_hard(self, title):
-        assert version_markers(title)[0] == set()
+    def test_packaging_details_are_not_versions(self, title):
+        assert version_markers(title) == set()
 
     def test_parenthesised_text_is_not_discarded(self):
         """Stripping brackets would throw away exactly the identifying detail."""
-        assert version_markers("Wonderwall (Live)")[0] == {"live"}
-
-    @pytest.mark.parametrize("want, got, conflict", [
-        ("Wonderwall", "Wonderwall (Live)", True),
-        ("Wonderwall (Live)", "Wonderwall", True),          # also the other direction
-        ("Wonderwall (Live)", "Wonderwall (Live)", False),
-        ("Wonderwall", "Wonderwall (Remastered)", False),   # soft marker only
-        ("Wonderwall", "Wonderwall", False),
-    ])
-    def test_conflicts_both_ways(self, want, got, conflict):
-        assert has_version_conflict(want, got) is conflict
+        assert version_markers("Wonderwall (Live)") == {"live"}
 
     @pytest.mark.parametrize("want, got, relation", [
         ("Wonderwall", "Wonderwall", "same"),
         ("Wonderwall (Live)", "Wonderwall (Live)", "same"),
-        ("Wonderwall", "Wonderwall (Remastered)", "same"),     # soft markers ignored
+        ("Wonderwall", "Wonderwall (Remastered)", "same"),     # packaging only
         ("Wonderwall", "Wonderwall (Live)", "extra"),          # not what was asked for
         ("Wonderwall (Live)", "Wonderwall", "missing"),        # the usable fallback
         ("Wonderwall (Live)", "Wonderwall (Remix)", "extra"),  # a different recording
@@ -151,8 +142,9 @@ class TestVersionMarkers:
         ("One More Time (Skrillex Remix)", "one more time"),
         ("Hurt (Johnny Cash Cover)", "hurt"),
         ("Song (2009 Remaster) (Live)", "song"),
-        # A bracketed group with no version marker is part of the title.
-        ("Song (Pt. 2)", "song pt 2"),
+        # Any bracketed group goes, marker or not: brackets never count.
+        ("Song (Pt. 2)", "song"),
+        ("Song - From the Movie X", "song"),
     ])
     def test_core_title(self, title, core):
         assert core_title(title) == core
@@ -161,7 +153,7 @@ class TestVersionMarkers:
         """The venue text must not cost the candidate title similarity — the
         version difference is reported separately."""
         d = decide("Oasis", "Wonderwall", result("Wonderwall (Live at Wembley)", "Oasis"))
-        assert d.title_score == 1.0
+        assert d.candidate.title_score == 1.0
         assert d.candidate.reason == "this is the live version, not the one asked for"
 
 
@@ -232,7 +224,7 @@ class TestHighConfidence:
         d = decide(artist, title, res)
         assert d.status == "high", f"{label}: {d}"
         assert d.video_id == "v1"
-        assert d.title_score >= HIGH_TITLE and d.artist_score >= HIGH_ARTIST
+        assert d.candidate.title_score >= HIGH_TITLE and d.candidate.artist_score >= HIGH_ARTIST
 
 
 class TestExactMatchInvariant:
@@ -260,7 +252,7 @@ class TestExactMatchInvariant:
     def test_an_exact_result_is_always_high(self, title):
         d = decide("Some Artist", title, result(title, "Some Artist"))
         assert d.status == "high", f"{title!r} → {d} (core {core_title(title)!r})"
-        assert d.title_score == 1.0
+        assert d.candidate.title_score == 1.0
 
     @pytest.mark.parametrize("title", MARKER_TITLES + TRICKY_TITLES)
     def test_the_core_title_is_never_empty(self, title):
@@ -302,6 +294,11 @@ class TestSpacing:
     def test_title_spacing_is_high(self, title, got):
         d = decide("Some Artist", title, result(got, "Some Artist"))
         assert d.status == "high", d
+
+    def test_spacing_is_forgiven_alongside_another_difference(self):
+        """Re-joining split words must survive extra words on the result."""
+        d = decide("Some Artist", "Love Song", result("Lovesong Radio Edit", "Some Artist"))
+        assert d.status in OFFERED and d.video_id == "v1"
 
     @pytest.mark.parametrize("want, got", [("one", "someone"), ("cher", "cherub")])
     def test_joining_words_cannot_create_a_substring_match(self, want, got):
@@ -355,6 +352,65 @@ class TestUnrequestedSuffix:
                    result("Song Name", "Some Artist", vid="single"))
         assert d.status == "high", d
 
+    @pytest.mark.parametrize("a, b", [
+        ({"isExplicit": True}, {"isExplicit": False}),
+        ({"duration": "4:18"}, {"duration": "5:02"}),
+        ({"duration_seconds": 258}, {"duration_seconds": 300}),
+    ])
+    def test_identical_titles_that_differ_visibly_ask(self, a, b):
+        """Clean vs explicit, or a clearly different length, is a real choice
+        even when the titles are identical."""
+        d = decide("Some Artist", "Song Name",
+                   dict(result("Song Name", "Some Artist", vid="one"), **a),
+                   dict(result("Song Name", "Some Artist", vid="two"), **b))
+        assert d.status == "ambiguous", d
+        assert {c.video_id for c in d.choices} == {"one", "two"}
+
+    @pytest.mark.parametrize("a, b", [
+        ({"duration": "4:18", "isExplicit": False}, {"duration": "4:22", "isExplicit": False}),
+        ({"duration": "4:18"}, {}),                       # unknown length isn't a difference
+        ({"duration": "1:04:18"}, {"duration_seconds": 3858}),
+    ])
+    def test_identical_titles_that_look_the_same_are_one_version(self, a, b):
+        d = decide("Some Artist", "Song Name",
+                   dict(result("Song Name", "Some Artist", vid="one"), **a),
+                   dict(result("Song Name", "Some Artist", vid="two"), **b))
+        assert d.status == "high", d
+        assert d.video_id == "one"
+
+    @pytest.mark.parametrize("order", [("u", "a", "b"), ("a", "b", "u"), ("a", "u", "b")])
+    def test_an_unknown_length_cannot_hide_a_known_difference(self, order):
+        """3:00 and 6:00 are two recordings whatever position the unknown-length
+        result comes in — it may join one of them, never merge them."""
+        durations = {"u": None, "a": "3:00", "b": "6:00"}
+        results = []
+        for vid in order:
+            r = result("Song Name", "Some Artist", vid=vid)
+            if durations[vid]:
+                r["duration"] = durations[vid]
+            results.append(r)
+        d = decide("Some Artist", "Song Name", *results)
+        assert d.status == "ambiguous", (order, d)
+        assert {"a", "b"} <= {c.video_id for c in d.choices}
+        assert "2 versions of this song found" in d.reason
+
+    @pytest.mark.parametrize("order", list(itertools.permutations(["3:00", "3:10", "3:20"])))
+    def test_lengths_cannot_chain_across_more_than_the_tolerance(self, order):
+        """3:00 and 3:20 are twenty seconds apart: whatever the order, two
+        recordings — 3:10 bridging them must not merge all three."""
+        d = decide("Some Artist", "Song Name",
+                   *[dict(result("Song Name", "Some Artist", vid=x), duration=x) for x in order])
+        assert d.status == "ambiguous", (order, d)
+        assert "2 versions of this song found" in d.reason
+
+    @pytest.mark.parametrize("order", [("u", "a"), ("a", "u")])
+    def test_an_unknown_length_alone_with_one_recording_is_the_same(self, order):
+        """Taken without asking, and the known-length entry is the one added."""
+        results = [dict(result("Song Name", "Some Artist", vid=v),
+                        **({"duration": "3:00"} if v == "a" else {})) for v in order]
+        d = decide("Some Artist", "Song Name", *results)
+        assert d.status == "high" and d.video_id == "a"
+
     def test_every_version_is_listed(self):
         """More versions than the usual three alternatives: all of them shown."""
         titles = ["Song Name"] + [f"Song Name ({x})" for x in
@@ -373,6 +429,29 @@ class TestUnrequestedSuffix:
     def test_brackets_on_the_request_are_ignored_too(self):
         d = decide("Some Artist", "Song Name (Pt. 2)", result("Song Name (Pt. 1)", "Some Artist"))
         assert d.status == "high", d
+
+
+class TestUserTextKeepsItsDashes:
+    """" - …" is YouTube Music's metadata convention, not the user's: a folder
+    import's title is the whole filename."""
+
+    def test_a_folder_filename_still_finds_the_song(self):
+        d = decide("Radio Nova", "Phoenix - Lisztomania", result("Lisztomania", "Phoenix"))
+        assert d.status in OFFERED and d.video_id == "v1"
+
+    @pytest.mark.parametrize("artist, title, got", [
+        ("Queen", "Bohemian Rhapsody - Remastered 2011", "Bohemian Rhapsody"),
+        ("The Beatles", "Here Comes the Sun - Remastered 2009", "Here Comes The Sun"),
+        ("Oasis", "Wonderwall - Live", "Wonderwall (Live at Wembley)"),
+    ])
+    def test_a_dash_suffix_in_a_spotify_export_is_metadata(self, artist, title, got):
+        """Exportify writes " - Remastered 2011": that reading must win too."""
+        d = decide(artist, title, result(got, artist))
+        assert d.status == "high", d
+
+    def test_a_dash_on_the_result_is_still_metadata(self):
+        d = decide("Oasis", "Wonderwall", result("Wonderwall - Remastered 2011", "Oasis"))
+        assert d.status == "high"
 
 
 class TestMatchKey:
@@ -402,8 +481,13 @@ class TestMatchKey:
         d = decide(artist, title, result(got_title, got_artist))
         assert d.status != "high", d
 
-    def test_a_title_that_is_all_brackets_matches_nothing_by_key(self):
-        assert match_key("(Intro)") == ""
+    def test_a_title_that_is_all_metadata_is_kept_whole(self):
+        assert strip_metadata("(Intro)") == "(Intro)"
+        d = decide("Artist", "(Intro)", result("(Intro)", "Artist"))
+        assert d.status == "high"
+
+    def test_nested_brackets_peel_completely(self):
+        assert strip_metadata("Song (Live (Remastered) 2004)").strip() == "Song"
 
     def test_several_versions_ask(self):
         d = decide("Artist", "Song",
@@ -433,13 +517,13 @@ class TestPrincipalArtist:
         d = decide("Jay-Z feat. Alicia Keys", "Empire State of Mind",
                    result("Empire State of Mind", "Alicia Keys"))
         assert d.status != "high"
-        assert d.artist_score < HIGH_ARTIST
+        assert d.candidate.principal_score < HIGH_ARTIST
         assert "Alicia Keys" in d.reason
 
     def test_a_guest_cannot_lift_a_wrong_principal_over_the_bar(self):
         d = decide("Jay-Z feat. Alicia Keys", "Empire State of Mind",
                    result("Empire State of Mind", "Alicia Keys", "Someone Else"))
-        assert d.artist_score < HIGH_ARTIST
+        assert d.candidate.principal_score < HIGH_ARTIST
 
     def test_with_is_a_separator_in_artists(self):
         """Unlike titles, artist credits really do use "with"."""
@@ -544,7 +628,7 @@ class TestSpacelessScripts:
     def test_a_kana_variant_is_offered(self):
         d = decide("Angela Aki", "愛をこめて花束を", result("愛を込めて花束を", "Angela Aki"))
         assert d.status in OFFERED
-        assert d.title_score >= 0.80
+        assert d.candidate.title_score >= 0.80
 
     def test_an_exact_japanese_title_is_confident(self):
         d = decide("宇多田ヒカル", "初恋", result("初恋", "宇多田ヒカル"))
@@ -714,16 +798,15 @@ class TestAmbiguity:
                    result("Champagne Supernova", "Oasis", vid="b"))
         assert d.status == "high" and d.video_id == "a"
 
-    def test_a_near_tie_without_a_sure_artist_is_ambiguous(self):
+    def test_without_a_sure_artist_it_is_offered_not_taken(self):
         """When the artist isn't a sure match these aren't versions of the
-        requested song, so the margin still decides between them."""
+        requested song: the best is offered, with the shortfall named."""
         d = decide("Nick Cave & The Bad Seeds", "Red Right Hand",
                    result("Red Right Hand", "Nick Cave and the Bad Seeds", vid="a"),
-                   result("Red Right Hand (Live)", "Nick Cave and the Bad Seeds", vid="b"),
-                   result("Red Right Hand", "Nick Cave and the Bad Seeds", vid="c"))
+                   result("Red Right Hand (Live)", "Nick Cave and the Bad Seeds", vid="b"))
         assert d.status == "ambiguous"
-        assert d.runner_up_score is not None
-        assert "almost the same" in d.reason
+        assert d.video_id == "a"
+        assert "artist similarity" in d.reason
 
     def test_the_plain_title_is_proposed_first_among_versions(self):
         """On a tie, the literal title leads, whatever YouTube Music's order."""
@@ -740,8 +823,7 @@ class TestAmbiguity:
                    result("Wonderwall (Live)", "Oasis", vid="a"),
                    result("Wonderwall", "Oasis", vid="b"))
         assert d.video_id == "b"
-        assert d.runner_up_score is not None, "the live take is ranked, not discarded"
-        assert d.alternatives[0].video_id == "a"
+        assert d.alternatives[0].video_id == "a", "the live take is ranked, not discarded"
 
     def test_alternatives_are_offered_for_review(self):
         d = decide("Oasis", "Wonderwall",
