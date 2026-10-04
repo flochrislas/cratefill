@@ -192,6 +192,33 @@ class TestAddVideoIdsToPlaylists:
         assert any("already in the playlist" in line for line in kinds(out, "log"))
         assert len(yt.added) == 1  # no pointless second attempt
 
+    def test_a_refused_retry_falls_back_to_one_song_at_a_time(self):
+        """A duplicate under a different id survives the filtered retry and
+        fails the batch again; only that song may be lost, not the others."""
+        out = []
+        yt = FakeYT(add_status=lambda attempt: "STATUS_SUCCEEDED" if attempt in (3, 5)
+                    else "STATUS_FAILED")
+        youtube.add_video_ids_to_playlists(yt, ["a", "dup", "b"], [PLAYLIST], out.append)
+        assert yt.added == [["a", "dup", "b"], ["a", "dup", "b"], ["a"], ["dup"], ["b"]]
+        assert any("Added 2 of 3 song(s) to 'Road trip'; 1 refused" in line
+                   for line in kinds(out, "log"))
+
+    def test_an_error_on_one_song_does_not_stop_the_rest(self):
+        out = []
+        # Attempts 1 and 2 are the batch and its retry; "boom" raises before
+        # reaching the fake, so "ok" alone is attempt 3.
+        yt = FakeYT(add_status=lambda attempt: "STATUS_SUCCEEDED" if attempt == 3
+                    else "STATUS_FAILED")
+        real_add = yt.add_playlist_items
+
+        def add(playlist_id, video_ids, **kwargs):
+            if list(video_ids) == ["boom"]:
+                raise RuntimeError("network hiccup")
+            return real_add(playlist_id, video_ids, **kwargs)
+        yt.add_playlist_items = add
+        youtube.add_video_ids_to_playlists(yt, ["boom", "ok"], [PLAYLIST], out.append)
+        assert any("Added 1 of 2" in line for line in kinds(out, "log"))
+
     def test_one_failing_playlist_does_not_stop_the_others(self):
         out = []
         two = [PLAYLIST, {"playlistId": "PL2", "title": "Chill"}]

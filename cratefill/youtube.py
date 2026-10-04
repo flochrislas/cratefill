@@ -226,48 +226,57 @@ def add_video_ids_to_playlists(yt, video_ids, playlists, put):
     and every ambiguous one decided, so nothing here needs to judge anything.
     """
     video_ids = list(dict.fromkeys(video_ids))  # two rows can match the same YT song
-
-    def status_of(result):
-        return str(result.get("status", "")) if isinstance(result, dict) else str(result)
-
     for pl in playlists:
-        if not video_ids:
-            put(("step", None))
-            continue
-        try:
-            # YT Music rejects the whole batch if even one song is already in
-            # the playlist (no items get added), so on failure drop the songs
-            # it already contains and retry with the rest.
-            to_add = video_ids
-            skipped = 0
-            result = yt.add_playlist_items(pl["playlistId"], to_add, duplicates=False)
-            if "SUCCEEDED" not in status_of(result):
-                existing = {
-                    t.get("videoId")
-                    for t in yt.get_playlist(pl["playlistId"], limit=None).get("tracks", [])
-                }
-                to_add = [v for v in video_ids if v not in existing]
-                skipped = len(video_ids) - len(to_add)
-                if not to_add:
-                    put(("log", f"→ '{pl['title']}': all {len(video_ids)} song(s) "
-                                "are already in the playlist — nothing to add"))
-                    put(("step", None))
-                    continue
-                result = yt.add_playlist_items(pl["playlistId"], to_add, duplicates=False)
-            status = status_of(result)
-            if "SUCCEEDED" in status:
-                message = f"→ Added {len(to_add)} song(s) to '{pl['title']}'"
-                if skipped:
-                    message += f" ({skipped} already there, skipped)"
-                put(("log", message))
-            else:
-                put(("log", f"→ '{pl['title']}': {status} (playlist not editable, or YT Music "
-                            "sees some of these songs as duplicates under different ids)"))
-        except Exception as e:
-            put(("log", f"→ Failed to add to '{pl['title']}': {e}"))
+        if video_ids:
+            try:
+                put(("log", _add_to_playlist(yt, pl, video_ids)))
+            except Exception as e:
+                put(("log", f"→ Failed to add to '{pl['title']}': {e}"))
         put(("step", None))
-
     put(("log", "--- Done. ---"))
+
+
+def _add_to_playlist(yt, pl, video_ids):
+    """Add the ids to one playlist and return the log line saying how it went.
+
+    YT Music rejects a whole batch, adding nothing, if even one song is already
+    in the playlist. So a refused batch is retried without the songs the
+    playlist already contains — and if it is *still* refused (a duplicate under
+    a different id, or a song the playlist won't take), the rest go one at a
+    time, so a single refusal can't cost every other new song.
+    """
+    name = pl["title"]
+    if _added(yt, pl, video_ids):
+        return f"→ Added {len(video_ids)} song(s) to '{name}'"
+
+    tracks = yt.get_playlist(pl["playlistId"], limit=None).get("tracks") or []
+    existing = {t.get("videoId") for t in tracks}
+    to_add = [v for v in video_ids if v not in existing]
+    if not to_add:
+        return (f"→ '{name}': all {len(video_ids)} song(s) are already in the "
+                "playlist — nothing to add")
+    skipped = len(video_ids) - len(to_add)
+    note = f" ({skipped} already there, skipped)" if skipped else ""
+    if _added(yt, pl, to_add):
+        return f"→ Added {len(to_add)} song(s) to '{name}'{note}"
+
+    refused = [v for v in to_add if not _added(yt, pl, [v], quiet=True)]
+    return (f"→ Added {len(to_add) - len(refused)} of {len(to_add)} song(s) to "
+            f"'{name}'{note}; {len(refused)} refused (playlist not editable, or YT "
+            "Music sees them as duplicates under different ids)")
+
+
+def _added(yt, pl, video_ids, quiet=False):
+    """True if YT Music accepted the batch. With `quiet`, an error counts as a
+    refusal instead of propagating — one song's failure is not the playlist's."""
+    try:
+        result = yt.add_playlist_items(pl["playlistId"], video_ids, duplicates=False)
+    except Exception:
+        if quiet:
+            return False
+        raise
+    status = result.get("status", "") if isinstance(result, dict) else result
+    return "SUCCEEDED" in str(status)
 
 
 def export_playlists_to_csv(yt, playlists, dest, put, liked_only=False):
