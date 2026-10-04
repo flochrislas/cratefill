@@ -367,8 +367,8 @@ class AmbiguousMatchDialog(tk.Toplevel):
         ttk.Label(body, text=f"{artist} — {title}", wraplength=520).pack(
             anchor="w", padx=(12, 0), pady=(0, 8)
         )
-        # The decision-level reason, which includes why we're asking at all — the
-        # near-tie note lives here rather than on any single candidate.
+        # The decision-level reason: why we're asking at all ("2 versions of
+        # this song found"), as opposed to each candidate's own shortfalls.
         ttk.Label(body, text="Reason:", foreground=FG_DIM).pack(anchor="w")
         ttk.Label(body, text=decision.reason, wraplength=520, justify="left").pack(
             anchor="w", padx=(12, 0), pady=(0, 8)
@@ -385,10 +385,37 @@ class AmbiguousMatchDialog(tk.Toplevel):
         # not always the one the user wants, and the reason text says as much.
         caption = "Proposed:" if len(self.choices) == 1 else "Proposed (tick any to add):"
         ttk.Label(body, text=caption, foreground=FG_DIM).pack(anchor="w")
+
+        # Buttons and the checkbox are packed (to the bottom) *before* the list,
+        # so they keep their space however many candidates there are — the list
+        # is what scrolls. Every version of a song is listed, which can be ten.
+        buttons = ttk.Frame(body)
+        buttons.pack(side="bottom", fill="x", pady=(12, 0))
+        add = ttk.Button(buttons, text="Add", command=lambda: self._choose(policy.ADD))
+        add.pack(side="right")
+        self.add_button = add
+        ttk.Button(buttons, text="Skip", command=lambda: self._choose(policy.SKIP)).pack(
+            side="right", padx=(0, 8)
+        )
+        self.remember_var = tk.BooleanVar(value=False)
+        self.remember_check = ttk.Checkbutton(
+            body,
+            text="Use this choice for future ambiguous matches",
+            variable=self.remember_var,
+        )
+        if decision.status != "weak":
+            self.remember_check.pack(side="bottom", anchor="w", pady=(4, 0))
+
+        list_area = ttk.Frame(body)
+        list_area.pack(fill="both", expand=True, padx=(12, 0))
+        canvas = tk.Canvas(list_area, bg=BG, highlightthickness=0, borderwidth=0,
+                           yscrollincrement=20)
+        rows = ttk.Frame(canvas)
+        canvas.create_window((0, 0), window=rows, anchor="nw")
         self.choice_vars = [tk.BooleanVar(value=index == 0) for index in range(len(self.choices))]
         for index, candidate in enumerate(self.choices):
-            row = ttk.Frame(body)
-            row.pack(fill="x", anchor="w", padx=(12, 0))
+            row = ttk.Frame(rows)
+            row.pack(fill="x", anchor="w")
             # Checkbox + "Open" share the top line so the button lines up with the
             # score, which is what the user's eye tracks along.
             head = ttk.Frame(row)
@@ -423,26 +450,33 @@ class AmbiguousMatchDialog(tk.Toplevel):
                 anchor="w", padx=(24, 0), pady=(0, 6)
             )
 
-        self.remember_var = tk.BooleanVar(value=False)
-        self.remember_check = ttk.Checkbutton(
-            body,
-            text="Use this choice for future ambiguous matches",
-            variable=self.remember_var,
-        )
-        if decision.status != "weak":
-            self.remember_check.pack(anchor="w", pady=(4, 0))
-
-        buttons = ttk.Frame(body)
-        buttons.pack(fill="x", pady=(12, 0))
-        add = ttk.Button(buttons, text="Add", command=lambda: self._choose(policy.ADD))
-        add.pack(side="right")
-        self.add_button = add
-        ttk.Button(buttons, text="Skip", command=lambda: self._choose(policy.SKIP)).pack(
-            side="right", padx=(0, 8)
-        )
+        self._fit_list(canvas, rows)
         add.focus_set()
         self.bind("<Escape>", lambda _e: self.destroy())  # dismiss = cancel the import
         self._select()
+
+    def _fit_list(self, canvas, rows):
+        """Size the candidate list to its content, or to what the screen has
+        room for — with a scrollbar and the mouse wheel — when it doesn't fit."""
+        self.update_idletasks()  # the canvas isn't packed yet: this measures the rest
+        width, height = rows.winfo_reqwidth(), rows.winfo_reqheight()
+        # Leave room for the title bar and a taskbar; the rest of the dialog
+        # (request, reason, buttons) keeps its natural height.
+        room = max(self.winfo_screenheight() - 120 - self.winfo_reqheight(), 120)
+        canvas.configure(width=width, height=min(height, room),
+                         scrollregion=(0, 0, width, height))
+        if height > room:
+            bar = ttk.Scrollbar(canvas.master, orient="vertical", command=canvas.yview)
+            canvas.configure(yscrollcommand=bar.set)
+            bar.pack(side="right", fill="y")
+            # Bound on the dialog, whose tag every child carries, so the wheel
+            # works wherever the pointer is. Windows/macOS send <MouseWheel>,
+            # X11 sends buttons 4 and 5.
+            self.bind("<MouseWheel>",
+                      lambda e: canvas.yview_scroll(-1 if e.delta > 0 else 1, "units"))
+            self.bind("<Button-4>", lambda _e: canvas.yview_scroll(-1, "units"))
+            self.bind("<Button-5>", lambda _e: canvas.yview_scroll(1, "units"))
+        canvas.pack(side="left", fill="both", expand=True)
 
     def _select(self):
         """Track the ticked candidates. Add needs at least one — with none ticked
@@ -932,10 +966,10 @@ class CratefillApp:
             elif decision.status == "ambiguous":
                 verb = "added" if action == policy.ADD else "skipped"
                 self.log(f"    → ambiguous match {verb} by policy")
-            # Two songs can resolve to the same track; one batch must not carry
-            # it twice.
+            # Two rows can resolve to the same track, so "N to add" counts
+            # only ids not already approved.
             new_ids = [v for v in video_ids if v not in approved]
-            if action == policy.ADD and new_ids:
+            if action == policy.ADD and video_ids:
                 approved.extend(new_ids)
                 counts["add"] += len(new_ids)
             else:

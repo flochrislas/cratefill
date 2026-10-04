@@ -27,7 +27,7 @@ def high(vid="v-high"):
 
 def ambiguous(vid="v-amb", alternatives=()):
     return MatchDecision("ambiguous", candidate=candidate(vid),
-                         reasons=["another candidate scores almost the same"],
+                         reasons=["2 versions of this song found"],
                          alternatives=list(alternatives))
 
 
@@ -227,17 +227,19 @@ class TestChoosingAnAlternative:
         assert approved_ids(started) == ["v-winner", "v-alt2"]
         assert any("2 to add" in line for line in stub.logs)
 
-    def test_a_track_already_approved_is_not_added_twice(self):
-        alt = candidate("v-high", title="Other")
-        stub = ReviewStub("ask", answers=[(policy.ADD, False, [0, 1])])
-        started = review(stub, [high("v-high"), ambiguous("v-winner", alternatives=[alt])])
-        assert approved_ids(started) == ["v-high", "v-winner"]
-
     def test_the_winner_is_used_when_nothing_is_picked(self):
         alt = candidate("v-alt", title="Other")
         stub = ReviewStub("ask", answers=[(policy.ADD, False)])
         started = review(stub, [ambiguous("v-winner", alternatives=[alt])])
         assert approved_ids(started) == ["v-winner"]
+
+
+class TestCounting:
+    def test_a_track_two_rows_resolve_to_is_counted_once(self):
+        stub = ReviewStub("add")
+        started = review(stub, [high("same"), high("same")])
+        assert approved_ids(started) == ["same"]
+        assert any("1 to add" in line for line in stub.logs)
 
 
 class TestCancelling:

@@ -35,7 +35,7 @@ def decision():
     return MatchDecision(
         "ambiguous",
         candidate=candidate("v1", "Wonderwall (Deluxe)"),
-        reasons=["another candidate scores almost the same"],
+        reasons=["2 versions of this song found"],
     )
 
 
@@ -44,7 +44,7 @@ def decision_with_alternatives():
     return MatchDecision(
         "ambiguous",
         candidate=candidate("v1", "Wonderwall (Deluxe)", score=0.95),
-        reasons=["another candidate scores almost the same"],
+        reasons=["2 versions of this song found"],
         alternatives=[
             candidate("v2", "Wonderwall", score=0.94, reasons=["a close second"]),
             candidate("v3", "Wonderwall (Live)", score=0.80, reasons=["live version"]),
@@ -73,7 +73,7 @@ def test_shows_the_request_the_proposal_and_the_reason(root, decision):
     shown = " | ".join(shown_text(dialog))
     assert "Oasis — Wonderwall" in shown          # requested
     assert "Wonderwall (Deluxe)" in shown         # proposed
-    assert "almost the same" in shown             # reason
+    assert "2 versions" in shown             # reason
     dialog.destroy()
 
 
@@ -278,7 +278,7 @@ class TestCandidateMetadataInDialog:
                                 score=0.78, extras={
                                     "album": {"name": "TIKI"}, "duration": "4:08",
                                 }),
-            reasons=["another candidate scores almost the same"],
+            reasons=["2 versions of this song found"],
             alternatives=[
                 candidate("v2", "Manyaka O Brazil", artist="Richard Bona", score=0.78,
                           extras={"album": {"name": "Tiki"}, "duration": "4:07"}),
@@ -304,7 +304,7 @@ class TestCandidateMetadataInDialog:
         dialog = open_dialog(root, decision)
         shown = " | ".join(shown_text(dialog))
         assert "Wonderwall (Deluxe)" in shown
-        assert "almost the same" in shown             # reason still there
+        assert "2 versions" in shown             # reason still there
         dialog.destroy()
 
 
@@ -495,3 +495,41 @@ class TestEmptyListHintWithRealDragAndDrop:
         dnd_root.update()
         assert "Drag" not in app.empty_hint.cget("text")
         assert "Load CSV" in app.empty_hint.cget("text")
+
+
+class TestManyCandidates:
+    """Every version of a song is listed, which can be ten: the list scrolls and
+    the buttons must stay on screen."""
+
+    def many(self):
+        return MatchDecision(
+            "ambiguous",
+            candidate=candidate("v0", "Wonderwall", score=1.0),
+            reasons=["10 versions of this song found"],
+            alternatives=[candidate(f"v{i}", f"Wonderwall (Take {i})",
+                                    extras={"album": {"name": "Morning Glory"},
+                                            "duration": "4:18", "year": "1995"})
+                          for i in range(1, 10)],
+        )
+
+    def test_the_dialog_fits_on_screen(self, root):
+        dialog = open_dialog(root, self.many())
+        assert dialog.winfo_reqheight() <= dialog.winfo_screenheight()
+        dialog.destroy()
+
+    def test_every_candidate_is_still_listed(self, root):
+        dialog = open_dialog(root, self.many())
+        assert len(dialog.choice_vars) == 10
+        assert "Wonderwall (Take 9)" in " | ".join(shown_text(dialog))
+        dialog.destroy()
+
+    def test_a_short_list_does_not_scroll(self, root, decision):
+        dialog = open_dialog(root, decision)
+        assert "TScrollbar" not in {w.winfo_class() for w in all_widgets(dialog)}
+        dialog.destroy()
+
+
+def all_widgets(widget):
+    for child in widget.winfo_children():
+        yield child
+        yield from all_widgets(child)
