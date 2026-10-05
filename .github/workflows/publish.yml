@@ -26,6 +26,10 @@ jobs:
   test:
     name: Tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # The suite takes well under a minute. A test stuck on a modal dialog
+    # (Windows has a real desktop, so those tests run there) must fail the
+    # release rather than hang it for the default six hours.
+    timeout-minutes: 15
     strategy:
       fail-fast: false          # a Windows-only failure shouldn't hide a Linux one
       matrix:

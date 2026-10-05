@@ -36,6 +36,20 @@ def no_real_session(tmp_path, monkeypatch):
     monkeypatch.setattr(app_module.youtube, "open_session", _no_network)
 
 
+@pytest.fixture(autouse=True)
+def no_modal_boxes(monkeypatch):
+    """A message box nobody answers blocks forever — on Windows CI, which has
+    a real desktop, that hung a release for ten minutes. Here an unexpected
+    box fails the test at once; tests that expect one patch it themselves."""
+    from tkinter import messagebox
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError(f"unexpected message box: {args}")
+
+    for name in ("showinfo", "showwarning", "showerror", "askokcancel", "askyesno"):
+        monkeypatch.setattr(messagebox, name, unexpected)
+
+
 def _no_network():
     raise AssertionError("a test tried to open a YouTube Music session")
 
@@ -648,7 +662,9 @@ class TestLoadingSeveralSources:
         app = self.app(root)
         a = self.csv(tmp_path, "with space.csv", [("Phoenix", "Lisztomania")])
         b = self.csv(tmp_path, "b.csv", [("Air", "Sexy Boy")])
-        event = type("Drop", (), {"data": f"{{{a}}} {b}"})()   # Tcl list, as tkdnd sends it
+        # A real Tcl list, as tkdnd sends it — hand-quoting broke on Windows,
+        # where an unbraced path's backslashes were read as escapes.
+        event = type("Drop", (), {"data": root.tk.call("list", a, b)})()
         app._on_drop(event)
         root.update()                              # the drop is handled just after
         assert len(app.songs) == 2
@@ -734,7 +750,7 @@ class TestLoadingOntoAList:
 
     @staticmethod
     def drop(app, *paths, settle=True):
-        app._on_drop(type("Drop", (), {"data": " ".join(f"{{{p}}}" for p in paths)})())
+        app._on_drop(type("Drop", (), {"data": app.root.tk.call("list", *map(str, paths))})())
         if settle:
             app.root.update()                      # the drop is handled just after
 
