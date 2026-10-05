@@ -10,6 +10,7 @@ import os
 import re
 import sys
 import tempfile
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import NamedTuple
 
@@ -154,6 +155,68 @@ def read_songs_folder(path) -> list[Song]:
         for f in sorted(folder.iterdir())
         if f.is_file() and f.suffix.lower() in AUDIO_EXTENSIONS
     ]
+
+
+CSV_EXTENSIONS = {".csv", ".txt"}
+
+
+@dataclass
+class SongSources:
+    """Several CSV files and music folders read as one list.
+
+    `sources` is what each loaded path contributed (before duplicates were
+    dropped), `skipped` each path that gave nothing and why, `duplicates` how
+    many rows were merged away — including ones already in the list.
+    """
+
+    songs: list[Song] = field(default_factory=list)
+    sources: list[tuple[Path, int]] = field(default_factory=list)
+    skipped: list[tuple[Path, str]] = field(default_factory=list)
+    duplicates: int = 0
+
+
+def read_song_sources(paths, existing=()) -> SongSources:
+    """Read CSV files and music folders, in the order given, into one list.
+
+    A song in more than one source — same artist and title, ignoring case and
+    spacing — is kept once, as its first occurrence: searching and reviewing
+    it twice would only ask the same question twice. Songs in `existing` (a
+    list being added to) count as already seen, so `songs` holds only what is
+    new. A path that can't be read, or holds no songs, is skipped and
+    reported; the rest still load.
+    """
+    result = SongSources()
+    seen = {(_song_key(song[0]), _song_key(song[1])) for song in existing}
+    for path in map(Path, paths):
+        try:
+            if path.is_dir():
+                songs = read_songs_folder(path)
+                empty = "no music files in that folder"
+            elif path.suffix.lower() in CSV_EXTENSIONS:
+                songs = read_songs_csv(path)
+                empty = "no songs found in that file"
+            else:
+                result.skipped.append((path, "not a CSV file or a folder"))
+                continue
+        except Exception as e:  # unreadable, vanished, permission denied…
+            result.skipped.append((path, str(e)))
+            continue
+        if not songs:
+            result.skipped.append((path, empty))
+            continue
+        result.sources.append((path, len(songs)))
+        for song in songs:
+            key = (_song_key(song.artist), _song_key(song.title))
+            if key in seen:
+                result.duplicates += 1
+            else:
+                seen.add(key)
+                result.songs.append(song)
+    return result
+
+
+def _song_key(text):
+    return " ".join(text.split()).casefold()
 
 
 def safe_filename(name):

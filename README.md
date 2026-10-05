@@ -10,10 +10,13 @@ candidate isn't clear, it asks rather than guessing.
 
 ![Cratefill screenshot](https://raw.githubusercontent.com/flochrislas/cratefill/main/docs/screenshot.png)
 
-- **Left pane:** load your songs, either from a CSV (artist + song name; extra
-  columns are ignored) or from a folder of music files (**Load folder…** — the
-  folder name + file name become the search query). You can also drag and drop
-  a CSV file or a folder straight onto the song list. Click a column title to sort.
+- **Left pane:** load your songs, either from CSV files (artist + song name;
+  extra columns are ignored) or from a folder of music files (**Load folder…** —
+  the folder name + file name become the search query). Select several CSVs at
+  once, or drag and drop any mix of CSV files and folders onto the song list, and
+  they're combined into one list; a song that appears in more than one is listed
+  once. Loading onto a list that already has songs — by button or by drop —
+  asks whether to add them to it or make a new list. Click a column title to sort.
 - **Right pane:** log in to YouTube Music and see your playlists.
 - Select songs on the left, one or more playlists on the right, click **Add** —
   each song is searched on YouTube Music and added to every selected playlist.

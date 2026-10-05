@@ -17,12 +17,11 @@ storage.py, and every network call in youtube.py.
 import queue
 import threading
 import tkinter as tk
-from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from . import policy, youtube
-from .storage import read_songs_csv, read_songs_folder
-from .dialogs import AmbiguousMatchDialog, LoginDialog
+from .storage import read_song_sources
+from .dialogs import AddOrReplaceDialog, AmbiguousMatchDialog, LoginDialog
 from .theme import (
     DARK_LIST_STYLE, DARK_TEXT_STYLE, FG_DIM, FIELD, apply_dark_theme, enable_dark_title_bar,
 )
@@ -41,7 +40,7 @@ SONG_COLUMNS = (("artist", "Artist"), ("title", "Song"), ("station", "Station"))
 HELP_TEXT = """\
 How to use:
 
-1. Load a list of songs from a CSV file or a folder.
+1. Load songs from CSV files or a folder (several CSVs are combined).
 2. Log into YouTube Music and select a playlist.
 3. Select the songs you want to add to this playlist.
 4. Click the big "Add selected songs to selected playlist(s)" button.
@@ -62,6 +61,8 @@ class CratefillApp:
 
         self.yt = None
         self.songs = []  # list of storage.Song
+        self.source_names = []  # the files and folders self.songs came from, for the label
+        self.drop_pending = False  # a drop is being asked about; see _on_drop
         self.song_sort = (None, False)  # (column id, descending?)
         self.playlists = []  # list of dicts from get_library_playlists
         self.worker_queue = queue.Queue()
@@ -164,7 +165,7 @@ class CratefillApp:
         # dead zone in the very spot the text says to aim for.
         hint_accepts_drops = self._register_drop_target(self.empty_hint)
         self.empty_hint.configure(
-            text="Drag a CSV file or a folder of music here\n\n"
+            text="Drag CSV files or music folders here\n(several at once are combined)\n\n"
                  "or use Load CSV… / Load folder… above"
             if tree_accepts_drops and hint_accepts_drops
             else "Use Load CSV… or Load folder… above to get started",
@@ -314,57 +315,104 @@ class CratefillApp:
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
 
-    # ---------- Left pane: CSV ----------
+    # ---------- Left pane: loading songs ----------
 
     def load_csv(self):
-        path = filedialog.askopenfilename(
-            title="Open songs CSV",
+        paths = filedialog.askopenfilenames(
+            title="Open songs CSV (select several to combine them)",
             filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
         )
-        if path:
-            self.load_csv_path(path)
-
-    def load_csv_path(self, path):
-        try:
-            self.songs = read_songs_csv(path)
-        except Exception as e:
-            messagebox.showerror("Cratefill", f"Could not read CSV:\n{e}")
-            return
-        self.populate_song_tree()
-        self.csv_label.configure(text=f"{Path(path).name} — {len(self.songs)} songs")
-        self.log(f"Loaded {len(self.songs)} songs from {path}")
+        if paths:
+            self._load_asking(paths, "selected")
 
     def load_folder(self):
         path = filedialog.askdirectory(title="Open a folder of music files")
         if path:
-            self.load_folder_path(path)
-
-    def load_folder_path(self, path):
-        songs = read_songs_folder(path)
-        if not songs:
-            messagebox.showwarning("Cratefill", "No music files found in that folder.")
-            return
-        self.songs = songs
-        self.populate_song_tree()
-        self.csv_label.configure(text=f"{Path(path).name} — {len(self.songs)} songs")
-        self.log(f"Loaded {len(self.songs)} music files from {path}")
+            self._load_asking([path], "selected")
 
     def _on_drop(self, event):
-        """Handle a file/folder dropped onto the song list."""
-        paths = [Path(p) for p in self.song_tree.tk.splitlist(event.data)]
+        """Load everything dropped onto the song list — files and folders.
+
+        The drop is acknowledged at once and handled just after: on Windows the
+        drag source (Explorer) waits for this callback to return, so asking
+        add-or-replace in here would freeze it until the user answered. Drops
+        arriving while one is still pending or being asked about are ignored —
+        the dialog's grab doesn't stop drag-and-drop, and they would stack.
+        """
+        paths = self.song_tree.tk.splitlist(event.data)
         if not paths:
             return
-        if len(paths) > 1:
-            self.log("Multiple items dropped — loading only the first one.")
-        path = paths[0]
-        if path.is_dir():
-            self.load_folder_path(str(path))
-        elif path.suffix.lower() in (".csv", ".txt"):
-            self.load_csv_path(str(path))
+        if self.drop_pending:
+            self.log("Answer the open question before dropping more.")
+            return
+        self.drop_pending = True
+        self.root.after_idle(self._finish_drop, paths)
+
+    def _finish_drop(self, paths):
+        try:
+            self._load_asking(paths, "dropped")
+        finally:
+            self.drop_pending = False
+
+    def _load_asking(self, paths, how):
+        """Load paths the user just picked or dropped. With songs already
+        listed, they choose first: combine with the list, or make a new one.
+        Dismissing the question loads nothing."""
+        choice = self._ask_add_or_replace(len(paths), how) if self.songs \
+            else AddOrReplaceDialog.NEW
+        if choice is not None:
+            self.load_paths(paths, add=choice == AddOrReplaceDialog.ADD)
+
+    def _ask_add_or_replace(self, count, how):
+        """AddOrReplaceDialog.ADD / NEW, or None if the user dismissed it."""
+        dialog = AddOrReplaceDialog(self.root, count, len(self.songs), how)
+        self.root.wait_window(dialog)
+        return dialog.choice
+
+    def load_paths(self, paths, add=False):
+        """Load these CSV files and music folders, combined in order
+        (storage.read_song_sources): as a new list, or with `add` appended to
+        the current one, skipping songs it already has and keeping its
+        selection.
+
+        A path that gives nothing is skipped and named, in the log and in a
+        warning; the rest still load. If nothing loads at all, the current list
+        is left alone rather than emptied.
+        """
+        existing = self.songs if add else []
+        loaded = read_song_sources(paths, existing=existing)
+        for path, reason in loaded.skipped:
+            self.log(f"✗ Skipped {path.name}: {reason}")
+        if loaded.skipped:
+            listed = "\n".join(f"• {path.name}: {reason}" for path, reason in loaded.skipped)
+            kept = "" if loaded.songs else "\n\nThe song list was left unchanged."
+            messagebox.showwarning("Cratefill", f"Could not load:\n{listed}{kept}")
+        if not loaded.songs:
+            if loaded.sources:  # read fine, but every song was already listed
+                self.log("Nothing new: every song loaded is already in the list.")
+            return
+
+        selected = self.song_tree.selection() if add else ()
+        self.songs = existing + loaded.songs
+        self.source_names = (self.source_names if add else []) + [
+            path.name for path, _count in loaded.sources]
+        self.populate_song_tree()
+        if selected:  # appended rows leave the old iids pointing where they did
+            self.song_tree.selection_set(selected)
+            self.refresh_add_button()
+        first, count = self.source_names[0], len(self.source_names)
+        where = first if count == 1 else f"{first} + {count - 1} more"
+        self.csv_label.configure(text=f"{where} — {len(self.songs)} songs")
+
+        merged = f" ({loaded.duplicates} duplicate(s) skipped)" if loaded.duplicates else ""
+        verb, total = ("Added", f", {len(self.songs)} in the list") if add else ("Loaded", "")
+        sources = loaded.sources
+        if len(sources) == 1:
+            self.log(f"{verb} {len(loaded.songs)} songs from {sources[0][0]}{merged}{total}")
         else:
-            messagebox.showwarning(
-                "Cratefill", "Drop a .csv file (or a folder of music files)."
-            )
+            self.log(f"{verb} {len(loaded.songs)} songs from {len(sources)} sources{merged}{total}:")
+            for path, n in sources:
+                self.log(f"    {path.name}: {n} song(s)")
 
     def populate_song_tree(self):
         """(Re)fill the tree from self.songs, in CSV order.

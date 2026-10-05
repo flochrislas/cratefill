@@ -345,3 +345,64 @@ class AmbiguousMatchDialog(tk.Toplevel):
         self.action = action
         self.remember = bool(self.remember_var.get())
         self.destroy()
+
+
+class AddOrReplaceDialog(tk.Toplevel):
+    """Asks what newly chosen files should do to a song list that isn't empty.
+
+    Sets `choice` to "add" (combine them with the list) or "new" (replace it),
+    or leaves it None if the window was dismissed — the caller then loads
+    nothing. "Add" is the default: it can't lose anything.
+    """
+
+    ADD, NEW = "add", "new"
+
+    def __init__(self, parent, count, listed, how="dropped"):
+        """`count` files/folders arriving, `listed` songs already there; `how`
+        they arrived ("dropped", "selected") for the question's wording."""
+        super().__init__(parent)
+        self.title("Add to the song list?")
+        self.configure(bg=BG)
+        self.transient(parent)
+        self.resizable(False, False)
+        self.grab_set()
+        enable_dark_title_bar(self)
+        self.choice = None
+
+        body = ttk.Frame(self, padding=12)
+        body.pack(fill="both", expand=True)
+        items = "1 item" if count == 1 else f"{count} items"
+        ttk.Label(
+            body,
+            text=f"The song list already has {listed} song(s).\n"
+                 f"What should the {items} you {how} do?",
+            justify="left",
+        ).pack(anchor="w")
+        ttk.Label(
+            body,
+            text="Songs already in the list are not added twice.",
+            foreground=FG_DIM,
+        ).pack(anchor="w", pady=(4, 0))
+
+        buttons = ttk.Frame(body)
+        buttons.pack(fill="x", pady=(12, 0))
+        self.add_button = ttk.Button(buttons, text="Add and combine to the list",
+                                     command=lambda: self._choose(self.ADD))
+        self.add_button.pack(side="right")
+        self.new_button = ttk.Button(buttons, text="Make a new list",
+                                     command=lambda: self._choose(self.NEW))
+        self.new_button.pack(side="right", padx=(0, 8))
+        self.add_button.focus_set()
+        self.bind("<Return>", self._press_focused)
+        self.bind("<Escape>", lambda _e: self.destroy())  # dismiss = load nothing
+
+    def _press_focused(self, _event=None):
+        """Enter presses the focused button: ttk buttons only answer the space
+        bar, and a blanket "Enter = Add" ignored a Tab to "Make a new list".
+        Add has focus when the dialog opens, so Enter alone still adds."""
+        focused = self.focus_get()
+        (focused if focused in (self.add_button, self.new_button) else self.add_button).invoke()
+
+    def _choose(self, choice):
+        self.choice = choice
+        self.destroy()

@@ -49,6 +49,7 @@ cratefill/
 │                  Song(artist, title, station)  one imported row (a NamedTuple)
 │                  read_songs_csv(path)       CSV → list[Song]
 │                  read_songs_folder(path)    music files → list[Song(folder, stem)]
+│                  read_song_sources(paths)   several CSVs/folders → one list, deduped
 │                  safe_filename(name)        playlist title → legal file name
 │                  write_playlist_csv(...)    tracks → Artist/Title/Album CSV
 │                  ARTIST/TITLE/STATION_HEADERS, AUDIO_EXTENSIONS
@@ -67,6 +68,7 @@ cratefill/
 ├── dialogs.py     LOGIN_INSTRUCTIONS, candidate_meta(result)
 │                  class LoginDialog(Toplevel)           paste-headers auth dialog
 │                  class AmbiguousMatchDialog(Toplevel)  tick candidates (scrolls), Skip/Add
+│                  class AddOrReplaceDialog(Toplevel)    drop onto a list: add or new list
 └── app.py         SONG_COLUMNS, HELP_TEXT
                    class CratefillApp  window: one _build_… method per area,
                                        jobs (_run_job), queue handlers (_handlers)
@@ -538,9 +540,23 @@ through `read_songs_csv` (the Album header is deliberately *not* in
 - **Bottom:** Add button, determinate `ttk.Progressbar` (max = songs +
   playlists, one step per unit of work), and a read-only `tk.Text` log.
 
-Dropping a CSV file or a music folder onto the song tree loads it
-(`_on_drop`, routed to `load_csv_path`/`load_folder_path` — the same methods
-the buttons use). This needs the optional `tkinterdnd2` package and the
+Dropping CSV files and music folders onto the song tree loads them all
+(`_on_drop` → `load_paths`, the same method both buttons use; **Load CSV…**
+accepts several files). `storage.read_song_sources()` combines them in order:
+a song in more than one source (same artist and title, ignoring case and
+spacing) is kept once, as its first occurrence, and a source that can't be read
+or holds no songs is skipped and named in the log and a warning while the rest
+load. Loading onto a list that already has songs — either button or a drop,
+all through `_load_asking` — asks first (`AddOrReplaceDialog`): **Add and combine to the list** appends
+(`load_paths(add=True)`, which passes the current songs as `existing`, so only
+new ones are added, and keeps the selection — appended rows leave the old iids
+valid), **Make a new list** replaces it, and dismissing loads nothing. Enter
+presses the focused button. A drop is acknowledged at once and handled from
+`after_idle` (`_finish_drop`): on Windows the drag source waits for the drop
+callback, so a dialog inside it would freeze Explorer. Drops arriving while one
+is pending are ignored (`drop_pending`), since the dialog's grab doesn't stop
+drag-and-drop. If
+nothing loads, the current list stays. This needs the optional `tkinterdnd2` package and the
 `TkinterDnD.Tk()` root that `main()` creates when the package is present;
 without either, the app degrades to buttons-only (the import is guarded and
 `_build_ui` ignores the `TclError` raised when registering a drop target on a

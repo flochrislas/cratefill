@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from cratefill.storage import (
+    read_song_sources,
     read_songs_csv,
     read_songs_folder,
     safe_filename,
@@ -152,3 +153,65 @@ class TestWritePlaylistCsv:
             "Road trip (2).csv",
             "Road trip (3).csv",
         ]
+
+
+class TestReadSongSources:
+    """Several CSV files and music folders combined into one list."""
+
+    def test_sources_combine_in_order(self, tmp_path):
+        a = write(tmp_path, "a.csv", "Artist,Title\nPhoenix,Lisztomania\n")
+        b = write(tmp_path, "b.csv", "Artist,Title\nAir,Sexy Boy\nDaft Punk,One More Time\n")
+        loaded = read_song_sources([a, b])
+        assert [s.title for s in loaded.songs] == ["Lisztomania", "Sexy Boy", "One More Time"]
+        assert loaded.sources == [(a, 1), (b, 2)]
+        assert loaded.skipped == [] and loaded.duplicates == 0
+
+    def test_a_song_in_several_files_is_kept_once(self, tmp_path):
+        """First occurrence wins, matched ignoring case and spacing."""
+        a = write(tmp_path, "a.csv", "Artist,Title,Station\nPhoenix,Lisztomania,FIP\n")
+        b = write(tmp_path, "b.csv", "Artist,Title,Station\nphoenix ,  LISZTOMANIA,Nova\nAir,Sexy Boy,\n")
+        loaded = read_song_sources([a, b])
+        assert loaded.songs == [("Phoenix", "Lisztomania", "FIP"), ("Air", "Sexy Boy", "")]
+        assert loaded.duplicates == 1
+
+    def test_a_different_version_is_not_a_duplicate(self, tmp_path):
+        a = write(tmp_path, "a.csv", "Artist,Title\nOasis,Wonderwall\nOasis,Wonderwall (Live)\n")
+        assert len(read_song_sources([a]).songs) == 2
+
+    def test_csvs_and_folders_mix(self, tmp_path):
+        folder = tmp_path / "Air"
+        folder.mkdir()
+        (folder / "Sexy Boy.mp3").touch()
+        a = write(tmp_path, "a.csv", "Artist,Title\nPhoenix,Lisztomania\n")
+        loaded = read_song_sources([a, folder])
+        assert loaded.songs == [("Phoenix", "Lisztomania", ""), ("Air", "Sexy Boy", "")]
+
+    def test_a_bad_source_is_skipped_and_the_rest_load(self, tmp_path, monkeypatch):
+        good = write(tmp_path, "good.csv", "Artist,Title\nPhoenix,Lisztomania\n")
+        empty = write(tmp_path, "empty.csv", "")
+        music = tmp_path / "song.mp3"
+        music.touch()
+        empty_dir = tmp_path / "nothing"
+        empty_dir.mkdir()
+        broken = write(tmp_path, "broken.csv", "Artist,Title\nx,y\n")
+        real = Path.read_bytes
+        monkeypatch.setattr(Path, "read_bytes",
+                            lambda self: (_ for _ in ()).throw(PermissionError("denied"))
+                            if self.name == "broken.csv" else real(self))
+        loaded = read_song_sources([empty, good, music, empty_dir, broken, tmp_path / "gone.csv"])
+        assert loaded.songs == [("Phoenix", "Lisztomania", "")]
+        reasons = {path.name: reason for path, reason in loaded.skipped}
+        assert reasons["empty.csv"] == "no songs found in that file"
+        assert reasons["song.mp3"] == "not a CSV file or a folder"
+        assert reasons["nothing"] == "no music files in that folder"
+        assert reasons["broken.csv"] == "denied"
+        assert "gone.csv" in reasons            # vanished between pick and load
+
+
+    def test_songs_already_listed_are_not_new(self, tmp_path):
+        """Adding to a list: only what it lacks comes back."""
+        a = write(tmp_path, "a.csv", "Artist,Title\nPhoenix,Lisztomania\nAir,Sexy Boy\n")
+        loaded = read_song_sources([a], existing=[("phoenix", "lisztomania", "FIP")])
+        assert loaded.songs == [("Air", "Sexy Boy", "")]
+        assert loaded.duplicates == 1
+        assert loaded.sources == [(a, 2)]

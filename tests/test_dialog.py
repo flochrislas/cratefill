@@ -23,6 +23,50 @@ def root():
     r.destroy()
 
 
+@pytest.fixture(autouse=True)
+def no_real_session(tmp_path, monkeypatch):
+    """No test here may use the developer's saved session. The startup tests
+    run CratefillApp's real launch path, which connects when browser.json
+    exists — a real network call from the suite, on a background thread that
+    then garbage-collected other tests' Tk variables off the main thread."""
+    import cratefill.app as app_module
+    monkeypatch.setattr(app_module, "AUTH_FILE", tmp_path / "no-session.json")
+    monkeypatch.setattr(app_module, "migrate_legacy_auth_file", lambda: False)
+    monkeypatch.setattr(app_module, "secure_auth_file", lambda *a: None)
+    monkeypatch.setattr(app_module.youtube, "open_session", _no_network)
+
+
+def _no_network():
+    raise AssertionError("a test tried to open a YouTube Music session")
+
+
+@pytest.fixture
+def mapped_root():
+    """For key-binding tests. Key events go to the focused window, and with no
+    window manager (Xvfb) a dialog over a withdrawn root never gets focus — a
+    generated key is silently dropped, and a test that only checks "nothing
+    was chosen" passes without the binding ever running."""
+    try:
+        r = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"no display: {exc}")
+    apply_dark_theme(r)
+    for _ in range(3):
+        r.update()
+    yield r
+    r.destroy()
+
+
+def press(root, dialog, key):
+    """Deliver a key to a dialog for real: map it, focus it, send the key."""
+    for _ in range(3):
+        root.update()
+    dialog.focus_force()
+    root.update()
+    dialog.event_generate(key)
+    root.update()
+
+
 def candidate(vid, title, artist="Oasis", score=0.9, reasons=(), extras=None):
     result = {"videoId": vid, "title": title, "artists": [{"name": artist}]}
     if extras:
@@ -97,12 +141,12 @@ def test_the_checkbox_is_reported(root, decision):
     assert (dialog.action, dialog.remember) == ("add", True)
 
 
-def test_escape_cancels(root, decision):
+def test_escape_cancels(mapped_root, decision):
     """No action means "cancel the whole import" to the caller, so the binding
     must leave `action` as None rather than defaulting to skip."""
-    dialog = open_dialog(root, decision)
-    dialog.event_generate("<Escape>")
-    root.update()
+    dialog = open_dialog(mapped_root, decision)
+    press(mapped_root, dialog, "<Escape>")
+    assert not dialog.winfo_exists(), "Escape must close the dialog"
     assert dialog.action is None
 
 
@@ -467,7 +511,7 @@ class TestEmptyListHintWithRealDragAndDrop:
 
     def test_it_advertises_dropping(self, dnd_root):
         app = self.app(dnd_root)
-        assert "Drag a CSV file or a folder of music here" in app.empty_hint.cget("text")
+        assert "Drag CSV files or music folders here" in app.empty_hint.cget("text")
 
     def test_both_the_tree_and_the_hint_accept_drops(self, dnd_root):
         """tkdnd exposes registration as a <<Drop>> binding. The hint needs its
@@ -577,3 +621,206 @@ class TestWorkerMessages:
         self.drain(root, app, ("done", None))
         assert reviews == [("yt", [], [])]
         assert not app.working
+
+
+class TestLoadingSeveralSources:
+    def app(self, root):
+        from cratefill.app import CratefillApp
+        return CratefillApp(root, startup=False)
+
+    @staticmethod
+    def csv(tmp_path, name, rows):
+        path = tmp_path / name
+        path.write_text("Artist,Title\n" + "".join(f"{a},{t}\n" for a, t in rows))
+        return str(path)
+
+    def test_several_files_become_one_list(self, root, tmp_path):
+        app = self.app(root)
+        a = self.csv(tmp_path, "a.csv", [("Phoenix", "Lisztomania")])
+        b = self.csv(tmp_path, "b.csv", [("Air", "Sexy Boy"), ("Phoenix", "Lisztomania")])
+        app.load_paths([a, b])
+        assert [app.song_tree.item(i, "values")[1] for i in app.song_tree.get_children()] \
+            == ["Lisztomania", "Sexy Boy"]
+        assert app.csv_label.cget("text") == "a.csv + 1 more — 2 songs"
+        assert "1 duplicate(s) skipped" in app.log_text.get("1.0", "end")
+
+    def test_a_drop_loads_every_item(self, root, tmp_path):
+        app = self.app(root)
+        a = self.csv(tmp_path, "with space.csv", [("Phoenix", "Lisztomania")])
+        b = self.csv(tmp_path, "b.csv", [("Air", "Sexy Boy")])
+        event = type("Drop", (), {"data": f"{{{a}}} {b}"})()   # Tcl list, as tkdnd sends it
+        app._on_drop(event)
+        root.update()                              # the drop is handled just after
+        assert len(app.songs) == 2
+
+    def test_nothing_loadable_keeps_the_current_list(self, root, tmp_path, monkeypatch):
+        app = self.app(root)
+        warnings = []
+        monkeypatch.setattr("cratefill.app.messagebox.showwarning",
+                            lambda title, text: warnings.append(text))
+        app.load_paths([self.csv(tmp_path, "a.csv", [("Phoenix", "Lisztomania")])])
+        app.load_paths([str(tmp_path / "notes.mp3")])
+        assert len(app.songs) == 1, "a failed load must not empty the list"
+        assert "left unchanged" in warnings[0]
+
+    def test_a_partial_load_names_what_was_skipped(self, root, tmp_path, monkeypatch):
+        app = self.app(root)
+        warnings = []
+        monkeypatch.setattr("cratefill.app.messagebox.showwarning",
+                            lambda title, text: warnings.append(text))
+        app.load_paths([self.csv(tmp_path, "a.csv", [("Phoenix", "Lisztomania")]),
+                        str(tmp_path / "empty.csv")])
+        assert len(app.songs) == 1
+        assert "empty.csv" in warnings[0] and "left unchanged" not in warnings[0]
+
+
+class TestAddOrReplaceDialog:
+    def open(self, root):
+        from cratefill.dialogs import AddOrReplaceDialog
+        dialog = AddOrReplaceDialog(root, count=2, listed=5)
+        root.update()
+        return dialog
+
+    def test_it_says_what_is_at_stake(self, root):
+        dialog = self.open(root)
+        shown = " | ".join(shown_text(dialog))
+        assert "already has 5 song(s)" in shown and "2 items you dropped" in shown
+        dialog.destroy()
+
+    @pytest.mark.parametrize("button, choice", [
+        ("Add and combine to the list", "add"), ("Make a new list", "new")])
+    def test_each_button_reports_its_choice(self, root, button, choice):
+        dialog = self.open(root)
+        [b for b in all_widgets(dialog)
+         if b.winfo_class() == "TButton" and b.cget("text") == button][0].invoke()
+        assert dialog.choice == choice
+
+    def test_return_adds(self, mapped_root):
+        dialog = self.open(mapped_root)
+        press(mapped_root, dialog, "<Return>")
+        assert dialog.choice == "add"
+
+    def test_return_presses_the_focused_button(self, mapped_root):
+        """Tab to "Make a new list", Enter: that's the choice, not Add."""
+        dialog = self.open(mapped_root)
+        for _ in range(3):
+            mapped_root.update()
+        dialog.new_button.focus_force()
+        mapped_root.update()
+        dialog.event_generate("<Return>")
+        mapped_root.update()
+        assert dialog.choice == "new"
+
+    def test_escape_cancels(self, mapped_root):
+        dialog = self.open(mapped_root)
+        press(mapped_root, dialog, "<Escape>")
+        assert not dialog.winfo_exists(), "Escape must close the dialog"
+        assert dialog.choice is None
+
+
+class TestLoadingOntoAList:
+    """Loading onto a non-empty list — by drop or by button — asks: combine,
+    or make a new list."""
+
+    def app(self, root, tmp_path, monkeypatch, answer):
+        from cratefill.app import CratefillApp
+        app = CratefillApp(root, startup=False)
+        self.asked = []
+        monkeypatch.setattr(app, "_ask_add_or_replace",
+                            lambda count, how: self.asked.append((count, how)) or answer)
+        app.load_paths([TestLoadingSeveralSources.csv(
+            tmp_path, "first.csv", [("Phoenix", "Lisztomania"), ("Air", "Sexy Boy")])])
+        return app
+
+    @staticmethod
+    def drop(app, *paths, settle=True):
+        app._on_drop(type("Drop", (), {"data": " ".join(f"{{{p}}}" for p in paths)})())
+        if settle:
+            app.root.update()                      # the drop is handled just after
+
+    def test_an_empty_list_does_not_ask(self, root, tmp_path, monkeypatch):
+        from cratefill.app import CratefillApp
+        app = CratefillApp(root, startup=False)
+        monkeypatch.setattr(app, "_ask_add_or_replace",
+                            lambda count, how: pytest.fail("nothing to combine with"))
+        self.drop(app, TestLoadingSeveralSources.csv(tmp_path, "a.csv", [("Air", "Sexy Boy")]))
+        assert len(app.songs) == 1
+
+    def test_add_combines_and_keeps_the_selection(self, root, tmp_path, monkeypatch):
+        app = self.app(root, tmp_path, monkeypatch, "add")
+        app.song_tree.selection_set("1")                     # Air — Sexy Boy
+        second = TestLoadingSeveralSources.csv(
+            tmp_path, "second.csv", [("Air", "Sexy Boy"), ("Daft Punk", "One More Time")])
+        self.drop(app, second)
+        assert self.asked == [(1, "dropped")]
+        assert [s.title for s in app.songs] == ["Lisztomania", "Sexy Boy", "One More Time"]
+        assert app.song_tree.selection() == ("1",)
+        assert app.csv_label.cget("text") == "first.csv + 1 more — 3 songs"
+        assert "1 duplicate(s) skipped" in app.log_text.get("1.0", "end")
+
+    def test_new_list_replaces(self, root, tmp_path, monkeypatch):
+        app = self.app(root, tmp_path, monkeypatch, "new")
+        self.drop(app, TestLoadingSeveralSources.csv(tmp_path, "b.csv", [("Daft Punk", "Da Funk")]))
+        assert [s.title for s in app.songs] == ["Da Funk"]
+        assert app.csv_label.cget("text") == "b.csv — 1 songs"
+
+    def test_dismissing_the_question_loads_nothing(self, root, tmp_path, monkeypatch):
+        app = self.app(root, tmp_path, monkeypatch, None)
+        self.drop(app, TestLoadingSeveralSources.csv(tmp_path, "b.csv", [("Daft Punk", "Da Funk")]))
+        assert [s.title for s in app.songs] == ["Lisztomania", "Sexy Boy"]
+
+    @pytest.mark.parametrize("button, answer, titles", [
+        ("load_csv", "add", ["Lisztomania", "Sexy Boy", "Da Funk"]),
+        ("load_csv", "new", ["Da Funk"]),
+        ("load_csv", None, ["Lisztomania", "Sexy Boy"]),
+        ("load_folder", "add", ["Lisztomania", "Sexy Boy", "Da Funk"]),
+    ])
+    def test_the_buttons_ask_too(self, root, tmp_path, monkeypatch, button, answer, titles):
+        app = self.app(root, tmp_path, monkeypatch, answer)
+        if button == "load_csv":
+            picked = TestLoadingSeveralSources.csv(tmp_path, "b.csv", [("Daft Punk", "Da Funk")])
+            monkeypatch.setattr("cratefill.app.filedialog.askopenfilenames",
+                                lambda **kw: (picked,))
+        else:
+            folder = tmp_path / "Daft Punk"
+            folder.mkdir()
+            (folder / "Da Funk.mp3").touch()
+            monkeypatch.setattr("cratefill.app.filedialog.askdirectory",
+                                lambda **kw: str(folder))
+        getattr(app, button)()
+        assert self.asked == [(1, "selected")]
+        assert [s.title for s in app.songs] == titles
+
+    def test_a_cancelled_file_picker_asks_nothing(self, root, tmp_path, monkeypatch):
+        app = self.app(root, tmp_path, monkeypatch, "add")
+        monkeypatch.setattr("cratefill.app.filedialog.askopenfilenames", lambda **kw: ())
+        app.load_csv()
+        assert self.asked == [] and len(app.songs) == 2
+
+    def test_the_drop_callback_returns_before_asking(self, root, tmp_path, monkeypatch):
+        """On Windows the drag source waits for the callback: no question
+        may be asked inside it."""
+        app = self.app(root, tmp_path, monkeypatch, "add")
+        self.drop(app, TestLoadingSeveralSources.csv(tmp_path, "b.csv", [("Daft Punk", "Da Funk")]),
+                  settle=False)
+        assert self.asked == [], "asked inside the drop callback"
+        root.update()
+        assert self.asked == [(1, "dropped")]
+
+    def test_a_second_drop_while_one_is_pending_is_ignored(self, root, tmp_path, monkeypatch):
+        app = self.app(root, tmp_path, monkeypatch, "add")
+        b = TestLoadingSeveralSources.csv(tmp_path, "b.csv", [("Daft Punk", "Da Funk")])
+        c = TestLoadingSeveralSources.csv(tmp_path, "c.csv", [("Justice", "D.A.N.C.E.")])
+        self.drop(app, b, settle=False)
+        self.drop(app, c, settle=False)
+        root.update()
+        assert self.asked == [(1, "dropped")], "only one question at a time"
+        assert "Da Funk" in [s.title for s in app.songs]
+        assert "D.A.N.C.E." not in [s.title for s in app.songs]
+        assert not app.drop_pending, "the next drop must be accepted again"
+
+    def test_a_drop_with_nothing_new_says_so(self, root, tmp_path, monkeypatch):
+        app = self.app(root, tmp_path, monkeypatch, "add")
+        self.drop(app, TestLoadingSeveralSources.csv(tmp_path, "b.csv", [("Air", "Sexy Boy")]))
+        assert len(app.songs) == 2
+        assert "Nothing new" in app.log_text.get("1.0", "end")
