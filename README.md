@@ -136,7 +136,9 @@ See `sample.csv` for an example.
 
 | File | Purpose |
 |---|---|
-| `cratefill/app.py` | Tkinter window, theme, dialogs, worker threads |
+| `cratefill/app.py` | Tkinter main window and its background jobs |
+| `cratefill/dialogs.py` | Login and match-review dialogs |
+| `cratefill/theme.py` | Dark theme |
 | `cratefill/matching.py` | Which search result answers a request, and how sure we are |
 | `cratefill/policy.py` | What to do about an uncertain match, and remembering it |
 | `cratefill/storage.py` | CSV import/export, music folders, data directory |

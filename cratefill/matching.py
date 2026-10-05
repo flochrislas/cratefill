@@ -40,6 +40,7 @@ policy.action_for_match.
 import re
 import unicodedata
 from collections import Counter
+from dataclasses import KW_ONLY, dataclass, field
 
 from rapidfuzz import fuzz
 
@@ -124,7 +125,7 @@ _LIGATURES = {
 }
 
 
-def normalize(text):
+def normalize(text: str | None) -> str:
     """Casefold and flatten harmless formatting differences.
 
     Accents are stripped (Beyoncé → beyonce), curly quotes straightened,
@@ -157,18 +158,18 @@ def _substitute_interior_letters(text):
     return "".join(out)
 
 
-def tokens(text):
+def tokens(text: str | None) -> list[str]:
     """Normalized whole words. Substring comparison is what let "one" match
     "someone", so everything downstream works on these instead."""
     return normalize(text).split()
 
 
-def strip_leading_the(word_list):
+def strip_leading_the(word_list: list[str]) -> list[str]:
     """"The Beatles" and "Beatles" name the same band."""
     return word_list[1:] if len(word_list) > 1 and word_list[0] == "the" else word_list
 
 
-def split_featured(text, allow_with=False):
+def split_featured(text: str | None, allow_with: bool = False) -> tuple[str, list[str]]:
     """Split "Artist feat. Guest" into ("Artist", ["Guest"]).
 
     Featured artists are parsed out rather than treated as ordinary words, so
@@ -198,7 +199,7 @@ BRACKETED_RE = re.compile(
 TRAILING_METADATA_RE = re.compile(r"\s[-–—]\s.*$")
 
 
-def split_metadata(text, dash=True):
+def split_metadata(text: str | None, dash: bool = True) -> tuple[str, list[str]]:
     """Split text into (remainder, metadata segments).
 
     Only bracketed groups and a trailing dash-separated segment count as
@@ -223,7 +224,7 @@ def split_metadata(text, dash=True):
     return text, segments
 
 
-def strip_metadata(text, dash=True):
+def strip_metadata(text: str | None, dash: bool = True) -> str:
     """The text without its metadata — or whole, if the metadata *was* the text.
 
     That backstop is what keeps "(Intro)" matchable: stripping must never turn a
@@ -233,7 +234,7 @@ def strip_metadata(text, dash=True):
     return remainder if tokens(remainder) else (text or "")
 
 
-def version_markers(text):
+def version_markers(text: str | None) -> set[str]:
     """Names of the VERSION_MARKERS found in the text's metadata positions."""
     scanned = normalize(" ".join(split_metadata(text)[1]))
     return {
@@ -243,7 +244,7 @@ def version_markers(text):
     }
 
 
-def version_relation(want_title, got_title):
+def version_relation(want_title: str, got_title: str | None) -> str:
     """How the candidate's recording relates to the requested one.
 
     Deliberately asymmetric, because the two directions are not equally bad:
@@ -261,17 +262,10 @@ def version_relation(want_title, got_title):
     was wrong: it let a tribute band's exact studio cut outrank the real artist's
     live take.
     """
-    if normalize(want_title) == normalize(got_title):
-        return "same"  # literally the same string; nothing to compare
-    want, got = version_markers(want_title), version_markers(got_title)
-    if got - want:
-        return "extra"
-    if want - got:
-        return "missing"
-    return "same"
+    return _relation(_Request.of("", want_title), _Result.of({"title": got_title}))
 
 
-def core_title(text, dash=True):
+def core_title(text: str | None, dash: bool = True) -> str:
     """The title as compared: metadata and featured artists removed, normalized.
 
     Words outside metadata positions stay, however marker-ish they look —
@@ -308,7 +302,7 @@ def _is_spaceless_script(text):
     )
 
 
-def score_text(want, got):
+def score_text(want: str | None, got: str | None) -> float:
     """Score two pieces of text 0.0–1.0 on whole tokens.
 
     Equal token *multisets* score 1.0 — order is irrelevant, repetition is not.
@@ -333,7 +327,7 @@ def score_text(want, got):
     return min(_ratio(want_text, got_text), coverage)
 
 
-def align_spacing(want_tokens, got_tokens):
+def align_spacing(want_tokens: list[str], got_tokens: list[str]) -> tuple[list[str], list[str]]:
     """Both token lists, with words split on one side only re-joined.
 
     "ArtistName" is "Artist Name", "Lovesong Radio Edit" is "Love Song Radio
@@ -377,25 +371,14 @@ def _score_spaceless(want_text, got_text):
     return ratio if ratio >= SPACELESS_MIN else 0.0
 
 
-def score_title(want, got):
-    """Score two titles 0.0–1.0, metadata and featured artists discounted.
-
-    Identical normalized titles score 1.0 before anything is stripped.
-    """
-    if normalize(want) == normalize(got):
-        return 1.0
-    got_core = core_title(got)
-    return max(score_text(core, got_core) for core in user_title_cores(want))
-
-
-def user_title_cores(title):
+def user_title_cores(title: str) -> tuple[str, ...]:
     """The requested title compared both with and without a trailing " - …"
     segment, since in the user's text that may be metadata or content (see
     split_metadata). Whichever reading fits a result better is the one used."""
-    return {core_title(title), core_title(title, dash=False)}
+    return tuple(dict.fromkeys((core_title(title), core_title(title, dash=False))))
 
 
-def score_artist(want_artist, result_artists):
+def score_artist(want_artist: str, result_artists: list | None) -> tuple[float, float]:
     """Score the requested artist against a result's artist list.
 
     Returns `(principal, combined)`, both 0.0–1.0, and the two are **not**
@@ -415,35 +398,10 @@ def score_artist(want_artist, result_artists):
     metadata in a name ("Artist (UK)", "Artist - Topic") is ignored like in a
     title, and malformed entries are ignored.
     """
-    names = [
-        strip_metadata(a.get("name"))
-        for a in (result_artists or [])
-        if isinstance(a, dict) and a.get("name")
-    ]
-    if not names:
-        return 0.0, 0.0
-
-    # Metadata goes first: split_featured trims a trailing ")" and would leave
-    # "Artist (UK" behind.
-    principal, guests = split_featured(strip_metadata(want_artist, dash=False),
-                                       allow_with=True)
-    if not tokens(principal):
-        return 0.0, 0.0
-
-    def best(one):
-        one_text = " ".join(strip_leading_the(tokens(one)))
-        scores = [score_text(one_text, " ".join(strip_leading_the(tokens(name))))
-                  for name in names]
-        # The result may bundle every artist into one string ("Air, Phoenix").
-        scores.append(score_text(one_text, " ".join(names)))
-        return max(scores, default=0.0)
-
-    principal_score = best(principal)
-    found_guests = sum(1 for guest in guests if tokens(guest) and best(guest) >= HIGH_ARTIST)
-    return principal_score, min(1.0, principal_score + GUEST_BONUS * found_guests)
+    return _artist_scores(_Request.of(want_artist, ""), _Result.of({"artists": result_artists}))
 
 
-def artists_label(result):
+def artists_label(result: dict) -> str:
     """Human-readable artist string for a search result, for logs and dialogs."""
     return ", ".join(
         a.get("name") or ""
@@ -452,7 +410,7 @@ def artists_label(result):
     )
 
 
-def validate_request(artist, title):
+def validate_request(artist: str, title: str) -> list[str]:
     """Reasons this imported row can't be matched automatically (empty if fine).
 
     Checked before searching, so a hopeless row doesn't cost a network call.
@@ -465,7 +423,7 @@ def validate_request(artist, title):
     return reasons
 
 
-def has_content_overlap(want_title, got_title):
+def has_content_overlap(want_title: str, got_title: str | None) -> bool:
     """True when the titles share a word that actually says something.
 
     "The End" and "The Beginning" share "the", which is no evidence at all —
@@ -473,8 +431,7 @@ def has_content_overlap(want_title, got_title):
     completely different song. Titles built entirely from stop words ("You and
     Me") fall back to any shared token, or they could never match anything.
     """
-    got_core = core_title(got_title)
-    return any(_cores_overlap(core, got_core) for core in user_title_cores(want_title))
+    return _related(_Request.of("", want_title), _Result.of({"title": got_title}))
 
 
 def _cores_overlap(want_core, got_core):
@@ -491,79 +448,174 @@ def _cores_overlap(want_core, got_core):
     return _score_spaceless(" ".join(want.elements()), " ".join(got.elements())) > 0.0
 
 
+@dataclass(frozen=True, slots=True)
+class _Request:
+    """The requested song, interpreted once. Every rule reads these values, so
+    scoring, relatedness, version checks and explanations can't disagree about
+    what the user asked for. The user's text keeps a trailing " - …" as one
+    possible reading (see split_metadata)."""
+
+    normalized: str             # the whole title, normalized
+    cores: tuple[str, ...]      # comparable readings: user_title_cores
+    markers: frozenset[str]     # version markers asked for
+    principal: str              # principal artist: metadata stripped, no leading "the"
+    guests: tuple[str, ...]     # featured artists, same treatment
+
+    @classmethod
+    def of(cls, artist: str, title: str) -> "_Request":
+        # Metadata goes first: split_featured trims a trailing ")" and would
+        # leave "Artist (UK" behind.
+        principal, guests = split_featured(strip_metadata(artist, dash=False), allow_with=True)
+        return cls(
+            normalized=normalize(title),
+            cores=user_title_cores(title),
+            markers=frozenset(version_markers(title)),
+            principal=_artist_text(principal),
+            guests=tuple(_artist_text(g) for g in guests if tokens(g)),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _Result:
+    """One search result, interpreted once — YouTube Music's text, where any
+    bracket and a trailing " - …" are metadata. Tolerates every field missing."""
+
+    normalized: str             # the whole title, normalized
+    core: str                   # core_title: what is compared
+    markers: frozenset[str]     # version markers on the recording
+    names: tuple[str, ...]      # each credited artist, like _Request.principal
+    all_names: str              # every artist as one credit ("Air, Phoenix")
+    explicit: bool
+    seconds: float | None       # length, None when YouTube Music didn't say
+
+    @classmethod
+    def of(cls, result: dict) -> "_Result":
+        title = result.get("title")
+        names = [strip_metadata(a.get("name")) for a in (result.get("artists") or [])
+                 if isinstance(a, dict) and a.get("name")]
+        return cls(
+            normalized=normalize(title),
+            core=core_title(title),
+            markers=frozenset(version_markers(title)),
+            names=tuple(_artist_text(n) for n in names),
+            all_names=" ".join(names),
+            explicit=bool(result.get("isExplicit")),
+            seconds=_duration_seconds(result),
+        )
+
+
+def _artist_text(name: str) -> str:
+    """"The Beatles" and "Beatles" name the same band."""
+    return " ".join(strip_leading_the(tokens(name)))
+
+
+def _title_score(req: _Request, res: _Result) -> float:
+    """Score two titles 0.0–1.0, metadata and featured artists discounted.
+    Identical normalized titles score 1.0 before anything is stripped."""
+    if req.normalized == res.normalized:
+        return 1.0
+    return max(score_text(core, res.core) for core in req.cores)
+
+
+def _artist_scores(req: _Request, res: _Result) -> tuple[float, float]:
+    """(principal, combined); see score_artist."""
+    if not res.names or not req.principal:
+        return 0.0, 0.0
+
+    def best(one):
+        # The result may bundle every artist into one string ("Air, Phoenix").
+        return max(score_text(one, name) for name in (*res.names, res.all_names))
+
+    principal = best(req.principal)
+    found_guests = sum(1 for guest in req.guests if best(guest) >= HIGH_ARTIST)
+    return principal, min(1.0, principal + GUEST_BONUS * found_guests)
+
+
+def _relation(req: _Request, res: _Result) -> str:
+    """"same" / "extra" / "missing"; see version_relation."""
+    if req.normalized == res.normalized:
+        return "same"  # literally the same string; nothing to compare
+    if res.markers - req.markers:
+        return "extra"
+    if req.markers - res.markers:
+        return "missing"
+    return "same"
+
+
+def _related(req: _Request, res: _Result) -> bool:
+    """has_content_overlap for prepared values."""
+    return any(_cores_overlap(core, res.core) for core in req.cores)
+
+
+@dataclass(slots=True, repr=False)
 class Candidate:
     """One scored search result, with the reasons it isn't a perfect answer.
 
     Scoring lives here rather than in the UI so the review dialog can list
-    alternatives without recomputing anything.
+    alternatives without recomputing anything. Scores are keyword-only and all
+    required: `principal_score` and the guest-boosted `artist_score` are easy
+    to mix up, and only the principal may decide confidence.
     """
 
-    __slots__ = ("result", "title_score", "artist_score", "principal_score",
-                 "overall_score", "relation", "reasons")
-
-    def __init__(self, result, title_score, artist_score, overall_score, relation,
-                 reasons=None, principal_score=None):
-        self.result = result
-        self.title_score = title_score
-        self.artist_score = artist_score        # with the guest bonus: for ranking
-        # Without it: the only artist number allowed to decide confidence.
-        self.principal_score = artist_score if principal_score is None else principal_score
-        self.overall_score = overall_score
-        self.relation = relation
-        self.reasons = reasons or []
+    result: dict
+    _: KW_ONLY
+    title_score: float
+    principal_score: float  # the requested principal artist alone: decides confidence
+    artist_score: float     # principal + guest bonus: for ranking only
+    overall_score: float
+    relation: str           # "same" | "missing" | "extra", see version_relation
+    reasons: list[str] = field(default_factory=list)
+    # The result as interpreted for matching; set by choose_match, and what
+    # grouping reads. Absent on hand-built candidates (tests, the dialog).
+    prepared: _Result | None = field(default=None, compare=False)
 
     @property
-    def video_id(self):
+    def video_id(self) -> str | None:
         return (self.result or {}).get("videoId")
 
     @property
-    def label(self):
+    def label(self) -> str:
         """"Artist — Title", for logs and the review dialog."""
         return f"{artists_label(self.result)} — {self.result.get('title') or ''}"
 
     @property
-    def reason(self):
+    def reason(self) -> str:
         return "; ".join(self.reasons)
 
     def __repr__(self):
         return f"Candidate({self.label!r}, overall={self.overall_score:.2f})"
 
 
+@dataclass(slots=True)
 class MatchDecision:
     """What the evidence says about a requested song. Carries no policy."""
 
-    __slots__ = ("status", "candidate", "reasons", "alternatives")
-
-    def __init__(self, status, candidate=None, reasons=None, alternatives=None):
-        self.status = status         # "high" | "ambiguous" | "weak" | "rejected"
-        self.candidate = candidate  # the proposed Candidate, or None
-        self.reasons = reasons or []
-        self.alternatives = alternatives or []
-
-    def __repr__(self):
-        return f"MatchDecision({self.status!r}, {self.candidate!r}, reasons={self.reasons!r})"
+    status: str                         # "high" | "ambiguous" | "weak" | "rejected"
+    candidate: Candidate | None = None  # the proposal, or None
+    reasons: list[str] = field(default_factory=list)
+    alternatives: list[Candidate] = field(default_factory=list)
 
     @property
-    def reason(self):
+    def reason(self) -> str:
         """The reasons as one sentence, for logs and the review dialog."""
         return "; ".join(self.reasons)
 
     @property
-    def video_id(self):
+    def video_id(self) -> str | None:
         return self.candidate.video_id if self.candidate else None
 
     @property
-    def label(self):
+    def label(self) -> str:
         """"Artist — Title" of the proposed match, or "" when there is none."""
         return self.candidate.label if self.candidate else ""
 
     @property
-    def choices(self):
+    def choices(self) -> list[Candidate]:
         """The proposal followed by its alternatives, for the review dialog."""
         return ([self.candidate] if self.candidate else []) + list(self.alternatives)
 
 
-def choose_match(artist, title, results):
+def choose_match(artist: str, title: str, results: list | None) -> MatchDecision:
     """Evaluate search results for one requested song. Returns a MatchDecision.
 
     Only evaluates evidence — it does not know or care whether ambiguous matches
@@ -577,8 +629,9 @@ def choose_match(artist, title, results):
     if blocking:
         return MatchDecision("rejected", reasons=blocking)
 
+    req = _Request.of(artist, title)
     scored = [
-        _score(artist, title, result)
+        _score(req, result)
         for result in results or []
         if isinstance(result, dict) and result.get("videoId")  # else nothing to add
     ]
@@ -586,8 +639,7 @@ def choose_match(artist, title, results):
         return MatchDecision("rejected", reasons=["no usable search results"])
     # Best first. On a tie the result titled exactly as requested leads, rather
     # than whichever variant YouTube Music happened to list first.
-    scored.sort(key=lambda c: (c.overall_score,
-                               normalize(c.result.get("title")) == normalize(title)),
+    scored.sort(key=lambda c: (c.overall_score, c.prepared.normalized == req.normalized),
                 reverse=True)
 
     # Versions of the requested song by the requested artist decide on their
@@ -610,7 +662,7 @@ def choose_match(artist, title, results):
     # word with the title: "the" alone is no evidence, and under an "Always add"
     # policy it would authorise a different song unreviewed. This rejects
     # "One" → "Someone" and "Lisztomania" → "1901".
-    related = [c for c in scored if has_content_overlap(title, c.result.get("title"))]
+    related = [c for c in scored if _related(req, c.prepared)]
     if not related:
         return MatchDecision("rejected", reasons=["no result with a related title"])
     winner, *rest = related
@@ -621,22 +673,27 @@ def choose_match(artist, title, results):
                          reasons=list(winner.reasons), alternatives=rest[:3])
 
 
-def _score(artist, title, result):
+def _score(req: _Request, result: dict) -> Candidate:
     """Score one search result against the requested song."""
-    title_score = score_title(title, result.get("title"))
-    principal_score, artist_score = score_artist(artist, result.get("artists"))
-    relation = version_relation(title, result.get("title"))
+    res = _Result.of(result)
+    title_score = _title_score(req, res)
+    principal_score, artist_score = _artist_scores(req, res)
+    relation = _relation(req, res)
     base = TITLE_WEIGHT * title_score + ARTIST_WEIGHT * artist_score
     candidate = Candidate(
-        result, title_score, artist_score,
-        base * (1.0 - VERSION_PENALTY[relation]), relation,
+        result,
+        title_score=title_score,
         principal_score=principal_score,
+        artist_score=artist_score,
+        overall_score=base * (1.0 - VERSION_PENALTY[relation]),
+        relation=relation,
+        prepared=res,
     )
-    candidate.reasons = _shortfalls(candidate, title)
+    candidate.reasons = _shortfalls(candidate, req)
     return candidate
 
 
-def _is_version(candidate):
+def _is_version(candidate: Candidate) -> bool:
     """The requested title by the requested principal artist — the scores have
     already discounted spacing, metadata and featured artists. The *principal*
     score is what's tested, never the guest-boosted one: a guest may help a
@@ -644,51 +701,77 @@ def _is_version(candidate):
     return candidate.title_score >= HIGH_TITLE and candidate.principal_score >= HIGH_ARTIST
 
 
-def _distinct_recordings(candidates):
+@dataclass(slots=True)
+class _Entry:
+    rank: int                # position in the score ranking, 0 = best
+    candidate: Candidate
+    seconds: float | None    # length, None when YouTube Music didn't say
+
+
+@dataclass(slots=True)
+class _RecordingGroup:
+    """Entries taken to be one recording: same title and explicit flag, and
+    known lengths spanning at most SAME_RECORDING_SECONDS."""
+
+    entries: list[_Entry]
+
+    @property
+    def best_rank(self) -> int:
+        """Where the group ranks: its best-ranked member, whoever that is."""
+        return min(e.rank for e in self.entries)
+
+    @property
+    def shortest(self) -> float:
+        return min(e.seconds for e in self.entries if e.seconds is not None)
+
+    @property
+    def representative(self) -> Candidate:
+        """What the group is shown and added as: its best-ranked member *with a
+        known length*, since the length is what tells recordings apart. Not
+        necessarily the member that decides best_rank."""
+        known = [e for e in self.entries if e.seconds is not None]
+        return min(known or self.entries, key=lambda e: e.rank).candidate
+
+
+def _distinct_recordings(candidates: list[Candidate]) -> list[Candidate]:
     """One candidate per recording, best-ranked recording first.
 
-    Same title and explicit flag, with lengths spanning at most
-    SAME_RECORDING_SECONDS, is one recording. Known lengths are grouped by
-    sorting them, so no group can chain 3:00 → 3:10 → 3:20 into one, and the
-    grouping doesn't depend on the order results arrive in. A candidate with an
-    unknown length (YouTube Music omits it often enough that "unknown" must not
-    create questions) then joins the best-ranked group it could belong to; it
-    can never bridge two groups.
+    Candidates are partitioned by title and explicit flag, then grouped by
+    length within each (_group_by_length). The outcome doesn't depend on the
+    order YouTube Music lists results in.
     """
-    rank = {id(c): i for i, c in enumerate(candidates)}
-    length = {id(c): _duration_seconds(c.result) for c in candidates}
-    groups = []
-    for c in sorted((c for c in candidates if length[id(c)] is not None),
-                    key=lambda c: length[id(c)]):
-        group = next((g for g in groups if _same_track(g[0], c)
-                      and length[id(c)] - length[id(g[0])] <= SAME_RECORDING_SECONDS), None)
-        if group:
-            group.append(c)
+    tracks: dict[tuple[str, bool], list[_Entry]] = {}
+    for rank, c in enumerate(candidates):
+        key = (c.prepared.normalized, c.prepared.explicit)
+        tracks.setdefault(key, []).append(_Entry(rank, c, c.prepared.seconds))
+    groups = [g for entries in tracks.values() for g in _group_by_length(entries)]
+    return [g.representative for g in sorted(groups, key=lambda g: g.best_rank)]
+
+
+def _group_by_length(entries: list[_Entry]) -> list[_RecordingGroup]:
+    """Group one track's entries into recordings.
+
+    Known lengths are walked in sorted order and a group closes once a length
+    is more than SAME_RECORDING_SECONDS past its shortest, so 3:00 → 3:10 →
+    3:20 can't chain into one. Unknown lengths (YouTube Music omits them often
+    enough that "unknown" must not create questions) then all join the
+    best-ranked group — they can never bridge two.
+    """
+    groups: list[_RecordingGroup] = []
+    for e in sorted((e for e in entries if e.seconds is not None), key=lambda e: e.seconds):
+        if groups and e.seconds - groups[-1].shortest <= SAME_RECORDING_SECONDS:
+            groups[-1].entries.append(e)
         else:
-            groups.append([c])  # sorted, so g[0] is the shortest: the span's anchor
-    groups.sort(key=lambda g: min(rank[id(c)] for c in g))
-    for c in candidates:
-        if length[id(c)] is None:
-            group = next((g for g in groups if _same_track(g[0], c)), None)
-            if group:
-                group.append(c)
-            else:
-                groups.append([c])
-    # A group is shown by its best-ranked member with a known length — the
-    # length is what tells the recordings apart — and ranked by its best member.
-    groups.sort(key=lambda g: min(rank[id(c)] for c in g))
-    return [min([c for c in g if length[id(c)] is not None] or g, key=lambda c: rank[id(c)])
-            for g in groups]
+            groups.append(_RecordingGroup([e]))
+    unknown = [e for e in entries if e.seconds is None]
+    if unknown and groups:
+        min(groups, key=lambda g: g.best_rank).entries.extend(unknown)
+    elif unknown:
+        groups.append(_RecordingGroup(unknown))
+    return groups
 
 
-def _same_track(a, b):
-    """Same title and same explicit flag — length aside."""
-    ra, rb = a.result, b.result
-    return (normalize(ra.get("title")) == normalize(rb.get("title"))
-            and bool(ra.get("isExplicit")) == bool(rb.get("isExplicit")))
-
-
-def _duration_seconds(result):
+def _duration_seconds(result: dict) -> float | None:
     """The result's length in seconds: `duration_seconds`, else "m:ss" or
     "h:mm:ss" parsed from `duration`, else None."""
     seconds = result.get("duration_seconds")
@@ -703,7 +786,7 @@ def _duration_seconds(result):
     return None
 
 
-def _shortfalls(candidate, want_title):
+def _shortfalls(candidate: Candidate, req: _Request) -> list[str]:
     """Every way this candidate falls short of being the obvious answer."""
     reasons = []
     if candidate.title_score < HIGH_TITLE:
@@ -716,14 +799,13 @@ def _shortfalls(candidate, want_title):
             f" (found {artists_label(candidate.result) or 'no artist'})"
         )
     if candidate.relation != "same":
-        reasons.append(_version_reason(candidate.relation, want_title, candidate.result))
+        reasons.append(_version_reason(candidate.relation, req, candidate.prepared))
     return reasons
 
 
-def _version_reason(relation, want_title, result):
+def _version_reason(relation: str, req: _Request, res: _Result) -> str:
     """Explain a recording-version difference in the user's terms."""
-    want = version_markers(want_title)
-    got = version_markers(result.get("title"))
+    want, got = req.markers, res.markers
     if relation == "missing":
         wanted = ", ".join(sorted(want - got))
         return f"no {wanted} version found — this is the standard recording"

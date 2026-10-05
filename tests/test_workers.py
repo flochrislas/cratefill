@@ -4,7 +4,6 @@ No Tk window, no network, no browser.json. The functions under test take a `put`
 callable, so a plain list stands in for the UI's worker queue.
 """
 
-import contextlib
 import queue
 
 import pytest
@@ -118,7 +117,22 @@ class TestEvaluateSongs:
         evaluated = youtube.evaluate_songs(FakeYT(fail_on=["search"]), [SONG], out.append)
         assert evaluated[0][1].status == "rejected"
         assert "search failed" in evaluated[0][1].reason
-        assert any("no credible match" in line for line in kinds(out, "log"))
+        lines = kinds(out, "log")
+        assert any("search failed — search exploded" in line for line in lines)
+        assert not any("no credible match" in line for line in lines), \
+            "a failed search learnt nothing; it must not read as 'no match'"
+
+    def test_a_repeated_row_reuses_the_search(self):
+        """Same artist and title twice: one network call, two decisions."""
+        yt = FakeYT()
+        evaluated = youtube.evaluate_songs(yt, [SONG, SONG], [].append)
+        assert len(called(yt, "search")) == 1
+        assert len(evaluated) == 2 and evaluated[0][1] is not evaluated[1][1]
+
+    def test_a_different_version_is_searched_separately(self):
+        yt = FakeYT()
+        youtube.evaluate_songs(yt, [SONG, ("Phoenix", "Lisztomania (Live)", "")], [].append)
+        assert len(called(yt, "search")) == 2
 
     def test_an_incomplete_row_is_rejected_without_searching(self):
         """Don't spend a network call on a row that can never match."""
@@ -163,8 +177,20 @@ class TestAddVideoIdsToPlaylists:
         out, yt = [], FakeYT()
         youtube.add_video_ids_to_playlists(yt, ["v1"], [PLAYLIST], out.append)
         assert yt.added == [["v1"]]
-        assert "--- Done. ---" in kinds(out, "log")
+        assert kinds(out, "log")[-1] == "--- Done: 1 added, across 1 playlist(s). ---"
         assert any("Added 1 song(s) to 'Road trip'" in line for line in kinds(out, "log"))
+
+    def test_the_summary_totals_every_playlist(self):
+        """One closing line with every outcome, so a partial failure in one of
+        several playlists can't scroll by unnoticed."""
+        out = []
+        two = [PLAYLIST, {"playlistId": "PL2", "title": "Chill"}]
+        yt = FakeYT(add_status=lambda attempt: "STATUS_SUCCEEDED" if attempt in (1, 3)
+                    else "STATUS_FAILED")
+        youtube.add_video_ids_to_playlists(yt, ["a", "b"], two, out.append)
+        # Road trip takes the batch; Chill refuses it, then takes "a" and refuses "b".
+        assert kinds(out, "log")[-1] == ("--- Done: 3 added, 1 refused, "
+                                         "across 2 playlist(s). ---")
 
     def test_duplicate_video_ids_are_collapsed(self):
         """Two CSV rows can resolve to the same YT song."""
@@ -192,22 +218,37 @@ class TestAddVideoIdsToPlaylists:
         assert any("already in the playlist" in line for line in kinds(out, "log"))
         assert len(yt.added) == 1  # no pointless second attempt
 
-    def test_a_refused_retry_falls_back_to_one_song_at_a_time(self):
-        """A duplicate under a different id survives the filtered retry and
-        fails the batch again; only that song may be lost, not the others."""
+    def test_a_refused_batch_with_nothing_to_filter_goes_one_at_a_time(self):
+        """Nothing already in the playlist: retrying the identical batch would
+        be refused again, so it goes straight to one song at a time — and only
+        the song YT Music refuses is lost."""
         out = []
-        yt = FakeYT(add_status=lambda attempt: "STATUS_SUCCEEDED" if attempt in (3, 5)
+        yt = FakeYT(add_status=lambda attempt: "STATUS_SUCCEEDED" if attempt in (2, 4)
                     else "STATUS_FAILED")
-        youtube.add_video_ids_to_playlists(yt, ["a", "dup", "b"], [PLAYLIST], out.append)
-        assert yt.added == [["a", "dup", "b"], ["a", "dup", "b"], ["a"], ["dup"], ["b"]]
+        results = youtube.add_video_ids_to_playlists(yt, ["a", "dup", "b"], [PLAYLIST],
+                                                     out.append)
+        assert yt.added == [["a", "dup", "b"], ["a"], ["dup"], ["b"]]
+        assert (results[0].added, results[0].refused) == (["a", "b"], ["dup"])
         assert any("Added 2 of 3 song(s) to 'Road trip'; 1 refused" in line
                    for line in kinds(out, "log"))
 
-    def test_an_error_on_one_song_does_not_stop_the_rest(self):
-        out = []
-        # Attempts 1 and 2 are the batch and its retry; "boom" raises before
-        # reaching the fake, so "ok" alone is attempt 3.
+    def test_a_refused_filtered_retry_also_falls_back(self):
+        """The duplicate-under-another-id case: the filtered retry is refused too."""
         yt = FakeYT(add_status=lambda attempt: "STATUS_SUCCEEDED" if attempt == 3
+                    else "STATUS_FAILED", existing_tracks=[{"videoId": "old"}])
+        results = youtube.add_video_ids_to_playlists(yt, ["old", "a", "dup"], [PLAYLIST],
+                                                     [].append)
+        assert yt.added == [["old", "a", "dup"], ["a", "dup"], ["a"], ["dup"]]
+        r = results[0]
+        assert (r.added, r.already_present, r.refused) == (["a"], ["old"], ["dup"])
+
+    def test_an_error_on_one_song_is_failed_not_refused(self):
+        """An error is no answer: the song may or may not have gone in, so it is
+        reported apart from a refusal, and the rest still go."""
+        out = []
+        # Attempt 1 is the batch; "boom" raises before reaching the fake, so
+        # "ok" alone is attempt 2.
+        yt = FakeYT(add_status=lambda attempt: "STATUS_SUCCEEDED" if attempt == 2
                     else "STATUS_FAILED")
         real_add = yt.add_playlist_items
 
@@ -216,14 +257,19 @@ class TestAddVideoIdsToPlaylists:
                 raise RuntimeError("network hiccup")
             return real_add(playlist_id, video_ids, **kwargs)
         yt.add_playlist_items = add
-        youtube.add_video_ids_to_playlists(yt, ["boom", "ok"], [PLAYLIST], out.append)
-        assert any("Added 1 of 2" in line for line in kinds(out, "log"))
+        results = youtube.add_video_ids_to_playlists(yt, ["boom", "ok"], [PLAYLIST], out.append)
+        r = results[0]
+        assert (r.added, r.refused, r.failed) == (["ok"], [], ["boom"])
+        assert any("Added 1 of 2 song(s) to 'Road trip'; 1 failed (network hiccup)" in line
+                   for line in kinds(out, "log"))
 
     def test_one_failing_playlist_does_not_stop_the_others(self):
         out = []
         two = [PLAYLIST, {"playlistId": "PL2", "title": "Chill"}]
-        youtube.add_video_ids_to_playlists(FakeYT(fail_on=["add"]), ["v1"], two, out.append)
+        results = youtube.add_video_ids_to_playlists(FakeYT(fail_on=["add"]), ["v1"], two,
+                                                     out.append)
         assert sum("Failed to add" in line for line in kinds(out, "log")) == 2
+        assert [r.failed for r in results] == [["v1"], ["v1"]]
 
     def test_nothing_to_add(self):
         yt = FakeYT()
@@ -295,28 +341,30 @@ class TestExportPlaylistsToCsv:
 
 
 class TestCompletionGuarantee:
-    """The Add/Export buttons only come back on ("done", …); a worker that dies
-    without emitting it leaves the UI disabled until restart."""
+    """The busy controls only come back on ("done", …); a job that dies without
+    emitting it leaves the UI disabled until restart."""
 
-    @pytest.mark.parametrize("worker, args", [
-        ("_worker", ("songs", "playlists")),
-        ("_add_worker", (["v1"], "playlists")),
-        ("_export_worker", ("playlists", "dest", False)),
+    @staticmethod
+    def run(stub, what, job, *args):
+        """What a background thread does with a job, run synchronously."""
+        CratefillApp._job_body(stub, what, job, *args)
+        return stub.drain()
+
+    @pytest.mark.parametrize("what, job, args", [
+        ("matching", CratefillApp._match_job, (FakeYT(), "songs", "playlists")),
+        ("adding", CratefillApp._add_job, (FakeYT(), ["v1"], "playlists")),
+        ("exporting", CratefillApp._export_job, (FakeYT(), "playlists", "dest", False)),
+        ("refreshing", youtube.fetch_playlists, (FakeYT(),)),
+        ("connecting", CratefillApp._connect_job, (True,)),
     ])
-    def test_done_is_emitted_even_when_the_work_explodes(self, worker, args, monkeypatch):
+    def test_done_is_emitted_even_when_the_work_explodes(self, what, job, args, monkeypatch):
         def boom(*a, **k):
             raise TypeError("'NoneType' object is not iterable")
 
         for name in ("evaluate_songs", "add_video_ids_to_playlists",
-                     "export_playlists_to_csv", "fetch_playlists"):
+                     "export_playlists_to_csv", "open_session"):
             monkeypatch.setattr(youtube, name, boom)
-        stub = Stub()
-        # The thread may still die noisily — what must not happen is the UI
-        # never hearing about it. Tolerate the exception, then check the queue.
-        with contextlib.suppress(Exception):
-            getattr(CratefillApp, worker)(stub, FakeYT(), *args)
-        messages = stub.drain()
-        assert ("done", None) in messages, "UI would stay disabled until restart"
+        messages = self.run(Stub(), what, job, *args)
         assert messages[-1] == ("done", None), "done must be the last word"
 
     def test_unexpected_failures_are_logged_for_the_user(self, monkeypatch):
@@ -324,15 +372,14 @@ class TestCompletionGuarantee:
             raise TypeError("'NoneType' object is not iterable")
 
         monkeypatch.setattr(youtube, "evaluate_songs", boom)
-        stub = Stub()
-        CratefillApp._worker(stub, FakeYT(), [SONG], [PLAYLIST])
-        logs = kinds(stub.drain(), "log")
-        assert any("Unexpected error while matching: TypeError" in line for line in logs)
+        messages = self.run(Stub(), "matching", CratefillApp._match_job,
+                            FakeYT(), [SONG], [PLAYLIST])
+        assert any("Unexpected error while matching: TypeError" in line
+                   for line in kinds(messages, "log"))
 
     def test_matching_phase_hands_its_decisions_over_for_review(self):
-        stub, yt = Stub(), FakeYT()
-        CratefillApp._worker(stub, yt, [SONG], [PLAYLIST])
-        messages = stub.drain()
+        yt = FakeYT()
+        messages = self.run(Stub(), "matching", CratefillApp._match_job, yt, [SONG], [PLAYLIST])
         handovers = kinds(messages, "decisions")
         assert len(handovers) == 1
         client, evaluated, playlists = handovers[0]
@@ -346,13 +393,22 @@ class TestCompletionGuarantee:
             raise RuntimeError("nope")
 
         monkeypatch.setattr(youtube, "evaluate_songs", boom)
-        stub = Stub()
-        CratefillApp._worker(stub, FakeYT(), [SONG], [PLAYLIST])
-        assert kinds(stub.drain(), "decisions") == []
+        messages = self.run(Stub(), "matching", CratefillApp._match_job,
+                            FakeYT(), [SONG], [PLAYLIST])
+        assert kinds(messages, "decisions") == []
 
     def test_add_phase_refetches_playlists_so_counts_stay_current(self):
-        stub, yt = Stub(), FakeYT()
-        CratefillApp._add_worker(stub, yt, ["v1"], [PLAYLIST])
-        messages = stub.drain()
+        messages = self.run(Stub(), "adding", CratefillApp._add_job,
+                            FakeYT(), ["v1"], [PLAYLIST])
         assert kinds(messages, "playlists")       # refetched on the worker thread
+        assert messages[-1] == ("done", None)
+
+    def test_playlists_are_refetched_even_when_adding_fails(self, monkeypatch):
+        def boom(*a, **k):
+            raise RuntimeError("nope")
+
+        monkeypatch.setattr(youtube, "add_video_ids_to_playlists", boom)
+        messages = self.run(Stub(), "adding", CratefillApp._add_job,
+                            FakeYT(), ["v1"], [PLAYLIST])
+        assert kinds(messages, "playlists")
         assert messages[-1] == ("done", None)

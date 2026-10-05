@@ -86,7 +86,8 @@ def _check_tkinter():
     reported as skipped rather than failed."""
     import tkinter as tk  # noqa: PLC0415 — deliberately local; see CLAUDE.md
 
-    from .app import CratefillApp, apply_dark_theme
+    from .app import CratefillApp
+    from .theme import apply_dark_theme
 
     try:
         root = tk.Tk()
@@ -95,7 +96,7 @@ def _check_tkinter():
     try:
         root.withdraw()
         apply_dark_theme(root)
-        CratefillApp(root)
+        CratefillApp(root, startup=False)  # check the widgets, change nothing
         root.update()
     finally:
         root.destroy()

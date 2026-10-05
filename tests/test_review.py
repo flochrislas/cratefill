@@ -7,7 +7,6 @@ decides what reaches a playlist.
 
 import pytest
 
-from cratefill import app as app_module
 from cratefill import policy
 from cratefill.app import CratefillApp
 from cratefill.matching import Candidate, MatchDecision
@@ -17,7 +16,7 @@ PLAYLIST = {"playlistId": "PL1", "title": "Road trip"}
 
 def candidate(vid, title="T", artist="A", score=0.9):
     return Candidate({"videoId": vid, "title": title, "artists": [{"name": artist}]},
-                     title_score=score, artist_score=score, overall_score=score,
+                     title_score=score, principal_score=score, artist_score=score, overall_score=score,
                      relation="same")
 
 
@@ -40,18 +39,6 @@ def rejected():
     return MatchDecision("rejected", reasons=["no result with a related title"])
 
 
-class FakeThread:
-    """Runs nothing — the test only cares which video ids were handed over."""
-
-    started = []
-
-    def __init__(self, target=None, args=(), daemon=None):
-        self.target, self.args = target, args
-
-    def start(self):
-        FakeThread.started.append(self.args)
-
-
 class ReviewStub:
     """Enough of CratefillApp to run _review_and_add and _ask_about_match."""
 
@@ -62,6 +49,7 @@ class ReviewStub:
         self.logs = []
         self.saved = []                         # policies written through the UI
         self.work_started = []
+        self.jobs = []                          # (what, args) per background job
 
     # --- the bits _review_and_add leans on ---
     def log(self, message):
@@ -90,22 +78,17 @@ class ReviewStub:
             self.set_ambiguous_policy(action)
         return action, chosen
 
-    def _add_worker(self, *args):
-        raise AssertionError("the add worker must only run via a thread")
+    _add_job = staticmethod(CratefillApp._add_job)
 
-
-@pytest.fixture(autouse=True)
-def no_threads(monkeypatch):
-    FakeThread.started = []
-    fake = type("FakeThreading", (), {"Thread": FakeThread})
-    monkeypatch.setattr(app_module, "threading", fake)
-    return FakeThread
+    def _run_job(self, what, job, *args):
+        """Records the job instead of starting a thread."""
+        self.jobs.append((what, args))
 
 
 def review(stub, decisions, playlists=(PLAYLIST,)):
     evaluated = [(("A", f"T{i}", ""), d) for i, d in enumerate(decisions)]
     CratefillApp._review_and_add(stub, "yt", evaluated, list(playlists))
-    return FakeThread.started
+    return [args for what, args in stub.jobs if what == "adding"]
 
 
 def approved_ids(started):

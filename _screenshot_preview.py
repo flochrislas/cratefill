@@ -13,7 +13,8 @@ import tkinter as tk
 
 from PIL import ImageGrab
 
-from cratefill.app import CratefillApp, apply_dark_theme, enable_dark_title_bar
+from cratefill.app import CratefillApp
+from cratefill.theme import apply_dark_theme, enable_dark_title_bar
 from cratefill.matching import choose_match
 from cratefill.storage import read_songs_csv
 from cratefill.youtube import _decision_line
@@ -21,7 +22,7 @@ from cratefill.youtube import _decision_line
 root = tk.Tk()
 apply_dark_theme(root)
 enable_dark_title_bar(root)
-app = CratefillApp(root)
+app = CratefillApp(root, startup=False)
 
 app.songs = read_songs_csv("sample.csv")
 app.populate_song_tree()

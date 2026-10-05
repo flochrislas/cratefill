@@ -11,6 +11,16 @@ import re
 import sys
 import tempfile
 from pathlib import Path
+from typing import NamedTuple
+
+
+class Song(NamedTuple):
+    """One imported row. Still a tuple, so (artist, title, station) unpacking
+    and index-based code keep working."""
+
+    artist: str
+    title: str
+    station: str = ""  # "where I heard this": display-only, never searched for
 
 
 def user_data_dir():
@@ -75,8 +85,8 @@ STATION_HEADERS = ("station", "radio", "chaine", "chaîne", "source")
 AUDIO_EXTENSIONS = {".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus", ".wav", ".wma"}
 
 
-def read_songs_csv(path):
-    """Return a list of (artist, title, station) tuples from a CSV file.
+def read_songs_csv(path) -> list[Song]:
+    """Return the Songs (artist, title, station) in a CSV file.
 
     Detects the delimiter, and finds the columns by header name; falls back
     to artist/title in the first two columns when headers are unrecognized.
@@ -125,12 +135,12 @@ def read_songs_csv(path):
         title = row[title_col].strip()
         station = row[station_col].strip() if station_col is not None and station_col < len(row) else ""
         if artist or title:
-            songs.append((artist, title, station))
+            songs.append(Song(artist, title, station))
     return songs
 
 
-def read_songs_folder(path):
-    """Return (artist, title, station) tuples from a folder of music files.
+def read_songs_folder(path) -> list[Song]:
+    """Return Songs (artist, title, station) from a folder of music files.
 
     The folder name fills the artist column and the file name (without
     extension) the title column, so the YouTube Music search query becomes
@@ -140,7 +150,7 @@ def read_songs_folder(path):
     folder = Path(path)
     artist = " ".join(folder.name.split())
     return [
-        (artist, " ".join(f.stem.split()), "")
+        Song(artist, " ".join(f.stem.split()))
         for f in sorted(folder.iterdir())
         if f.is_file() and f.suffix.lower() in AUDIO_EXTENSIONS
     ]

@@ -18,6 +18,7 @@ import os
 import re
 import sys
 import tempfile
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import ytmusicapi
@@ -180,30 +181,39 @@ def search_candidates(yt, artist, title):
     return yt.search(query, filter="songs", limit=SEARCH_LIMIT)
 
 
-def evaluate_songs(yt, songs, put):
+def evaluate_songs(yt, songs, put) -> list[tuple]:
     """Search and score every song. Returns [(song, MatchDecision), …].
 
     Phase one of adding: this function performs **no** mutating call, so the user
     can still cancel after seeing what would happen. `yt` is the client captured
     when the job started, so the job stays bound to one account even if the user
     logs into another one afterwards.
+
+    A row repeated in the import reuses the first search for the exact same
+    artist and title — it still gets its own decision, so it is reviewed on its
+    own. Failed searches aren't cached.
     """
-    evaluated = []
+    evaluated, searched = [], {}
     for song in songs:
         artist, title = song[0], song[1]  # song[2] is the station: context, not a search term
         blocking = validate_request(artist, title)
         if blocking:
             # Nothing to search for — don't spend a network call on it.
             decision = MatchDecision("rejected", reasons=blocking)
+            line = _decision_line(artist, title, decision)
         else:
             try:
-                results = search_candidates(yt, artist, title)
+                if (artist, title) not in searched:
+                    searched[(artist, title)] = search_candidates(yt, artist, title)
             except Exception as e:
+                # Not "no match": nothing was learnt about this song at all.
                 decision = MatchDecision("rejected", reasons=[f"search failed ({e})"])
+                line = f"✗ {artist} — {title}: search failed — {e}"
             else:
-                decision = choose_match(artist, title, results)
+                decision = choose_match(artist, title, searched[(artist, title)])
+                line = _decision_line(artist, title, decision)
         evaluated.append((song, decision))
-        put(("log", _decision_line(artist, title, decision)))
+        put(("log", line))
         put(("step", None))
     return evaluated
 
@@ -219,62 +229,118 @@ def _decision_line(artist, title, decision):
     return f"✗ {artist} — {title}: no credible match — {decision.reason}"
 
 
-def add_video_ids_to_playlists(yt, video_ids, playlists, put):
-    """Add already-approved video ids to each playlist.
+@dataclass
+class AddResult:
+    """What happened to the approved songs in one playlist.
+
+    `refused` means YT Music answered no; `failed` means there was no answer
+    (an error), so whether the song went in is unknown. `error` is the first
+    error message, if any.
+    """
+
+    playlist: str
+    added: list[str] = field(default_factory=list)
+    already_present: list[str] = field(default_factory=list)
+    refused: list[str] = field(default_factory=list)
+    failed: list[str] = field(default_factory=list)
+    error: str | None = None
+
+    def message(self) -> str:
+        """The Messages-pane line for this playlist."""
+        name = f"'{self.playlist}'"
+        if self.failed and not self.added and not self.refused:
+            return f"→ Failed to add to {name}: {self.error}"
+        attempted = len(self.added) + len(self.refused) + len(self.failed)
+        if not attempted:
+            return (f"→ {name}: all {len(self.already_present)} song(s) are already "
+                    "in the playlist — nothing to add")
+        line = (f"→ Added {len(self.added)} song(s) to {name}" if attempted == len(self.added)
+                else f"→ Added {len(self.added)} of {attempted} song(s) to {name}")
+        if self.already_present:
+            line += f" ({len(self.already_present)} already there, skipped)"
+        if self.refused:
+            line += (f"; {len(self.refused)} refused (playlist not editable, or YT Music "
+                     "sees them as duplicates under different ids)")
+        if self.failed:
+            line += f"; {len(self.failed)} failed ({self.error})"
+        return line
+
+
+def add_video_ids_to_playlists(yt, video_ids, playlists, put) -> list[AddResult]:
+    """Add already-approved video ids to each playlist. Returns one AddResult
+    per playlist that had anything to add.
 
     Phase two of adding: by the time this runs, every match has been classified
     and every ambiguous one decided, so nothing here needs to judge anything.
     """
     video_ids = list(dict.fromkeys(video_ids))  # two rows can match the same YT song
+    results = []
     for pl in playlists:
         if video_ids:
-            try:
-                put(("log", _add_to_playlist(yt, pl, video_ids)))
-            except Exception as e:
-                put(("log", f"→ Failed to add to '{pl['title']}': {e}"))
+            result = _add_to_playlist(yt, pl, video_ids)
+            results.append(result)
+            put(("log", result.message()))
         put(("step", None))
-    put(("log", "--- Done. ---"))
+    put(("log", done_summary(results)))
+    return results
 
 
-def _add_to_playlist(yt, pl, video_ids):
-    """Add the ids to one playlist and return the log line saying how it went.
+def done_summary(results) -> str:
+    """The closing line: totals over every playlist, counted per song and
+    playlist — one song added to two playlists is two additions."""
+    if not results:
+        return "--- Done. ---"
+    parts = [f"{sum(len(r.added) for r in results)} added"]
+    for attr, label in (("already_present", "already there"),
+                        ("refused", "refused"), ("failed", "failed")):
+        count = sum(len(getattr(r, attr)) for r in results)
+        if count:
+            parts.append(f"{count} {label}")
+    return f"--- Done: {', '.join(parts)}, across {len(results)} playlist(s). ---"
+
+
+def _add_to_playlist(yt, pl, video_ids) -> AddResult:
+    """Add the ids to one playlist.
 
     YT Music rejects a whole batch, adding nothing, if even one song is already
     in the playlist. So a refused batch is retried without the songs the
-    playlist already contains — and if it is *still* refused (a duplicate under
-    a different id, or a song the playlist won't take), the rest go one at a
+    playlist already contains — if that removed any; otherwise it would just be
+    the same batch again. If it is *still* refused (a duplicate under a
+    different id, or a song the playlist won't take), the rest go one at a
     time, so a single refusal can't cost every other new song.
     """
-    name = pl["title"]
-    if _added(yt, pl, video_ids):
-        return f"→ Added {len(video_ids)} song(s) to '{name}'"
-
-    tracks = yt.get_playlist(pl["playlistId"], limit=None).get("tracks") or []
-    existing = {t.get("videoId") for t in tracks}
-    to_add = [v for v in video_ids if v not in existing]
-    if not to_add:
-        return (f"→ '{name}': all {len(video_ids)} song(s) are already in the "
-                "playlist — nothing to add")
-    skipped = len(video_ids) - len(to_add)
-    note = f" ({skipped} already there, skipped)" if skipped else ""
-    if _added(yt, pl, to_add):
-        return f"→ Added {len(to_add)} song(s) to '{name}'{note}"
-
-    refused = [v for v in to_add if not _added(yt, pl, [v], quiet=True)]
-    return (f"→ Added {len(to_add) - len(refused)} of {len(to_add)} song(s) to "
-            f"'{name}'{note}; {len(refused)} refused (playlist not editable, or YT "
-            "Music sees them as duplicates under different ids)")
-
-
-def _added(yt, pl, video_ids, quiet=False):
-    """True if YT Music accepted the batch. With `quiet`, an error counts as a
-    refusal instead of propagating — one song's failure is not the playlist's."""
+    result = AddResult(pl["title"])
     try:
-        result = yt.add_playlist_items(pl["playlistId"], video_ids, duplicates=False)
-    except Exception:
-        if quiet:
-            return False
-        raise
+        if _accepted(yt, pl, video_ids):
+            result.added = list(video_ids)
+            return result
+        tracks = yt.get_playlist(pl["playlistId"], limit=None).get("tracks") or []
+        existing = {t.get("videoId") for t in tracks}
+        result.already_present = [v for v in video_ids if v in existing]
+        to_add = [v for v in video_ids if v not in existing]
+        if not to_add:
+            return result
+        if result.already_present and _accepted(yt, pl, to_add):
+            result.added = to_add
+            return result
+    except Exception as e:
+        result.error = str(e)
+        result.failed = [v for v in video_ids if v not in result.already_present]
+        return result
+
+    for v in to_add:
+        try:
+            (result.added if _accepted(yt, pl, [v]) else result.refused).append(v)
+        except Exception as e:
+            result.failed.append(v)
+            result.error = result.error or str(e)
+    return result
+
+
+def _accepted(yt, pl, video_ids) -> bool:
+    """True if YT Music accepted the batch, False if it refused it. Errors
+    propagate: an error is not an answer."""
+    result = yt.add_playlist_items(pl["playlistId"], video_ids, duplicates=False)
     status = result.get("status", "") if isinstance(result, dict) else result
     return "SUCCEEDED" in str(status)
 

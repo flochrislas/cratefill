@@ -1,4 +1,4 @@
-"""The Tkinter application: window, theme, dialogs and worker orchestration.
+"""The main window and the orchestration of its background jobs.
 
 Left pane:  songs loaded from a CSV (artist + title columns, optional station
 column shown for reference, extras ignored) or from a folder of music files
@@ -9,199 +9,33 @@ and added to every selected playlist. Results are reported in the Messages pane.
 The reverse also works: select playlists and click "Export CSV…" to save each
 one as an Artist/Title/Album CSV file.
 
-This module owns presentation and threading only. The matching rules live in
-matching.py, local files in storage.py, and every network call in youtube.py.
+This module owns the window and threading. Its dialogs live in dialogs.py and
+the dark theme in theme.py; the matching rules in matching.py, local files in
+storage.py, and every network call in youtube.py.
 """
 
 import queue
-import sys
 import threading
 import tkinter as tk
-import webbrowser
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
-from urllib.parse import quote
 
 from . import policy, youtube
 from .storage import read_songs_csv, read_songs_folder
-from .youtube import AUTH_FILE, clean_pasted_headers, migrate_legacy_auth_file, secure_auth_file
+from .dialogs import AmbiguousMatchDialog, LoginDialog
+from .theme import (
+    DARK_LIST_STYLE, DARK_TEXT_STYLE, FG_DIM, FIELD, apply_dark_theme, enable_dark_title_bar,
+)
+from .youtube import AUTH_FILE, migrate_legacy_auth_file, secure_auth_file
 
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
 except ImportError:  # optional: without it the app works, minus drag and drop
     DND_FILES = TkinterDnD = None
 
-# Dark palette. The ttk side is themed by apply_dark_theme() on top of "clam"
-# (the only built-in theme that renders identically on Windows and Linux);
-# plain tk widgets (Text, Listbox) take these styles directly.
-BG = "#1e1e1e"        # window / frame background
-FIELD = "#141414"     # data areas: tree, listbox, text
-BTN = "#333333"       # buttons, headings, scrollbar thumbs
-BTN_ACTIVE = "#404040"
-FG = "#e8e8e8"
-FG_DIM = "#888888"
-BORDER = "#3c3c3c"
-ACCENT = "#0f4a8a"    # selection background
-ACCENT_BAR = "#4a9eff" # progress bar fill
-READY = "#3ddc84"     # "you can go now": Add button outline once songs + playlists are picked
-
-DARK_LIST_STYLE = dict(
-    bg=FIELD,
-    fg=FG,
-    selectbackground=ACCENT,
-    selectforeground="#ffffff",
-    relief="flat",
-    highlightthickness=1,
-    highlightbackground=BORDER,
-    highlightcolor=BORDER,
-)
-DARK_TEXT_STYLE = {**DARK_LIST_STYLE, "insertbackground": FG}
-
-
-def apply_dark_theme(root):
-    """Dark-style all ttk widgets on top of the cross-platform 'clam' theme."""
-    root.configure(bg=BG)
-    style = ttk.Style(root)
-    style.theme_use("clam")
-
-    style.configure(
-        ".",
-        background=BG, foreground=FG, fieldbackground=FIELD,
-        bordercolor=BORDER, lightcolor=BG, darkcolor=BG,
-        troughcolor=FIELD, focuscolor=BORDER,
-        selectbackground=ACCENT, selectforeground="#ffffff",
-        insertcolor=FG,
-    )
-    style.configure("TButton", background=BTN, padding=(10, 5), borderwidth=2)
-    style.map(
-        "TButton",
-        background=[("disabled", BG), ("pressed", "#2a2a2a"), ("active", BTN_ACTIVE)],
-        foreground=[("disabled", FG_DIM)],
-    )
-    # Same geometry as TButton (borderwidth included) so swapping styles never
-    # shifts the layout — only the border and label colour change.
-    style.configure("Ready.TButton", bordercolor=READY, lightcolor=READY, darkcolor=READY,
-                    foreground=READY)
-    style.map(
-        "Ready.TButton",
-        background=[("disabled", BG), ("pressed", "#2a2a2a"), ("active", BTN_ACTIVE)],
-        foreground=[("disabled", FG_DIM), ("active", READY)],
-        bordercolor=[("disabled", BORDER)],
-        lightcolor=[("disabled", BG)],
-        darkcolor=[("disabled", BG)],
-    )
-    # Combobox needs its field styled explicitly, and its drop-down list is a
-    # plain tk Listbox that ttk styles don't reach at all — hence option_add.
-    style.configure(
-        "TCombobox",
-        fieldbackground=FIELD, background=BTN, foreground=FG,
-        arrowcolor=FG, bordercolor=BORDER, lightcolor=BTN, darkcolor=BTN,
-        selectbackground=FIELD, selectforeground=FG, padding=4,
-    )
-    style.map(
-        "TCombobox",
-        fieldbackground=[("readonly", FIELD), ("disabled", BG)],
-        foreground=[("disabled", FG_DIM)],
-        arrowcolor=[("disabled", FG_DIM), ("active", ACCENT_BAR)],
-        background=[("active", BTN_ACTIVE)],
-    )
-    root.option_add("*TCombobox*Listbox.background", FIELD)
-    root.option_add("*TCombobox*Listbox.foreground", FG)
-    root.option_add("*TCombobox*Listbox.selectBackground", ACCENT)
-    root.option_add("*TCombobox*Listbox.selectForeground", "#ffffff")
-    root.option_add("*TCombobox*Listbox.borderWidth", 0)
-
-    # Indicators: clam's element takes indicator*background*/*foreground*, not the
-    # default theme's "indicatorcolor" — set that and it is silently ignored,
-    # leaving a light circle that reads as *filled* when it isn't selected.
-    for widget in ("TRadiobutton", "TCheckbutton"):
-        style.configure(
-            widget,
-            background=BG, foreground=FG, focuscolor=BORDER,
-            indicatorbackground=FIELD, indicatorforeground=ACCENT_BAR,
-            upperbordercolor=BORDER, lowerbordercolor=BORDER,
-            # Bigger than clam's default, which is a ~6px dot. In the review
-            # dialog this is the only thing showing *which* candidate is armed,
-            # and it sits at the top of the window while the Add button is at the
-            # bottom — at this size it fills the ring, so selected vs not reads as
-            # blue vs empty rather than as a speck.
-            indicatorsize=16,
-        )
-        style.map(
-            widget,
-            background=[("active", BG)],
-            foreground=[("disabled", FG_DIM)],
-            indicatorbackground=[("disabled", BG), ("pressed", BTN_ACTIVE)],
-            indicatorforeground=[("disabled", FG_DIM)],
-        )
-    # Every label in the review dialog wraps except the candidate checkboxes,
-    # which would otherwise let one long "Artist — Title (Live at …)" drag the
-    # dialog wider than the screen. ttk.Checkbutton takes no `wraplength`
-    # argument, but its label element does through a style.
-    style.configure("Choice.TCheckbutton", wraplength=430)
-
-    style.configure("Treeview", background=FIELD, fieldbackground=FIELD, rowheight=24)
-    style.map(
-        "Treeview",
-        background=[("selected", ACCENT)],
-        foreground=[("selected", "#ffffff")],
-    )
-    style.configure("Treeview.Heading", background=BTN, relief="flat", padding=4)
-    style.map("Treeview.Heading", background=[("active", BTN_ACTIVE)])
-    style.configure("TLabelframe", bordercolor=BORDER)
-    style.configure("TLabelframe.Label", foreground=FG_DIM)
-    style.configure(
-        "TProgressbar",
-        background=ACCENT_BAR, troughcolor=FIELD,
-        bordercolor=BORDER, lightcolor=ACCENT_BAR, darkcolor=ACCENT_BAR,
-    )
-    style.configure(
-        "Vertical.TScrollbar",
-        background=BTN, troughcolor=BG, bordercolor=BG, arrowcolor=FG,
-        relief="flat",
-    )
-    style.map("Vertical.TScrollbar", background=[("active", BTN_ACTIVE)])
-    style.configure("Sash", sashthickness=6)
-
-
-def enable_dark_title_bar(window):
-    """Ask Windows (11) to draw this window's title bar in dark mode."""
-    if sys.platform != "win32":
-        return
-    try:
-        import ctypes
-
-        window.update_idletasks()
-        hwnd = ctypes.windll.user32.GetParent(window.winfo_id())
-        DWMWA_USE_IMMERSIVE_DARK_MODE = 20
-        ctypes.windll.dwmapi.DwmSetWindowAttribute(
-            hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE,
-            ctypes.byref(ctypes.c_int(1)), ctypes.sizeof(ctypes.c_int),
-        )
-    except Exception:
-        pass  # cosmetic only — never block startup over it
-
 # Song Treeview columns: (column id, heading label). The station column is
 # only displayed when the loaded CSV actually has station values.
 SONG_COLUMNS = (("artist", "Artist"), ("title", "Song"), ("station", "Station"))
-
-LOGIN_INSTRUCTIONS = f"""\
-To log in, Cratefill needs the request headers of your YouTube Music session:
-
-1. Open https://music.youtube.com in your browser and make sure you are logged in.
-2. Open the developer tools (F12) and select the Network tab.
-3. Click on the YouTube Music page (e.g. on Library) so requests appear.
-4. In the Network tab filter box, type:  browse
-5. Click one of the "browse?..." requests, then find the Request Headers section.
-   - Firefox: right-click the request > Copy Value > Copy Request Headers
-   - Chrome/Edge: in the Headers panel, select everything under
-     "Request Headers" and copy it (extra lines are ignored).
-6. Paste the copied headers below and click Log in.
-
-Your session is saved locally, for your user account only, in
-{AUTH_FILE}
-so you only need to do this once (until you log out of YouTube in that
-browser)."""
 
 # Shown in the Messages pane at startup, so the app never opens on a blank window.
 HELP_TEXT = """\
@@ -215,312 +49,19 @@ How to use:
 You can also export the list of songs from a selected playlist into a CSV file."""
 
 
-class LoginDialog(tk.Toplevel):
-    """Dialog asking the user to paste their music.youtube.com request headers."""
-
-    def __init__(self, parent):
-        super().__init__(parent)
-        self.title("Log in to YouTube Music")
-        self.geometry("700x560")
-        self.configure(bg=BG)
-        self.transient(parent)
-        self.grab_set()
-        enable_dark_title_bar(self)
-        self.success = False
-        self.validating = False
-        self.result_queue = queue.Queue()  # worker thread → _poll_validation
-
-        ttk.Label(self, text=LOGIN_INSTRUCTIONS, justify="left", wraplength=660).pack(
-            padx=12, pady=(12, 8), anchor="w"
-        )
-        self.headers_text = tk.Text(self, height=10, wrap="none", **DARK_TEXT_STYLE)
-        self.headers_text.pack(fill="both", expand=True, padx=12)
-
-        buttons = ttk.Frame(self)
-        buttons.pack(fill="x", padx=12, pady=10)
-        self.cancel_button = ttk.Button(buttons, text="Cancel", command=self.destroy)
-        self.cancel_button.pack(side="right")
-        self.submit_button = ttk.Button(buttons, text="Log in", command=self.submit)
-        self.submit_button.pack(side="right", padx=(0, 8))
-        self.status_label = ttk.Label(buttons, text="")
-        self.status_label.pack(side="left")
-        # Don't let the window close while a validation thread still owns the
-        # staged credentials file.
-        self.protocol("WM_DELETE_WINDOW", lambda: None if self.validating else self.destroy())
-
-    def submit(self):
-        raw = self.headers_text.get("1.0", "end").strip()
-        if not raw:
-            messagebox.showwarning("Cratefill", "Paste the request headers first.", parent=self)
-            return
-        headers = clean_pasted_headers(raw)
-        if "cookie" not in headers:
-            messagebox.showerror(
-                "Cratefill",
-                "No cookie found in the pasted text — make sure you copy the whole\n"
-                "Request Headers section of a music.youtube.com request.",
-                parent=self,
-            )
-            return
-        # Some requests omit it; 0 is the default Google account. The
-        # validation call below still catches a wrong guess.
-        headers.setdefault("x-goog-authuser", "0")
-        # Validating means a network round trip, so it runs on a worker thread:
-        # doing it here would freeze the dialog until YouTube answers.
-        self.validating = True
-        self.status_label.configure(text="Checking with YouTube Music…")
-        self.submit_button.configure(state="disabled")
-        self.cancel_button.configure(state="disabled")
-        threading.Thread(target=self._validate_worker, args=(headers,), daemon=True).start()
-        self.after(100, self._poll_validation)
-
-    def _validate_worker(self, headers):
-        """Worker thread: write the credentials, validate them, swap them in.
-
-        Reports the outcome on self.result_queue — None for success, otherwise
-        the exception. Touches no widget.
-        """
-        try:
-            youtube.save_credentials(headers)
-        except Exception as e:
-            self.result_queue.put(e)
-        else:
-            self.result_queue.put(None)
-
-    def _poll_validation(self):
-        """Main thread: wait for _validate_worker without blocking the dialog."""
-        if not self.winfo_exists():
-            return
-        try:
-            error = self.result_queue.get_nowait()
-        except queue.Empty:
-            self.after(100, self._poll_validation)
-            return
-        self.validating = False
-        if error is None:
-            self.success = True
-            self.destroy()
-            return
-        self.status_label.configure(text="")
-        self.submit_button.configure(state="normal")
-        self.cancel_button.configure(state="normal")
-        kept = " Your previous session is still in place." if AUTH_FILE.exists() else ""
-        messagebox.showerror(
-            "Cratefill",
-            f"Login failed — the pasted headers were not accepted.{kept}\n\n"
-            f"Details: {error}",
-            parent=self,
-        )
-
-
-def candidate_meta(result):
-    """One-line album/duration/year/explicit summary for a search result.
-
-    Every piece is optional — the ytmusicapi search shape is not guaranteed and
-    older or non-album tracks routinely miss `album`, `duration` or `year`. Joined
-    with " · " so the row stays readable even when only one field is present, and
-    returns "" when there is nothing to say (the caller then skips the label
-    entirely). This is what makes the dialog able to tell apart two candidates
-    that share exact artist + title — the case the reason line alone can't
-    disambiguate.
-    """
-    if not isinstance(result, dict):
-        return ""
-    parts = []
-    album = result.get("album") if isinstance(result.get("album"), dict) else {}
-    if album.get("name"):
-        parts.append(str(album["name"]))
-    if result.get("duration"):
-        parts.append(str(result["duration"]))
-    if result.get("year"):
-        parts.append(str(result["year"]))
-    if result.get("isExplicit"):
-        parts.append("E")     # matches YouTube Music's own explicit badge
-    return " · ".join(parts)
-
-
-class AmbiguousMatchDialog(tk.Toplevel):
-    """Asks what to do about one match that isn't certain.
-
-    Sets `action` to "add" or "skip", or leaves it None if the user dismissed the
-    window — which the caller treats as "cancel the whole import", so no playlist
-    is touched. `chosen` is the list of candidates to add: the top proposal by
-    default, or whichever ones the user ticked — several rivals can be worth
-    keeping. `remember` reports whether the choice should become the policy.
-    """
-
-    def __init__(self, parent, artist, title, decision):
-        super().__init__(parent)
-        self.title("Weak match" if decision.status == "weak" else "Ambiguous match")
-        self.configure(bg=BG)
-        self.transient(parent)
-        self.grab_set()
-        enable_dark_title_bar(self)
-        self.action = None
-        self.remember = False
-        self.choices = decision.choices
-        self.chosen = [decision.candidate] if decision.candidate else []
-
-        body = ttk.Frame(self, padding=12)
-        body.pack(fill="both", expand=True)
-        ttk.Label(body, text="Requested:", foreground=FG_DIM).pack(anchor="w")
-        ttk.Label(body, text=f"{artist} — {title}", wraplength=520).pack(
-            anchor="w", padx=(12, 0), pady=(0, 8)
-        )
-        # The decision-level reason: why we're asking at all ("2 versions of
-        # this song found"), as opposed to each candidate's own shortfalls.
-        ttk.Label(body, text="Reason:", foreground=FG_DIM).pack(anchor="w")
-        ttk.Label(body, text=decision.reason, wraplength=520, justify="left").pack(
-            anchor="w", padx=(12, 0), pady=(0, 8)
-        )
-        if decision.status == "weak":
-            ttk.Label(
-                body,
-                text="Weak match — asking whatever your policy says.",
-                foreground=READY,
-                wraplength=520,
-            ).pack(anchor="w", pady=(0, 8))
-
-        # The proposal plus its near-scoring rivals: the top-ranked candidate is
-        # not always the one the user wants, and the reason text says as much.
-        caption = "Proposed:" if len(self.choices) == 1 else "Proposed (tick any to add):"
-        ttk.Label(body, text=caption, foreground=FG_DIM).pack(anchor="w")
-
-        # Buttons and the checkbox are packed (to the bottom) *before* the list,
-        # so they keep their space however many candidates there are — the list
-        # is what scrolls. Every version of a song is listed, which can be ten.
-        buttons = ttk.Frame(body)
-        buttons.pack(side="bottom", fill="x", pady=(12, 0))
-        add = ttk.Button(buttons, text="Add", command=lambda: self._choose(policy.ADD))
-        add.pack(side="right")
-        self.add_button = add
-        ttk.Button(buttons, text="Skip", command=lambda: self._choose(policy.SKIP)).pack(
-            side="right", padx=(0, 8)
-        )
-        self.remember_var = tk.BooleanVar(value=False)
-        self.remember_check = ttk.Checkbutton(
-            body,
-            text="Use this choice for future ambiguous matches",
-            variable=self.remember_var,
-        )
-        if decision.status != "weak":
-            self.remember_check.pack(side="bottom", anchor="w", pady=(4, 0))
-
-        list_area = ttk.Frame(body)
-        list_area.pack(fill="both", expand=True, padx=(12, 0))
-        canvas = tk.Canvas(list_area, bg=BG, highlightthickness=0, borderwidth=0,
-                           yscrollincrement=20)
-        rows = ttk.Frame(canvas)
-        canvas.create_window((0, 0), window=rows, anchor="nw")
-        self.choice_vars = [tk.BooleanVar(value=index == 0) for index in range(len(self.choices))]
-        for index, candidate in enumerate(self.choices):
-            row = ttk.Frame(rows)
-            row.pack(fill="x", anchor="w")
-            # Checkbox + "Open" share the top line so the button lines up with the
-            # score, which is what the user's eye tracks along.
-            head = ttk.Frame(row)
-            head.pack(fill="x", anchor="w")
-            ttk.Checkbutton(
-                head,
-                text=f"{candidate.label}   ({candidate.overall_score:.2f})",
-                variable=self.choice_vars[index],
-                command=self._select,
-                style="Choice.TCheckbutton",  # wrapped; see apply_dark_theme
-            ).pack(side="left", anchor="w")
-            # Only offer "Open" when there's actually something to open: a result
-            # without a videoId can't be played, and can't be added either.
-            if candidate.video_id:
-                ttk.Button(
-                    head,
-                    text="Open ▶",
-                    width=8,
-                    command=lambda vid=candidate.video_id: self._open(vid),
-                ).pack(side="right")
-            # Album · duration · year · E — the fields that let the user tell
-            # apart candidates whose artist and title are identical (reissues,
-            # compilations, clean vs explicit). Skipped entirely when the result
-            # carries none of them, rather than showing an empty line.
-            meta = candidate_meta(candidate.result)
-            if meta:
-                ttk.Label(row, text=meta, foreground=FG_DIM, wraplength=480).pack(
-                    anchor="w", padx=(24, 0)
-                )
-            detail = candidate.reason or "matches exactly"
-            ttk.Label(row, text=detail, foreground=FG_DIM, wraplength=480).pack(
-                anchor="w", padx=(24, 0), pady=(0, 6)
-            )
-
-        self._fit_list(canvas, rows)
-        add.focus_set()
-        self.bind("<Escape>", lambda _e: self.destroy())  # dismiss = cancel the import
-        self._select()
-
-    def _fit_list(self, canvas, rows):
-        """Size the candidate list to its content, or to what the screen has
-        room for — with a scrollbar and the mouse wheel — when it doesn't fit."""
-        self.update_idletasks()  # the canvas isn't packed yet: this measures the rest
-        width, height = rows.winfo_reqwidth(), rows.winfo_reqheight()
-        # Leave room for the title bar and a taskbar; the rest of the dialog
-        # (request, reason, buttons) keeps its natural height.
-        room = max(self.winfo_screenheight() - 120 - self.winfo_reqheight(), 120)
-        canvas.configure(width=width, height=min(height, room),
-                         scrollregion=(0, 0, width, height))
-        if height > room:
-            bar = ttk.Scrollbar(canvas.master, orient="vertical", command=canvas.yview)
-            canvas.configure(yscrollcommand=bar.set)
-            bar.pack(side="right", fill="y")
-            # Bound on the dialog, whose tag every child carries, so the wheel
-            # works wherever the pointer is. Windows/macOS send <MouseWheel>,
-            # X11 sends buttons 4 and 5.
-            self.bind("<MouseWheel>",
-                      lambda e: canvas.yview_scroll(-1 if e.delta > 0 else 1, "units"))
-            self.bind("<Button-4>", lambda _e: canvas.yview_scroll(-1, "units"))
-            self.bind("<Button-5>", lambda _e: canvas.yview_scroll(1, "units"))
-        canvas.pack(side="left", fill="both", expand=True)
-
-    def _select(self):
-        """Track the ticked candidates. Add needs at least one — with none ticked
-        the only honest answers are Skip or cancelling."""
-        self.chosen = [c for c, var in zip(self.choices, self.choice_vars) if var.get()]
-        self.add_button.state(["!disabled"] if self.chosen else ["disabled"])
-
-    def _open(self, video_id):
-        """Open the candidate on music.youtube.com so the user can hear it.
-
-        The dialog stays up: this is a preview aid for the pending decision, not
-        an action of its own. Failure is caught because a missing default browser
-        is recoverable — dying here would drop the whole ambiguous match — but it
-        is *told* to the user rather than swallowed: a click that does nothing at
-        all is indistinguishable from a broken button.
-
-        The id is quoted even though it comes from the API: it is interpolated
-        into a URL handed to the OS, and "trusted input" is a bad habit there.
-        """
-        url = f"https://music.youtube.com/watch?v={quote(str(video_id), safe='')}"
-        try:
-            webbrowser.open(url)
-        except Exception as e:      # noqa: BLE001 — a failed preview must not lose the match
-            messagebox.showwarning(
-                "Cratefill",
-                f"Could not open a browser to preview this track.\n\n{url}\n\nDetails: {e}",
-                parent=self,
-            )
-
-    def _choose(self, action):
-        self._select()
-        self.action = action
-        self.remember = bool(self.remember_var.get())
-        self.destroy()
-
-
 class CratefillApp:
-    def __init__(self, root):
+    def __init__(self, root, startup=True):
+        """Build the window. With `startup` (the default) also do the launch
+        work that touches the outside world: migrate settings and an old
+        session file, and connect if a session is saved. Pass startup=False to
+        get just the interface — the self-check, previews and widget tests must
+        not rewrite settings.json or open a YouTube Music session."""
         self.root = root
         self.root.title("Cratefill — CSV to YouTube Music")
         self.root.geometry("1080x680")
 
         self.yt = None
-        self.songs = []  # list of (artist, title, station)
+        self.songs = []  # list of storage.Song
         self.song_sort = (None, False)  # (column id, descending?)
         self.playlists = []  # list of dicts from get_library_playlists
         self.worker_queue = queue.Queue()
@@ -532,6 +73,11 @@ class CratefillApp:
         self._build_ui()
         self.show_help()
         self.root.after(100, self._poll_worker)
+        if startup:
+            self._start_up()
+
+    def _start_up(self):
+        """Launch work with side effects; see __init__."""
         reset, saved = policy.migrate_settings()
         if reset:
             # Forced in memory even when the file couldn't be written: the whole
@@ -553,16 +99,28 @@ class CratefillApp:
     # ---------- UI construction ----------
 
     def _build_ui(self):
+        """The window: songs (left) and YouTube Music (right) side by side, then
+        the Process bar and the Messages pane across the bottom."""
         main = ttk.Frame(self.root, padding=8)
         main.pack(fill="both", expand=True)
 
         panes = ttk.PanedWindow(main, orient="horizontal")
         panes.pack(fill="both", expand=True)
+        panes.add(self._build_songs_pane(panes), weight=3)
+        panes.add(self._build_youtube_pane(panes), weight=2)
+        self._build_process_bar(main)
+        self._build_messages(main)
 
-        # Left pane: songs
-        left = ttk.LabelFrame(panes, text="Songs list", padding=4)
-        panes.add(left, weight=3)
+        # Everything that talks to YouTube Music, disabled for the duration of
+        # a job by _start_work — see there for why Log in and Refresh count.
+        self.busy_controls = (
+            self.add_button, self.export_button, self.login_button, self.refresh_button,
+            self.liked_only_check,  # read when Export starts; changing it mid-run would do nothing
+        )
 
+    def _build_songs_pane(self, parent):
+        """Load buttons, the song list (sortable, droppable) and its empty hint."""
+        left = ttk.LabelFrame(parent, text="Songs list", padding=4)
         left_top = ttk.Frame(left)
         left_top.pack(fill="x", pady=(0, 6))
         ttk.Button(left_top, text="Load CSV…", command=self.load_csv).pack(side="left")
@@ -612,11 +170,11 @@ class CratefillApp:
             else "Use Load CSV… or Load folder… above to get started",
         )
         self._refresh_empty_hint()
+        return left
 
-        # Right pane: account + playlists
-        right = ttk.LabelFrame(panes, text="YouTube Music", padding=4)
-        panes.add(right, weight=2)
-
+    def _build_youtube_pane(self, parent):
+        """Account buttons, the liked-only export option and the playlist list."""
+        right = ttk.LabelFrame(parent, text="YouTube Music", padding=4)
         right_top = ttk.Frame(right)
         right_top.pack(fill="x", pady=(0, 6))
         self.login_button = ttk.Button(right_top, text="Log in…", command=self.login)
@@ -646,9 +204,11 @@ class CratefillApp:
         self.playlist_list.configure(yscrollcommand=playlist_scroll.set)
         self.playlist_list.pack(side="left", fill="both", expand=True)
         playlist_scroll.pack(side="right", fill="y")
+        return right
 
-        # Bottom: ambiguous-match policy, action button, progress
-        bottom = ttk.LabelFrame(main, text="Process", padding=4)
+    def _build_process_bar(self, parent):
+        """The ambiguous-match policy, the Add button and the progress bar."""
+        bottom = ttk.LabelFrame(parent, text="Process", padding=4)
         bottom.pack(fill="x", pady=(8, 0))
         ttk.Label(bottom, text="On ambiguous match:").pack(side="left", padx=(0, 6))
         self.policy_combo = ttk.Combobox(
@@ -667,7 +227,9 @@ class CratefillApp:
         self.progress = ttk.Progressbar(bottom, mode="determinate")
         self.progress.pack(side="left", fill="x", expand=True, padx=8)
 
-        log_frame = ttk.LabelFrame(main, text="Messages", padding=4)
+    def _build_messages(self, parent):
+        """The Messages pane: every job reports here."""
+        log_frame = ttk.LabelFrame(parent, text="Messages", padding=4)
         log_frame.pack(fill="both", pady=(8, 0))
         self.log_text = tk.Text(
             log_frame, height=9, state="disabled", wrap="word", **DARK_TEXT_STYLE
@@ -676,13 +238,6 @@ class CratefillApp:
         self.log_text.configure(yscrollcommand=log_scroll.set)
         self.log_text.pack(side="left", fill="both", expand=True)
         log_scroll.pack(side="right", fill="y")
-
-        # Everything that talks to YouTube Music, disabled for the duration of
-        # a job by _start_work — see there for why Log in and Refresh count.
-        self.busy_controls = (
-            self.add_button, self.export_button, self.login_button, self.refresh_button,
-            self.liked_only_check,  # read when Export starts; changing it mid-run would do nothing
-        )
 
     # ---------- Ambiguous-match policy ----------
 
@@ -869,11 +424,11 @@ class CratefillApp:
             return
         self._start_work()
         self.log("Connecting to YouTube Music…")
-        threading.Thread(target=self._connect_worker, args=(silent,), daemon=True).start()
+        self._run_job("connecting", self._connect_job, silent)
 
-    def _connect_worker(self, silent):
-        """Worker thread: open the saved session, then fetch its playlists."""
-        put = self.worker_queue.put
+    @staticmethod
+    def _connect_job(silent, put):
+        """Open the saved session, then fetch its playlists."""
         try:
             yt = youtube.open_session()
         except Exception as e:
@@ -881,8 +436,6 @@ class CratefillApp:
         else:
             put(("connected", yt))
             youtube.fetch_playlists(yt, put)
-        finally:
-            put(("done", None))
 
     def refresh_playlists(self):
         # Never hit the API from here while a worker owns the client. _poll_worker
@@ -893,13 +446,7 @@ class CratefillApp:
             self.log("Not logged in — click 'Log in…' first.")
             return
         self._start_work()
-        threading.Thread(target=self._refresh_worker, args=(self.yt,), daemon=True).start()
-
-    def _refresh_worker(self, yt):
-        try:
-            youtube.fetch_playlists(yt, self.worker_queue.put)
-        finally:
-            self.worker_queue.put(("done", None))
+        self._run_job("refreshing", youtube.fetch_playlists, self.yt)
 
     def _show_playlists(self, playlists):
         """Main thread: refill the playlist Listbox."""
@@ -936,11 +483,7 @@ class CratefillApp:
         )
         # Snapshot the client: the worker must keep using the account it started
         # with, even if self.yt is replaced later.
-        threading.Thread(
-            target=self._worker,
-            args=(self.yt, selected_songs, selected_playlists),
-            daemon=True,
-        ).start()
+        self._run_job("matching", self._match_job, self.yt, selected_songs, selected_playlists)
 
     # ---------- Reviewing matches, then adding ----------
 
@@ -950,7 +493,7 @@ class CratefillApp:
         Runs between the two worker phases. Nothing has touched a playlist yet,
         which is what makes cancelling here safe and predictable.
         """
-        approved, counts = [], {"add": 0, "skip": 0}
+        approvals = policy.Approvals()
         for song, decision in evaluated:
             artist, title = song[0], song[1]
             video_ids = [decision.video_id] if decision.video_id else []
@@ -966,23 +509,14 @@ class CratefillApp:
             elif decision.status == "ambiguous":
                 verb = "added" if action == policy.ADD else "skipped"
                 self.log(f"    → ambiguous match {verb} by policy")
-            # Two rows can resolve to the same track, so "N to add" counts
-            # only ids not already approved.
-            new_ids = [v for v in video_ids if v not in approved]
-            if action == policy.ADD and video_ids:
-                approved.extend(new_ids)
-                counts["add"] += len(new_ids)
-            else:
-                counts["skip"] += 1
+            approvals.record(action, video_ids)
 
-        self.log(f"--- {counts['add']} to add, {counts['skip']} skipped. ---")
-        if not approved:
+        self.log(approvals.summary())
+        if not approvals.video_ids:
             self.log("Nothing approved — no playlist was changed.")
             return
         self._start_work(maximum=len(playlists))
-        threading.Thread(
-            target=self._add_worker, args=(yt, approved, playlists), daemon=True
-        ).start()
+        self._run_job("adding", self._add_job, yt, approvals.video_ids, playlists)
 
     def _ask_about_match(self, artist, title, decision):
         """Show the review dialog.
@@ -1020,10 +554,8 @@ class CratefillApp:
         self._start_work(maximum=len(selected))
         what = "liked songs of " if liked_only else ""
         self.log(f"--- Exporting {what}{len(selected)} playlist(s) to {dest} ---")
-        threading.Thread(
-            target=self._export_worker, args=(self.yt, selected, dest, liked_only),
-            daemon=True,
-        ).start()  # snapshot self.yt — see add_songs
+        # Snapshot self.yt — see add_songs.
+        self._run_job("exporting", self._export_job, self.yt, selected, dest, liked_only)
 
     def _start_work(self, maximum=None):
         """Lock every YouTube Music control for the duration of a job.
@@ -1053,94 +585,103 @@ class CratefillApp:
         self.progress.stop()  # no-op in determinate mode
         self.progress.configure(mode="determinate", value=0)
 
-    def _worker(self, yt, songs, playlists):
-        """Phase one, on a background thread: search and score, never mutate.
+    def _run_job(self, what, job, *args):
+        """Run job(*args, put) on a background thread; see _job_body.
 
-        Always reports completion. The Add/Export buttons stay disabled until a
-        ("done", …) message arrives, so a worker that dies on an unexpected
-        error — malformed API data, say — would leave the UI unusable until
-        restart. Hence the try/finally: the thread cannot exit without
-        re-enabling the UI.
+        Every YouTube Music call goes through here, off the UI thread. The
+        client is passed in as an argument, never read off self.yt inside the
+        job, so a job stays bound to the account it started with.
+        """
+        threading.Thread(target=self._job_body, args=(what, job, *args), daemon=True).start()
+
+    def _job_body(self, what, job, *args):
+        """Run a job and always report completion.
+
+        The busy controls stay disabled until ("done", …) arrives, so a job that
+        dies on an unexpected error — malformed API data, say — would leave the
+        UI unusable until restart. Hence the finally: the thread cannot exit
+        without re-enabling the UI, and the error is logged for the user.
         """
         put = self.worker_queue.put
         try:
-            evaluated = youtube.evaluate_songs(yt, songs, put)
-            put(("decisions", (yt, evaluated, playlists)))
+            job(*args, put)
         except Exception as e:
-            put(("log", f"✗ Unexpected error while matching: {type(e).__name__}: {e}"))
+            put(("log", f"✗ Unexpected error while {what}: {type(e).__name__}: {e}"))
         finally:
             put(("done", None))
 
-    def _add_worker(self, yt, video_ids, playlists):
-        """Phase two, on a background thread: add the approved video ids."""
-        put = self.worker_queue.put
+    @staticmethod
+    def _match_job(yt, songs, playlists, put):
+        """Phase one: search and score, never mutate. The decisions are handed
+        over for review; nothing is added until that is done."""
+        evaluated = youtube.evaluate_songs(yt, songs, put)
+        put(("decisions", (yt, evaluated, playlists)))
+
+    @staticmethod
+    def _add_job(yt, video_ids, playlists, put):
+        """Phase two: add the approved ids, then refetch the playlists — their
+        counts changed — even if adding failed."""
         try:
             youtube.add_video_ids_to_playlists(yt, video_ids, playlists, put)
-        except Exception as e:
-            put(("log", f"✗ Unexpected error while adding: {type(e).__name__}: {e}"))
         finally:
-            # The refetch is nested so that nothing it does can stop the "done"
-            # message: that message is the only thing that re-enables the UI.
-            try:
-                youtube.fetch_playlists(yt, put)  # counts changed — refetch here,
-            finally:                              # still off the UI thread
-                put(("done", None))
+            youtube.fetch_playlists(yt, put)  # swallows its own errors
 
-    def _export_worker(self, yt, playlists, dest, liked_only):
-        """Background thread entry point: always reports completion.
-
-        See _worker for why the try/finally is not optional.
-        """
-        try:
-            youtube.export_playlists_to_csv(
-                yt, playlists, dest, self.worker_queue.put, liked_only=liked_only
-            )
-        except Exception as e:
-            self.worker_queue.put(
-                ("log", f"✗ Unexpected error while exporting: {type(e).__name__}: {e}")
-            )
-        finally:
-            self.worker_queue.put(("done", None))
+    @staticmethod
+    def _export_job(yt, playlists, dest, liked_only, put):
+        youtube.export_playlists_to_csv(yt, playlists, dest, put, liked_only=liked_only)
 
     def _poll_worker(self):
-        # The reschedule lives in a finally: if draining ever raises, dropping
-        # out of the after() chain would freeze every future worker's output.
+        """Drain the worker queue on the main thread, every 100 ms.
+
+        Each message kind has one handler (_handlers). The reschedule lives in
+        a finally: if draining ever raises, dropping out of the after() chain
+        would freeze every future job's output.
+        """
         try:
             while True:
                 kind, payload = self.worker_queue.get_nowait()
-                if kind == "log":
-                    self.log(payload)
-                elif kind == "step":
-                    self.progress.step(1)
-                elif kind == "playlists":
-                    self._show_playlists(payload)
-                elif kind == "account":
-                    self.account_label.configure(text=payload)
-                elif kind == "connected":
-                    self.yt = payload
-                    self.account_label.configure(text="Logged in")
-                    self.login_button.configure(text="Re-log in…")
-                elif kind == "connect_failed":
-                    silent, message = payload
-                    self.yt = None
-                    if not silent:
-                        messagebox.showerror(
-                            "Cratefill", f"Could not use saved login:\n{message}"
-                        )
-                elif kind == "decisions":
-                    # Stashed rather than acted on immediately: the review has to
-                    # wait for this job's "done" below, because starting phase two
-                    # needs _end_work() to have cleared self.working first.
-                    self.pending_review = payload
-                elif kind == "done":
-                    self._end_work()
-                    review, self.pending_review = self.pending_review, None
-                    if review:
-                        self._review_and_add(*review)
+                self._handlers[kind](payload)
         except queue.Empty:
             pass
         finally:
             self.root.after(100, self._poll_worker)
+
+    @property
+    def _handlers(self):
+        """Message kind → what the main thread does with its payload."""
+        return {
+            "log": self.log,
+            "step": lambda _payload: self.progress.step(1),
+            "playlists": self._show_playlists,
+            "account": lambda text: self.account_label.configure(text=text),
+            "connected": self._on_connected,
+            "connect_failed": self._on_connect_failed,
+            "decisions": self._on_decisions,
+            "done": self._on_done,
+        }
+
+    def _on_connected(self, yt):
+        self.yt = yt
+        self.account_label.configure(text="Logged in")
+        self.login_button.configure(text="Re-log in…")
+
+    def _on_connect_failed(self, payload):
+        silent, message = payload
+        self.yt = None
+        if not silent:
+            messagebox.showerror("Cratefill", f"Could not use saved login:\n{message}")
+
+    def _on_decisions(self, review):
+        """Stashed rather than acted on: the review has to wait for this job's
+        "done", because starting phase two needs _end_work() to have cleared
+        self.working first."""
+        self.pending_review = review
+
+    def _on_done(self, _payload):
+        self._end_work()
+        review, self.pending_review = self.pending_review, None
+        if review:
+            self._review_and_add(*review)
 
 
 def main():

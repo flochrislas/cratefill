@@ -6,6 +6,8 @@ lead to. Pure and Tk-free, so the rules are testable on their own — see
 tests/test_policy.py.
 """
 
+from dataclasses import dataclass, field
+
 from .storage import read_json, user_data_dir, write_json_atomic
 
 ASK, SKIP, ADD = "ask", "skip", "add"
@@ -102,3 +104,31 @@ def action_for_match(decision, ambiguous_policy):
     if decision.status == "weak":
         return ASK
     return ambiguous_policy if ambiguous_policy in POLICIES else DEFAULT_POLICY
+
+
+@dataclass
+class Approvals:
+    """What a review approved, built one decision at a time.
+
+    `video_ids` is what reaches the playlists: in order, each id once — two
+    rows can resolve to the same track, and the user can tick a candidate
+    another row already approved. `added` counts those ids, `skipped` the
+    decisions that added nothing.
+    """
+
+    video_ids: list[str] = field(default_factory=list)
+    added: int = 0
+    skipped: int = 0
+
+    def record(self, action: str, video_ids: list[str]) -> None:
+        """One decision's outcome: `action` is ADD or SKIP, `video_ids` what
+        it would add."""
+        new = [v for v in dict.fromkeys(video_ids) if v not in self.video_ids]
+        if action == ADD and video_ids:
+            self.video_ids.extend(new)
+            self.added += len(new)
+        else:
+            self.skipped += 1
+
+    def summary(self) -> str:
+        return f"--- {self.added} to add, {self.skipped} skipped. ---"

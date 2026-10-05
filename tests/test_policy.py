@@ -178,3 +178,27 @@ class TestLabels:
 
     def test_ask_is_the_default(self):
         assert policy.DEFAULT_POLICY == "ask"
+
+
+class TestApprovals:
+    """The bookkeeping between review and adding — pure, so no window needed."""
+
+    def test_added_ids_keep_their_order(self):
+        a = policy.Approvals()
+        a.record(policy.ADD, ["v1"])
+        a.record(policy.ADD, ["v2", "v3"])
+        assert a.video_ids == ["v1", "v2", "v3"] and a.added == 3
+
+    def test_an_id_two_rows_resolve_to_counts_once(self):
+        a = policy.Approvals()
+        a.record(policy.ADD, ["same"])
+        a.record(policy.ADD, ["same", "other"])
+        assert a.video_ids == ["same", "other"]
+        assert a.summary() == "--- 2 to add, 0 skipped. ---"
+
+    @pytest.mark.parametrize("action, ids", [(policy.SKIP, ["v1"]), (policy.ADD, [])])
+    def test_a_decision_that_adds_nothing_is_skipped(self, action, ids):
+        a = policy.Approvals()
+        a.record(action, ids)
+        assert a.video_ids == [] and a.skipped == 1
+        assert a.summary() == "--- 0 to add, 1 skipped. ---"

@@ -105,6 +105,23 @@ class TestOptionalPieces:
         assert passed is True
 
 
+class TestNoSideEffects:
+    def test_the_widget_check_skips_startup(self, monkeypatch):
+        """--selftest builds the app to check the widgets. It must not migrate
+        settings.json, move a session file, or connect to YouTube Music."""
+        import tkinter as tk
+
+        def startup(_self):
+            raise AssertionError("the self-check ran the app's startup work")
+
+        monkeypatch.setattr(app.CratefillApp, "_start_up", startup)
+        try:
+            tk.Tk().destroy()
+        except tk.TclError:
+            pytest.skip("no display")
+        assert "skipped" not in selftest._check_tkinter()
+
+
 class TestChecksAreMeaningful:
     def test_rapidfuzz_check_needs_a_real_partial_score(self):
         """It must call the scorer, not just import it: a bundled-but-broken

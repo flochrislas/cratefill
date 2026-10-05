@@ -6,7 +6,8 @@ import pytest
 tk = pytest.importorskip("tkinter")
 
 from cratefill import policy                     # noqa: E402
-from cratefill.app import AmbiguousMatchDialog, apply_dark_theme, candidate_meta   # noqa: E402
+from cratefill.dialogs import AmbiguousMatchDialog, candidate_meta   # noqa: E402
+from cratefill.theme import apply_dark_theme                          # noqa: E402
 from cratefill.matching import Candidate, MatchDecision     # noqa: E402
 
 
@@ -26,7 +27,7 @@ def candidate(vid, title, artist="Oasis", score=0.9, reasons=(), extras=None):
     result = {"videoId": vid, "title": title, "artists": [{"name": artist}]}
     if extras:
         result.update(extras)
-    return Candidate(result, title_score=score, artist_score=score, overall_score=score,
+    return Candidate(result, title_score=score, principal_score=score, artist_score=score, overall_score=score,
                      relation="same", reasons=list(reasons))
 
 
@@ -336,7 +337,7 @@ class TestOpenButton:
         """A result without a videoId can't be added *or* played, so offering
         the button would be a lie."""
         no_vid = Candidate({"videoId": None, "title": "t", "artists": [{"name": "a"}]},
-                           title_score=0.7, artist_score=0.7, overall_score=0.7,
+                           title_score=0.7, principal_score=0.7, artist_score=0.7, overall_score=0.7,
                            relation="same", reasons=["thin"])
         d = MatchDecision("weak", candidate=no_vid, reasons=["thin"])
         dialog = open_dialog(root, d)
@@ -348,7 +349,7 @@ class TestOpenButton:
         """Verifies the URL shape (music.youtube.com/watch?v=<vid>) and that
         clicking one candidate's Open opens *that* candidate, not the winner."""
         opened = []
-        monkeypatch.setattr("cratefill.app.webbrowser.open",
+        monkeypatch.setattr("cratefill.dialogs.webbrowser.open",
                             lambda url: opened.append(url) or True)
         dialog = open_dialog(root, decision)
         dialog._open("v1")
@@ -364,8 +365,8 @@ class TestOpenButton:
         def boom(_url):
             raise OSError("no browser configured")
         warned = []
-        monkeypatch.setattr("cratefill.app.webbrowser.open", boom)
-        monkeypatch.setattr("cratefill.app.messagebox.showwarning",
+        monkeypatch.setattr("cratefill.dialogs.webbrowser.open", boom)
+        monkeypatch.setattr("cratefill.dialogs.messagebox.showwarning",
                             lambda *a, **k: warned.append(a[1]))
         dialog = open_dialog(root, decision)
         dialog._open("v1")     # must not raise
@@ -383,7 +384,7 @@ class TestOpenButton:
         """The id comes from an unofficial API and ends up in a URL handed to the
         OS, so it is quoted rather than trusted."""
         opened = []
-        monkeypatch.setattr("cratefill.app.webbrowser.open", lambda url: opened.append(url))
+        monkeypatch.setattr("cratefill.dialogs.webbrowser.open", lambda url: opened.append(url))
         dialog = open_dialog(root, decision)
         dialog._open(video_id)
         assert opened == [f"https://music.youtube.com/watch?v={expected}"]
@@ -396,7 +397,7 @@ class TestEmptyListHint:
 
     def app(self, root):
         from cratefill.app import CratefillApp
-        app = CratefillApp(root)
+        app = CratefillApp(root, startup=False)
         root.update()
         return app
 
@@ -460,7 +461,7 @@ class TestEmptyListHintWithRealDragAndDrop:
 
     def app(self, dnd_root):
         from cratefill.app import CratefillApp
-        app = CratefillApp(dnd_root)
+        app = CratefillApp(dnd_root, startup=False)
         dnd_root.update()
         return app
 
@@ -491,7 +492,7 @@ class TestEmptyListHintWithRealDragAndDrop:
             return False if len(calls) > 1 else real(self, widget)
 
         monkeypatch.setattr(CratefillApp, "_register_drop_target", fail_on_the_label)
-        app = CratefillApp(dnd_root)
+        app = CratefillApp(dnd_root, startup=False)
         dnd_root.update()
         assert "Drag" not in app.empty_hint.cget("text")
         assert "Load CSV" in app.empty_hint.cget("text")
@@ -533,3 +534,46 @@ def all_widgets(widget):
     for child in widget.winfo_children():
         yield child
         yield from all_widgets(child)
+
+
+class TestWorkerMessages:
+    """_poll_worker hands each queued message to its handler on the main thread."""
+
+    def app(self, root):
+        from cratefill.app import CratefillApp
+        return CratefillApp(root, startup=False)
+
+    def drain(self, root, app, *messages):
+        for message in messages:
+            app.worker_queue.put(message)
+        app._poll_worker()
+        root.update()
+
+    def test_log_account_and_connection_reach_the_window(self, root):
+        app = self.app(root)
+        client = object()
+        self.drain(root, app, ("log", "hello from a job"), ("connected", client),
+                   ("account", "Login expired? Re-log in."))
+        assert "hello from a job" in app.log_text.get("1.0", "end")
+        assert app.yt is client
+        assert app.login_button.cget("text") == "Re-log in…"
+        assert app.account_label.cget("text") == "Login expired? Re-log in."
+
+    def test_a_silent_connect_failure_just_clears_the_client(self, root):
+        app = self.app(root)
+        app.yt = object()
+        self.drain(root, app, ("connect_failed", (True, "expired")))
+        assert app.yt is None
+
+    def test_the_review_waits_for_its_jobs_done(self, root, monkeypatch):
+        """Phase two may only start once phase one's "done" has cleared
+        self.working — so the decisions are held until then."""
+        app = self.app(root)
+        reviews = []
+        monkeypatch.setattr(app, "_review_and_add", lambda *r: reviews.append(r))
+        app._start_work()
+        self.drain(root, app, ("decisions", ("yt", [], [])))
+        assert reviews == [] and app.working
+        self.drain(root, app, ("done", None))
+        assert reviews == [("yt", [], [])]
+        assert not app.working

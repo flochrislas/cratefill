@@ -5,6 +5,7 @@ about what must *not* be accepted.
 """
 
 import itertools
+import random
 
 import pytest
 
@@ -402,6 +403,38 @@ class TestUnrequestedSuffix:
                    *[dict(result("Song Name", "Some Artist", vid=x), duration=x) for x in order])
         assert d.status == "ambiguous", (order, d)
         assert "2 versions of this song found" in d.reason
+
+    @pytest.mark.parametrize("gap, versions", [(10, 1), (11, 2)])
+    def test_the_length_tolerance_is_inclusive(self, gap, versions):
+        d = decide("Some Artist", "Song Name",
+                   dict(result("Song Name", "Some Artist", vid="a"), duration_seconds=180),
+                   dict(result("Song Name", "Some Artist", vid="b"), duration_seconds=180 + gap))
+        if versions == 1:
+            assert d.status == "high", d
+        else:
+            assert d.status == "ambiguous" and "2 versions of this song found" in d.reason, d
+
+    def test_the_outcome_never_depends_on_result_order(self):
+        """For random sets of versions — mixed titles, explicit flags, known and
+        missing lengths — every ordering of the same results gives the same
+        status and the same number of versions."""
+        rng = random.Random(1234)
+        for _ in range(60):
+            results = []
+            for i in range(rng.randint(1, 5)):
+                r = result(rng.choice(["Song Name", "Song Name", "Song Name (Live)"]),
+                           "Some Artist", vid=f"v{i}")
+                if rng.random() < 0.7:
+                    r["duration_seconds"] = rng.choice([180, 186, 190, 195, 201, 240])
+                if rng.random() < 0.2:
+                    r["isExplicit"] = True
+                results.append(r)
+            outcomes = {
+                (d.status, d.reason)
+                for d in (decide("Some Artist", "Song Name", *order)
+                          for order in itertools.permutations(results))
+            }
+            assert len(outcomes) == 1, (results, outcomes)
 
     @pytest.mark.parametrize("order", [("u", "a"), ("a", "u")])
     def test_an_unknown_length_alone_with_one_recording_is_the_same(self, order):

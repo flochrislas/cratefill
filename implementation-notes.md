@@ -34,7 +34,7 @@ cratefill/
 ├── __init__.py    __version__ only — the single source of the version, and kept
 │                  import-light because setuptools reads the attribute
 ├── __main__.py    python -m cratefill → app.main()
-├── matching.py    normalize/tokens, split_metadata/core_title/score_title,
+├── matching.py    normalize/tokens, split_metadata/core_title, _Request/_Result,
 │                  version_markers/version_relation, score_text/score_artist,
 │                  has_content_overlap, Candidate,
 │                  choose_match → MatchDecision (high/ambiguous/weak/rejected)
@@ -42,11 +42,13 @@ cratefill/
 ├── policy.py      POLICIES ("ask"/"skip"/"add"), load_policy/save_policy,
 │                  migrate_settings(), SETTINGS_VERSION,
 │                  action_for_match(decision, policy) → "add"/"skip"/"ask"
+│                  Approvals — the review's tally: ids to add, counts
 ├── selftest.py    run() → does this build have everything? (--selftest)
 ├── storage.py     user_data_dir()            per-user data directory
 │                  read_json/write_json_atomic  settings file mechanics
-│                  read_songs_csv(path)       CSV → list[(artist, title, station)]
-│                  read_songs_folder(path)    music files → list[(folder, stem, "")]
+│                  Song(artist, title, station)  one imported row (a NamedTuple)
+│                  read_songs_csv(path)       CSV → list[Song]
+│                  read_songs_folder(path)    music files → list[Song(folder, stem)]
 │                  safe_filename(name)        playlist title → legal file name
 │                  write_playlist_csv(...)    tracks → Artist/Title/Album CSV
 │                  ARTIST/TITLE/STATION_HEADERS, AUDIO_EXTENSIONS
@@ -60,11 +62,14 @@ cratefill/
 │                  evaluate_songs(yt, songs, put) → [(song, MatchDecision)]
 │                  add_video_ids_to_playlists(yt, ids, playlists, put)
 │                  export_playlists_to_csv(yt, playlists, dest, put)
-└── app.py         palette + apply_dark_theme(), enable_dark_title_bar()
-                   SONG_COLUMNS, LOGIN_INSTRUCTIONS, HELP_TEXT
-                   class LoginDialog(Toplevel)           paste-headers auth dialog
-                   class AmbiguousMatchDialog(Toplevel)  tick candidates (scrolls), Skip/Add
-                   class CratefillApp           window, selections, threads, queue
+├── theme.py       palette, DARK_LIST/TEXT_STYLE, apply_dark_theme(),
+│                  enable_dark_title_bar() — pure styling, no app state
+├── dialogs.py     LOGIN_INSTRUCTIONS, candidate_meta(result)
+│                  class LoginDialog(Toplevel)           paste-headers auth dialog
+│                  class AmbiguousMatchDialog(Toplevel)  tick candidates (scrolls), Skip/Add
+└── app.py         SONG_COLUMNS, HELP_TEXT
+                   class CratefillApp  window: one _build_… method per area,
+                                       jobs (_run_job), queue handlers (_handlers)
                    main()
 
 run_cratefill.py   PyInstaller entry script (see PyInstaller section)
@@ -74,10 +79,11 @@ tests/             test_matching.py, test_policy.py, test_selftest.py,
 ```
 
 Dependency direction is one-way:
-`__main__ → app → {youtube → {matching, storage}, policy → storage}`. Nothing
-imports `app`. `matching.py` imports only `re`, `unicodedata`, `collections` and `rapidfuzz`;
-`storage.py`, `policy.py` and `youtube.py` never import Tkinter; `app.py` makes
-no `yt.*` call of its own; and `matching.py` knows nothing about the ambiguous
+`__main__ → app → {dialogs → theme, theme, youtube → {matching, storage},
+policy → storage}`. Nothing imports `app`; the dialogs report through
+attributes the window reads after `wait_window()`, so they never need to. `matching.py` imports only `re`, `unicodedata`, `collections` and `rapidfuzz`;
+`storage.py`, `policy.py` and `youtube.py` never import Tkinter; the UI modules
+make no `yt.*` call of their own; and `matching.py` knows nothing about the ambiguous
 policy. Those properties are what keep the test suite free of Tk and network, and
 they are worth asserting in review.
 
@@ -185,7 +191,7 @@ The stages, all in `matching.py`:
 
    Two backstops guard the identity of the song: `strip_metadata()` **never
    empties** a non-empty title (if the metadata was the title, the title wins),
-   and `score_title()` short-circuits to 1.0 on exact normalized equality before
+   and `_title_score()` short-circuits to 1.0 on exact normalized equality before
    any stripping happens. `TestExactMatchInvariant` runs every marker word as a
    whole title to keep it that way.
 
@@ -388,8 +394,8 @@ Tkinter is single-threaded; network calls would freeze the UI. The pattern used:
 
 - The **Add** button (`add_songs`) and **Export CSV…** button
   (`export_playlists`) snapshot the selections *and the `YTMusic` client*,
-  lock the controls (`_start_work`), and start a daemon `threading.Thread`
-  running `_worker` / `_export_worker` respectively.
+  lock the controls (`_start_work`), and start `_match_job` / `_export_job`
+  through `_run_job`, which runs them on a daemon `threading.Thread`.
 - `_start_work` disables everything in `self.busy_controls` — Add, Export,
   **Log in and Refresh too** — and `_end_work` re-enables them. The last two
   matter because they race with a running job: logging in rebinds `self.yt`,
@@ -400,11 +406,11 @@ Tkinter is single-threaded; network calls would freeze the UI. The pattern used:
 - The client is **passed to the worker as an argument**, never read off `self`
   mid-run, so a job stays bound to the account it started with.
 - **Every** ytmusicapi call runs on a worker — including the two that used to be
-  synchronous, connecting (`_connect` → `_connect_worker`) and refreshing
-  (`refresh_playlists` → `_refresh_worker`). Both were noticeably blocking: a
+  synchronous, connecting (`_connect` → `_connect_job`) and refreshing
+  (`refresh_playlists` → `youtube.fetch_playlists`). Both were noticeably blocking: a
   slow handshake or a library that paginates over many playlists made the window
-  stop repainting and look hung. `_put_playlists(yt)` is the shared worker-side
-  helper that fetches the library and queues it; `_add_to_playlists` ends with it
+  stop repainting and look hung. `youtube.fetch_playlists(yt, put)` is the shared
+  helper that fetches the library and queues it; `_add_job` ends with it
   too, so the post-add count refresh also happens off the UI thread (that
   replaced the old `("done", "refresh")` round trip).
 - The workers do all network I/O and communicate *only* by putting
@@ -421,12 +427,12 @@ Tkinter is single-threaded; network calls would freeze the UI. The pattern used:
   animation is the difference between "working" and "hung". `_end_work` stops it
   and restores `determinate`.
 
-Because the buttons only come back when a `"done"` message arrives, **both
-worker entry points must always emit one.** `_worker` and `_export_worker` are
-thin wrappers that call `_add_to_playlists` / `_export_to_csv` inside a
-`try/except Exception` (logged as "Unexpected error…") with the `"done"` put in
-a `finally` — a thread that dies on unforeseen data must not leave the UI
-permanently disabled. `_poll_worker` reschedules itself in a `finally` for the
+Because the buttons only come back when a `"done"` message arrives, **every
+job must end with one.** `_run_job` runs each job through `_job_body`, which
+catches any exception (logged as "Unexpected error while …") and puts `"done"`
+in a `finally` — a thread that dies on unforeseen data must not leave the UI
+permanently disabled. The jobs themselves are static functions of their
+arguments and `put`, so tests run them synchronously through `_job_body`. `_poll_worker` reschedules itself in a `finally` for the
 same reason: an exception escaping the drain loop would otherwise break the
 `after` chain and silence every later worker.
 
@@ -443,7 +449,7 @@ than one loop. **No playlist may be touched while a decision is outstanding**, s
 cancelling is predictable and the user can see the whole import before it changes
 anything.
 
-1. **Match phase** — `_worker` → `youtube.evaluate_songs()`. One
+1. **Match phase** — `_match_job` → `youtube.evaluate_songs()`. One
    `yt.search(f"{artist} {title}", filter="songs", limit=SEARCH_LIMIT)` per song
    (the station column is never part of the query), then `choose_match()`. Emits
    a log line per song and a `("step", …)` each. Per-song failures (search
@@ -472,7 +478,7 @@ anything.
    decisions, which can't be automated anyway). Dismissing the dialog (Escape or
    the window close button) leaves `action` as `None`, which abandons the entire
    import — including high-confidence matches already approved.
-3. **Add phase** — `_add_worker` → `youtube.add_video_ids_to_playlists()`. One
+3. **Add phase** — `_add_job` → `youtube.add_video_ids_to_playlists()`. One
    `yt.add_playlist_items(playlistId, video_ids, duplicates=False)` call **per
    playlist** with all approved IDs batched — not one call per song, which would
    be slow and rate-limit-prone.
@@ -486,7 +492,10 @@ playlist's current videoIds, filters them out of the batch, and retries with the
 within the batch. If the retry still fails (playlist not editable, or YT
 considers a song a duplicate under a *different* videoId), the remaining songs
 are added one at a time and the log says how many were refused — one bad
-song must not cost the others. Adding to a playlist the user doesn't own fails per-playlist and is
+song must not cost the others. Each playlist's outcome is an `AddResult`, and
+the run ends with totals over all of them ("--- Done: 5 added, 1 refused,
+across 2 playlist(s). ---", from `done_summary`), so a partial failure in one
+of several playlists can't scroll by unnoticed. Adding to a playlist the user doesn't own fails per-playlist and is
 logged without affecting the others.
 
 After completion, `refresh_playlists()` runs so track counts update.
@@ -501,7 +510,7 @@ artist/album; for station folders of "Artist - Title.ext" files most matches
 land as `?` (uncertain) because the folder name isn't the artist — still
 useful, just review the log.
 
-### Playlist → CSV export (`_export_worker`)
+### Playlist → CSV export (`_export_job`)
 
 One `yt.get_playlist(playlistId, limit=None)` per selected playlist, then
 `write_playlist_csv` writes `Artist,Title,Album` rows (UTF-8, csv module
